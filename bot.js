@@ -17,9 +17,11 @@ const VERSION          = process.env.VERSION          || '1.21.2'
 const LOGIN_PASSWORD   = process.env.LOGIN_PASSWORD   || '123456'
 const BOT_NAMES        = (process.env.BOT_NAMES || '').split(',').map(n => n.trim()).filter(Boolean)
 const CONNECT_DELAY_MS = parseInt(process.env.CONNECT_DELAY_MS || '39500', 10)
+const CONNECT_DELAY_RANDOM_MS = parseInt(process.env.CONNECT_DELAY_RANDOM_MS || '0', 10)
 const MAX_RECONNECT     = parseInt(process.env.MAX_RECONNECT     || '17',   10)
 const GUI_SLOT         = parseInt(process.env.GUI_SLOT         || '11', 10)
 const WARP_AFK         = process.env.WARP_COMMAND || '/warp afk'
+const WARP_BEFORE_CRATE = (process.env.WARP_BEFORE_CRATE ?? process.env.WARPORNOT ?? 'true').toLowerCase() !== 'false'
 
 // ── GUI slot selection: fixed slot (default) vs. search-by-item (opt-in) ────
 // By default the compass GUI always clicks GUI_SLOT. Set GUI_ITEM_SEARCH_ENABLED=true
@@ -149,6 +151,8 @@ const PROXY_CRASH_PATTERNS = [
   /pre-spawn socketClosed/i,     // synthetic marker (set in the 'end' handler below) for a silent
                                   // socket close with no kick/error text, before the bot ever spawned —
                                   // the signature of a Tor/SOCKS5 circuit dying under the post-login data burst
+  /Parse error/i,
+  /Invalid tag/i
 ]
 const FAST_RECONNECT_MS = 10400        // flat delay for proxy transfer crashes
 const RECONNECT_BASE_MS = 10400        // base delay for real kicks / errors
@@ -467,8 +471,6 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
   try {
     bot = mineflayer.createBot({
       host, port, username: id, version, hideErrors: true,
-      auth: 'offline',   // <-- YOU MUST ADD THIS FOR /login SERVERS
-      brand: 'vanilla',  // <-- YOU MUST ADD THIS TO PASS BRAND FILTERS
       connect: makeProxyConnect(host, port, i)
     })
   } catch (err) {
@@ -865,11 +867,13 @@ bot.on('windowOpen', (window) => {
 }
 
 // ── Connect all bots with staggered delay ─────────────────────────────────────
+let currentConnectDelay = 0;
 BOT_NAMES.forEach((name, index) => {
   setTimeout(() => {
     createBotInstance(name)
     if (index === 0) switchTo(name)
-  }, index * CONNECT_DELAY_MS)
+  }, currentConnectDelay)
+  currentConnectDelay += CONNECT_DELAY_MS + Math.floor(Math.random() * (CONNECT_DELAY_RANDOM_MS + 1))
 })
 
 // ── Proxy stall watchdog ─────────────────────────────────────────────────────
@@ -938,6 +942,7 @@ const COMMANDS = {
   '/exit':           'Disconnect all bots and close the program',
   '/reconnect':      'Reconnect the active bot',
   '/reconnect-all':  'Reconnect every currently disconnected bot',
+  '/reconnect-all-slow': 'Reconnect ALL bots (online or offline) with a 30s delay between each to avoid rate limits',
   '/new-bot <name> [host] [port] [ver]': 'Create and connect a new bot',
   '/switch <id>':    'Switch view to a different bot by name or number',
   '/uptime':         'Show uptime for all bots',
@@ -1274,16 +1279,19 @@ async function runCrateRoutine(id, blockNameOverride) {
   const { bot } = entry
 
   try {
-    if(WARP_AFK!=false){
-    logFor(id, `{cyan-fg}› Warping to crates (targeting ${blockName.replace(/_/g, ' ')})…{/cyan-fg}`)
-    try { bot.chat(WARP_CRATES) } catch (err) {
-      logFor(id, `{red-fg}✗ Failed to send "${sanitize(WARP_CRATES)}": ${sanitize(err.message)}{/red-fg}`)
-      return false
+    if (WARP_BEFORE_CRATE) {
+      logFor(id, `{cyan-fg}› Warping to crates (targeting ${blockName.replace(/_/g, ' ')})…{/cyan-fg}`)
+      try { bot.chat(WARP_CRATES) } catch (err) {
+        logFor(id, `{red-fg}✗ Failed to send "${sanitize(WARP_CRATES)}": ${sanitize(err.message)}{/red-fg}`)
+        return false
+      }
+
+      // Wait for warp to complete (5 seconds + random 100-600ms)
+      await new Promise(resolve => setTimeout(resolve, 5000 + 100 + Math.random() * 500))
+      if (!bot.entity) { logFor(id, `{red-fg}✗ ${id} despawned during warp — aborting.{/red-fg}`); return false }
+    } else {
+      logFor(id, `{cyan-fg}› Skipping warp (WARP_BEFORE_CRATE=false) — scanning from current position (targeting ${blockName.replace(/_/g, ' ')})…{/cyan-fg}`)
     }
-    }
-    // Wait for warp to complete (5 seconds + random 100-600ms)
-    await new Promise(resolve => setTimeout(resolve, 5000 + 100 + Math.random() * 500))
-    if (!bot.entity) { logFor(id, `{red-fg}✗ ${id} despawned during warp — aborting.{/red-fg}`); return false }
 
     const block = bot.findBlock({
       matching: (b) => b && b.name === blockName,
@@ -1477,6 +1485,13 @@ async function runCratesAllSequenceForBot(id, blockNameOverride) {
     logFor(id, `{green-fg}✓ /crates-all: sequence complete for ${id}.{/green-fg}`)
   } catch (err) {
     logFor(id, `{red-fg}✗ Dump step failed: ${sanitize(err.message)}{/red-fg}`)
+  }
+
+  // 4. Warp back to AFK after 15s
+  await new Promise(r => setTimeout(r, 15000))
+  if (bots[id]?.bot?.entity) {
+    logFor(id, `{cyan-fg}› Warping back to AFK…{/cyan-fg}`)
+    try { bot.chat(WARP_AFK) } catch (_) {}
   }
 }
 
@@ -1676,6 +1691,23 @@ function handleCommand(trimmed) {
     })
     if (count === 0) logInfo('All bots are already online.')
     else logSuccess(`Reconnecting ${count} offline bot(s)…`)
+    return
+  }
+
+  // ── /reconnect-all-slow ─────────────────────
+  if (trimmed === '/reconnect-all-slow') {
+    let count = 0
+    const delayMs = parseInt(process.env.RECONNECT_SLOW_DELAY_MS || '30000', 10)
+    Object.entries(bots).forEach(([id, entry]) => {
+      const { host, port, version } = entry
+      setTimeout(() => {
+        logInfo(`{yellow-fg}⚠ Staggered reconnect: disconnecting ${id}…{/yellow-fg}`)
+        try { entry.disconnectManually() } catch (_) {}
+        setTimeout(() => createBotInstance(id, host, port, version), 1000)
+      }, count * delayMs)
+      count++
+    })
+    logSuccess(`Staggered reconnect started for ${count} bot(s) (${delayMs / 1000}s apart)…`)
     return
   }
 
