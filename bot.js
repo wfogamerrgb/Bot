@@ -788,7 +788,9 @@ bot.on('resourcePack', (url, hashOrUuid) => {
         i('Right-clicking compass (server selector)…')
         try { bot.activateItem() } catch (err) { e(`activateItem failed: ${sanitize(err.message)}`) }
       }, 3600 + Math.random() * 600)
-    }
+    }else{
+      bot.chat('/server lifesteal');
+      }
   })
 bot.on('windowOpen', (window) => {
   try {
