@@ -1,10 +1,13 @@
-require('dotenv').config()          // npm install dotenv
+require('dotenv').config()          // npm install dotenv express ws
 const net = require('net')
 const fs = require('fs')
 const path = require('path')
+const crypto = require('crypto')
+const http = require('http')
 const { exec } = require('child_process')
+const express = require('express')   // npm install express
+const WebSocket = require('ws')      // npm install ws
 const mineflayer = require('mineflayer')
-const blessed = require('neo-blessed')
 const armorManager = require('mineflayer-armor-manager')
 const { pathfinder, Movements, goals: { GoalNear } } = require('mineflayer-pathfinder')
 let SocksClient
@@ -22,6 +25,31 @@ const MAX_RECONNECT     = parseInt(process.env.MAX_RECONNECT     || '17',   10)
 const GUI_SLOT         = parseInt(process.env.GUI_SLOT         || '11', 10)
 const WARP_AFK         = process.env.WARP_COMMAND || '/warp afk'
 const WARP_BEFORE_CRATE = (process.env.WARP_BEFORE_CRATE ?? process.env.WARPORNOT ?? 'true').toLowerCase() !== 'false'
+
+// ── Web GUI / auth config ──────────────────────────────────────────────────
+// The old blessed terminal UI has been fully replaced by a small authenticated
+// web app (HTTP + WebSocket) served on WEB_PORT. Everything renders in the
+// browser instead of a terminal, and multiple people can view/operate the
+// console at once (they all share one set of bots, same as the old single
+// TUI did).
+const WEB_PORT      = parseInt(process.env.WEB_PORT || '8080', 10)
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin'
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin'
+const LOG_MAX_LINES  = parseInt(process.env.LOG_MAX_LINES || '5000', 10)
+// How often (ms) batched log lines are flushed to connected browsers. Batching
+// avoids sending one WebSocket frame per line during bursty output (e.g. a
+// windowOpen slot dump, or many bots chatting at once), which is the single
+// biggest perf win over a naive "send on every log call" approach.
+const WS_BROADCAST_INTERVAL_MS = parseInt(process.env.WS_BROADCAST_INTERVAL_MS || '80', 10)
+if (!process.env.ADMIN_PASSWORD) {
+  // Deliberately using the raw stderr here — this runs before any log
+  // plumbing exists and it's important the operator sees it in a real
+  // terminal/process-manager log, not just the web console.
+  process.stderr.write(
+    `\n*** WARNING: ADMIN_PASSWORD is not set in .env — using the default password "admin".\n` +
+    `*** Set ADMIN_USERNAME / ADMIN_PASSWORD in .env before exposing this to a network.\n\n`
+  )
+}
 
 // ── GUI slot selection: fixed slot (default) vs. search-by-item (opt-in) ────
 // By default the compass GUI always clicks GUI_SLOT. Set GUI_ITEM_SEARCH_ENABLED=true
@@ -96,8 +124,7 @@ const SHARDSHOP_LOOP_MAX_RUNS   = parseInt(process.env.SHARDSHOP_LOOP_MAX_RUNS  
 // ── Outbound proxy config ──────────────────────────────────────────────────────
 // Every bot's Minecraft TCP connection is routed through this single shared
 // proxy when PROXY_HOST is set. Leave PROXY_HOST empty/unset to connect
-// directly (default, unchanged behavior). const PROXY_HOST       = process.env.PROXY_HOST       || ''
-
+// directly (default, unchanged behavior).
 const PROXY_HOST       = process.env.PROXY_HOST       || ''
 const PROXY_ENABLED    = Boolean(PROXY_HOST)
 const PROXY_PORT       = parseInt(process.env.PROXY_PORT || '1080', 10)
@@ -252,27 +279,15 @@ function makeProxyConnect(targetHost, targetPort, onLog) {
     : makeSocksConnect(targetHost, targetPort, onLog)
 }
 
-// ── Global crash guards ───────────────────────────────────────────────────────
-process.on('uncaughtException', (err) => {
-  try { 
-    const text = err.stack ? err.stack : err.message;
-    logBox.log(`{red-fg}[UNCAUGHT] ${sanitize(text)}{/red-fg}`); 
-    debouncedRender() 
-  }
-  catch (_) { /* blessed may not be ready */ }
-})
-process.on('unhandledRejection', (reason) => {
-  try {
-    const msg = reason instanceof Error ? reason.message : String(reason)
-    logBox.log(`{red-fg}[UNHANDLED REJECTION] ${sanitize(msg)}{/red-fg}`); debouncedRender()
-  } catch (_) {}
-})
-
-// ── Blessed tag sanitiser ─────────────────────────────────────────────────────
-// Player names / chat / errors can contain {curly braces} that blessed parses
-// as formatting tags → crash.  We escape everything except our own known tags.
+// ── HTML-safe tag sanitiser ────────────────────────────────────────────────
+// Player names / chat / errors can contain HTML-special characters that would
+// otherwise break out of the <span> markup the browser renders log lines
+// with. We escape everything except our own small set of "{tag}" markers
+// (translated client-side into colored <span>s), the same way the old
+// version protected blessed's {curly brace} tags.
 const KNOWN_TAG_RE = /\{(\/?(bold|underline|blink|inverse|red|green|blue|cyan|magenta|yellow|white|gray|grey|black|center|left|right)(-fg|-bg)?)\}/g
 const MAX_SANITIZED_LENGTH = 4000 // hard cap — some servers send oversized/malformed chat as a client-crashing trick
+const HTML_ESCAPE_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }
 function sanitize(str) {
   if (typeof str !== 'string') str = String(str ?? '')
   if (str.length > MAX_SANITIZED_LENGTH) {
@@ -280,156 +295,232 @@ function sanitize(str) {
   }
   const tags = []
   const safe = str.replace(KNOWN_TAG_RE, (m) => { tags.push(m); return `\x00T${tags.length - 1}\x00` })
-  const escaped = safe.replace(/[{}]/g, c => '\\' + c)
+  const escaped = safe.replace(/[&<>"']/g, c => HTML_ESCAPE_MAP[c])
   return escaped.replace(/\x00T(\d+)\x00/g, (_, i) => tags[+i])
 }
-
-// ── TUI setup ─────────────────────────────────────────────────────────────────
-const screen = blessed.screen({ smartCSR: true, title: 'Mineflayer AFK Console', fullUnicode: true })
-
-// Debounced render — the single biggest fix for input lag.
-// Without this, every chat line from 14 bots triggers a full synchronous repaint.
-let renderQueued = false
-function debouncedRender() {
-  if (renderQueued) return
-  renderQueued = true
-  setImmediate(() => {
-    renderQueued = false
-    try {
-      screen.render()
-    } catch (err) {
-      // Render itself failed — don't route this through logBox/console (that's what
-      // just broke), write straight to the real fd so it doesn't loop or get lost.
-      try { require('fs').writeSync(2, `[render error] ${err && err.message}\n`) } catch (_) {}
-    }
-  })
-}
-
-const header = blessed.box({
-  top: 0, left: 0, width: '100%', height: 3,
-  content: '{center}{bold}⛏  MINEFLAYER AFK CONSOLE{/bold}{/center}',
-  tags: true,
-  style: { fg: 'white', bg: 'blue' }
-})
-
-const logBox = blessed.log({
-  top: 3, left: 0, width: '100%', height: '100%-6',
-  border: { type: 'line' },
-  label: ' Activity Log ',
-  tags: true,
-  padding: { left: 1, right: 1 },
-  style: { border: { fg: 'gray' }, label: { fg: 'cyan', bold: true } },
-  scrollable: true, alwaysScroll: true, mouse: true,
-  scrollbar: { ch: '│', style: { fg: 'cyan' } }
-})
-
-const inputBox = blessed.textbox({
-  bottom: 0, left: 0, width: '100%', height: 3,
-  border: { type: 'line' },
-  tags: true,
-  style: { border: { fg: 'green' }, fg: 'white' },
-  inputOnFocus: true
-})
-inputBox.setLabel(' {green-fg}{bold}❯{/bold}{/green-fg} Command ')
-
-screen.append(header)
-screen.append(logBox)
-screen.append(inputBox)
-inputBox.focus()
-
-// Redirect native output into the log box — nothing leaks to raw terminal
-process.stderr.write = (chunk) => {
-  try {
-    const text = (typeof chunk === 'string' ? chunk : chunk.toString('utf8')).trim()
-    if (text) logBox.log(`{gray-fg}[stderr] ${sanitize(text)}{/gray-fg}`)
-    debouncedRender()
-  } catch (_) {}
-  return true
-}
-console.log   = (...a) => { logBox.log(`{gray-fg}${sanitize(a.join(' '))}{/gray-fg}`);            debouncedRender() }
-console.warn  = (...a) => { logBox.log(`{yellow-fg}[warn] ${sanitize(a.join(' '))}{/yellow-fg}`);  debouncedRender() }
-console.error = (...a) => { logBox.log(`{red-fg}[error] ${sanitize(a.join(' '))}{/red-fg}`);       debouncedRender() }
-
-screen.key(['C-c'], () => process.exit(0))
-
-// Automatically refocus the input box if the user clicks the log box
-logBox.on('click', () => {
-  inputBox.focus()
-})
-
-// Automatically refocus if the user starts typing while defocused
-screen.on('keypress', (ch, key) => {
-  if (key && key.ctrl && key.name === 'c') return // preserve ctrl+c
-  if (!inputBox.focused) {
-    inputBox.focus()
-    // If they typed a normal character, add it so it doesn't get lost
-    if (ch && ch.length === 1 && !key.ctrl && !key.meta) {
-      inputBox.setValue(inputBox.getValue() + ch)
-    }
-    screen.render()
-  }
-})
 
 function timestamp() {
   return `{gray-fg}${new Date().toLocaleTimeString()}{/gray-fg}`
 }
 
+// ── Command history (persisted across restarts, shared by every browser tab) ──
+const HISTORY_FILE = path.join(__dirname, '.command_history')
+const MAX_HISTORY = 500
+const commandHistory = (() => {
+  try {
+    const data = fs.readFileSync(HISTORY_FILE, 'utf8')
+    return data.split('\n').filter(Boolean).slice(-MAX_HISTORY)
+  } catch (_) { return [] }
+})()
+function saveHistory() {
+  try { fs.writeFileSync(HISTORY_FILE, commandHistory.join('\n') + '\n') } catch (_) {}
+}
+function recordHistory(trimmed) {
+  if (commandHistory[commandHistory.length - 1] !== trimmed) {
+    commandHistory.push(trimmed)
+    if (commandHistory.length > MAX_HISTORY) commandHistory.shift()
+    saveHistory()
+  }
+}
+
+// ── Web server: auth ─────────────────────────────────────────────────────────
+// Plain HTTP Basic Auth. It's the simplest thing that (a) works for both
+// normal page loads and the WebSocket upgrade request (browsers cache and
+// automatically resend Basic credentials for the same origin, including on
+// the WS handshake) and (b) needs no session store / cookie plumbing for what
+// is meant to be a small single-operator admin console.
+function timingSafeStringEqual(a, b) {
+  const bufA = Buffer.from(String(a))
+  const bufB = Buffer.from(String(b))
+  if (bufA.length !== bufB.length) {
+    // Still run timingSafeEqual against same-length buffers to avoid a fast
+    // early-return that leaks length information via timing.
+    crypto.timingSafeEqual(bufA, bufA)
+    return false
+  }
+  return crypto.timingSafeEqual(bufA, bufB)
+}
+function checkAuth(header) {
+  if (!header || !header.startsWith('Basic ')) return false
+  let decoded
+  try { decoded = Buffer.from(header.slice(6), 'base64').toString('utf8') } catch (_) { return false }
+  const idx = decoded.indexOf(':')
+  if (idx === -1) return false
+  const user = decoded.slice(0, idx)
+  const pass = decoded.slice(idx + 1)
+  return timingSafeStringEqual(user, ADMIN_USERNAME) && timingSafeStringEqual(pass, ADMIN_PASSWORD)
+}
+function requireAuth(req, res, next) {
+  if (checkAuth(req.headers.authorization)) return next()
+  res.set('WWW-Authenticate', 'Basic realm="Mineflayer AFK Console"')
+  res.status(401).send('Authentication required.')
+}
+
+// ── Web server: broadcast plumbing ──────────────────────────────────────────
+const SYSTEM_ID = '__system__'
+const systemLogs = [] // mirrors a bots[id].logs array, for messages with no associated bot
+let pendingLogEntries = []
+let flushScheduled = false
+function queueLogBroadcast(id, text) {
+  pendingLogEntries.push({ id, text })
+  if (!flushScheduled) {
+    flushScheduled = true
+    setTimeout(flushLogs, WS_BROADCAST_INTERVAL_MS)
+  }
+}
+function flushLogs() {
+  flushScheduled = false
+  if (pendingLogEntries.length === 0) return
+  const batch = pendingLogEntries
+  pendingLogEntries = []
+  broadcast({ type: 'log', entries: batch })
+}
+function broadcast(obj) {
+  const data = JSON.stringify(obj)
+  wss.clients.forEach(ws => { if (ws.readyState === WebSocket.OPEN) ws.send(data) })
+}
+function botListSnapshot() {
+  return Object.keys(bots).map(id => {
+    const b = bots[id]
+    return {
+      id,
+      online: !!(b.bot && b.bot.entity),
+      spawnTime: b.spawnTime,
+      lastKickReason: b.lastKickReason || null,
+      proxy: PROXY_ENABLED ? `${PROXY_TYPE.toUpperCase()} ${PROXY_HOST}:${PROXY_PORT}` : null
+    }
+  })
+}
+function broadcastBotList() {
+  broadcast({ type: 'botlist', bots: botListSnapshot(), activeId })
+}
+
+// ── Web server: HTTP + WebSocket setup ──────────────────────────────────────
+const app = express()
+app.get('/health', (req, res) => res.status(200).send('ok')) // unauthenticated liveness probe
+app.get('/', requireAuth, (req, res) => res.type('html').send(PAGE_HTML))
+app.get('/api/commands', requireAuth, (req, res) => res.json(COMMANDS))
+
+const server = http.createServer(app)
+// perMessageDeflate compresses the WS stream — worthwhile here since large
+// windowOpen slot dumps and /overview output can be repetitive/text-heavy.
+const wss = new WebSocket.Server({ noServer: true, perMessageDeflate: true })
+
+server.on('upgrade', (req, socket, head) => {
+  if (!checkAuth(req.headers.authorization)) {
+    socket.write('HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm="Mineflayer AFK Console"\r\n\r\n')
+    socket.destroy()
+    return
+  }
+  wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req))
+})
+
+wss.on('connection', (ws) => {
+  ws.isAlive = true
+  ws.on('pong', () => { ws.isAlive = true })
+
+  ws.send(JSON.stringify({
+    type: 'init',
+    activeId,
+    commands: COMMANDS,
+    history: commandHistory,
+    bots: botListSnapshot()
+  }))
+
+  ws.on('message', (raw) => {
+    let msg
+    try { msg = JSON.parse(raw) } catch (_) { return }
+
+    if (msg.type === 'command' && typeof msg.text === 'string') {
+      const trimmed = msg.text.trim()
+      if (!trimmed) return
+      recordHistory(trimmed)
+      handleCommand(trimmed)
+    } else if (msg.type === 'history' && typeof msg.id === 'string') {
+      const store = msg.id === SYSTEM_ID ? systemLogs : (bots[msg.id] && bots[msg.id].logs)
+      ws.send(JSON.stringify({ type: 'history', id: msg.id, logs: (store || []).map(l => l.text) }))
+    }
+  })
+})
+
+// Prune dead sockets so broadcast() never keeps writing to a socket that
+// silently dropped (e.g. a laptop going to sleep) — without this, dead
+// entries accumulate in wss.clients and every log line pays the cost of
+// attempting to write to a socket that's never coming back.
+setInterval(() => {
+  wss.clients.forEach(ws => {
+    if (ws.isAlive === false) { try { ws.terminate() } catch (_) {} ; return }
+    ws.isAlive = false
+    try { ws.ping() } catch (_) {}
+  })
+}, 30000)
+
+// ── console/stderr redirection ──────────────────────────────────────────────
+// Unlike the old TUI (which had to hijack these to keep them off the raw
+// terminal), the web version keeps real stdout/stderr output intact — useful
+// under pm2/systemd/docker logs — AND mirrors the same message into the web
+// console's "System" channel.
+const realLog   = console.log.bind(console)
+const realWarn  = console.warn.bind(console)
+const realError = console.error.bind(console)
+console.log   = (...a) => { realLog(...a);   logFor(SYSTEM_ID, `{gray-fg}${sanitize(a.join(' '))}{/gray-fg}`) }
+console.warn  = (...a) => { realWarn(...a);  logFor(SYSTEM_ID, `{yellow-fg}[warn] ${sanitize(a.join(' '))}{/yellow-fg}`) }
+console.error = (...a) => { realError(...a); logFor(SYSTEM_ID, `{red-fg}[error] ${sanitize(a.join(' '))}{/red-fg}`) }
+
+const realStderrWrite = process.stderr.write.bind(process.stderr)
+process.stderr.write = (chunk, encoding, cb) => {
+  try {
+    const text = (typeof chunk === 'string' ? chunk : chunk.toString('utf8')).trim()
+    if (text) logFor(SYSTEM_ID, `{gray-fg}[stderr] ${sanitize(text)}{/gray-fg}`)
+  } catch (_) {}
+  return realStderrWrite(chunk, encoding, cb)
+}
+
+// ── Global crash guards ───────────────────────────────────────────────────────
+process.on('uncaughtException', (err) => {
+  try {
+    const text = err.stack ? err.stack : err.message
+    logFor(SYSTEM_ID, `{red-fg}[UNCAUGHT] ${sanitize(text)}{/red-fg}`)
+  } catch (_) {}
+})
+process.on('unhandledRejection', (reason) => {
+  try {
+    const msg = reason instanceof Error ? reason.message : String(reason)
+    logFor(SYSTEM_ID, `{red-fg}[UNHANDLED REJECTION] ${sanitize(msg)}{/red-fg}`)
+  } catch (_) {}
+})
+
 // ── Multi-bot state ───────────────────────────────────────────────────────────
 setInterval(() => {
   const cutoff = Date.now() - (20 * 60 * 1000) // 20 minutes ago
   Object.values(bots).forEach(botState => {
-    // Filter out anything older than the cutoff
     botState.logs = botState.logs.filter(log => log.time > cutoff)
   })
+  systemLogs.splice(0, systemLogs.length, ...systemLogs.filter(log => log.time > cutoff))
 }, 60000) // Runs once every 60 seconds
 const bots = {}       // username → { bot, spawnTime, logs[], host, port, version, reconnectAttempts, … }
 let activeId = null
-const MAX_LOG_LINES = 5000
+const MAX_LOG_LINES = LOG_MAX_LINES
 
 function updateHeader() {
-  const names = Object.keys(bots)
-  const activeIndex = names.indexOf(activeId) + 1
-  const activeLabel = activeId ? `Active: [${activeIndex}] ${activeId}` : 'No active bot'
-  const others = names.map((n, i) => i !== (activeIndex - 1) ? `[${i + 1}] ${n}` : null).filter(Boolean)
-  const othersLabel = others.length ? `  |  Others: ${others.join(', ')}` : ''
-  const proxyLabel = PROXY_ENABLED ? `   —   Proxy: ${PROXY_TYPE.toUpperCase()} ${PROXY_HOST}:${PROXY_PORT}` : ''
-  header.setContent(`{center}{bold}⛏  MINEFLAYER AFK CONSOLE{/bold}   —   ${activeLabel}${othersLabel}${proxyLabel}{/center}`)
-  debouncedRender()
+  broadcastBotList()
 }
 
 function switchTo(id) {
   if (!bots[id]) { log(`{red-fg}✗ No bot named "${sanitize(id)}"{/red-fg}`); return }
   activeId = id
-  
-  logBox.setContent('')
-  logBox.scrollTo(0)
-  
-  // Map the objects back to strings to render them
-  if (bots[id].logs.length > 0) {
-    logBox.setContent(bots[id].logs.map(l => l.text).join('\n'))
-  }
-  
   updateHeader()
-  const bottom = logBox.getScrollHeight()
-  if (bottom > 0) logBox.scrollTo(bottom)
-  debouncedRender()
 }
 
 function logFor(id, msg) {
-  if (!bots[id]) return
-  
+  if (id !== SYSTEM_ID && !bots[id]) return
   const line = `${timestamp()} ${msg}`
-  
-  // Store as an object with a timestamp
-  bots[id].logs.push({ text: line, time: Date.now() })
-  if (bots[id].logs.length > MAX_LOG_LINES) bots[id].logs.splice(0, bots[id].logs.length - MAX_LOG_LINES)
-  
-  if (id === activeId) { 
-    logBox.log(line)
-    debouncedRender() 
-  }
+  const store = id === SYSTEM_ID ? systemLogs : bots[id].logs
+  store.push({ text: line, time: Date.now() })
+  if (store.length > MAX_LOG_LINES) store.splice(0, store.length - MAX_LOG_LINES)
+  queueLogBroadcast(id, line)
 }
-function log(msg)        { if (activeId) logFor(activeId, msg) }
+function log(msg)        { logFor(activeId || SYSTEM_ID, msg) }
 function logSuccess(msg) { log(`{green-fg}✓ ${msg}{/green-fg}`) }
 function logError(msg)   { log(`{red-fg}✗ ${msg}{/red-fg}`) }
 function logInfo(msg)    { log(`{cyan-fg}› ${msg}{/cyan-fg}`) }
@@ -681,6 +772,7 @@ bot.on('resourcePack', (url, hashOrUuid) => {
     connected = true
     if (bots[id]) bots[id].spawnTime = Date.now()
     s(`Spawned on ${host}:${port} (v${version}).`)
+    updateHeader()
 
     // Stable for 60 s → reset backoff
     pushT(() => { if (connected && bots[id]) bots[id].reconnectAttempts = 0 }, 60_000)
@@ -784,6 +876,7 @@ bot.on('windowOpen', (window) => {
       bots[id].lastDisconnectReason = text
     }
     e(`Kicked: ${sanitize(text)}`)
+    updateHeader()
   })
 
   // ── Velocity / proxy packet-level error interception ────────────────────────
@@ -825,6 +918,7 @@ bot.on('windowOpen', (window) => {
     connected = false
     const reasonText = reason ? String(reason) : ''
     w(`Disconnected${reasonText ? ': ' + sanitize(reasonText) : ''}.`)
+    updateHeader()
 
     // node-minecraft-protocol's 'end' reason is almost always the generic
     // string "socketClosed" once the connection has already torn down — it
@@ -859,22 +953,13 @@ bot.on('windowOpen', (window) => {
     clearReconnectTimer(id)
     clearAll()
     try { bot.quit() } catch (_) {}
+    updateHeader()
   }
 
   if (!activeId) activeId = id
   updateHeader()
   return bot
 }
-
-// ── Connect all bots with staggered delay ─────────────────────────────────────
-let currentConnectDelay = 0;
-BOT_NAMES.forEach((name, index) => {
-  setTimeout(() => {
-    createBotInstance(name)
-    if (index === 0) switchTo(name)
-  }, currentConnectDelay)
-  currentConnectDelay += CONNECT_DELAY_MS + Math.floor(Math.random() * (CONNECT_DELAY_RANDOM_MS + 1))
-})
 
 // ── Proxy stall watchdog ─────────────────────────────────────────────────────
 // Force-kills sockets for bots that have gone silent while spawned (see config
@@ -1081,7 +1166,7 @@ function runLocalCommandForBot(id, cmd) {
 
     case '/clear': {
       entry.logs = []
-      if (id === activeId) { logBox.setContent(''); debouncedRender() }
+      broadcast({ type: 'clear', id })
       return true
     }
 
@@ -1103,8 +1188,6 @@ function runLocalCommandForBot(id, cmd) {
           switchTo(remainingNames[remainingNames.length - 1])
         } else {
           activeId = null
-          logBox.setContent('')
-          debouncedRender()
         }
       }
       updateHeader()
@@ -1862,6 +1945,7 @@ function handleCommand(trimmed) {
     case '/exit':
       logWarn('Exiting all bots…')
       Object.values(bots).forEach(({ bot }) => { try { bot.quit() } catch (_) {} })
+      try { wss.clients.forEach(c => c.close()) } catch (_) {}
       setTimeout(() => process.exit(0), 300)
       break
 
@@ -1872,84 +1956,267 @@ function handleCommand(trimmed) {
   }
 }
 
-// ── Input handling & History ──────────────────────────────────────────────────
-const HISTORY_FILE = path.join(__dirname, '.command_history')
-const MAX_HISTORY = 500
+// ── Web page (single-file HTML/CSS/JS client) ───────────────────────────────
+const PAGE_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mineflayer AFK Console</title>
+<style>
+  :root { --bg:#0d0d16; --panel:#12121e; --border:#2a2a3d; --accent:#3a7bd5; --green:#50fa7b; --red:#ff5555; }
+  * { box-sizing: border-box; }
+  html, body { height:100%; margin:0; background:var(--bg); color:#eaeaf5; font-family: 'Consolas','Menlo',monospace; }
+  #app { display:flex; flex-direction:column; height:100vh; }
+  header { background:linear-gradient(90deg,#1e3a8a,#2563eb); color:#fff; padding:10px 16px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:6px; }
+  header h1 { font-size:15px; margin:0; letter-spacing:.5px; }
+  header .info { font-size:12px; opacity:.9; }
+  #status-dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#888; margin-right:6px; }
+  #status-dot.online { background:var(--green); }
+  #status-dot.offline { background:var(--red); }
+  #body { flex:1; display:flex; min-height:0; }
+  #sidebar { width:220px; background:var(--panel); border-right:1px solid var(--border); overflow-y:auto; flex-shrink:0; }
+  .bot-item { padding:10px 12px; cursor:pointer; border-bottom:1px solid var(--border); font-size:13px; display:flex; align-items:center; justify-content:space-between; }
+  .bot-item:hover { background:#1a1a2b; }
+  .bot-item.selected { background:#20304f; border-left:3px solid var(--accent); }
+  .bot-item .dot { width:8px; height:8px; border-radius:50%; margin-right:8px; flex-shrink:0; }
+  .bot-item .dot.on { background:var(--green); }
+  .bot-item .dot.off { background:var(--red); }
+  .bot-item .name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #main { flex:1; display:flex; flex-direction:column; min-width:0; }
+  #log { flex:1; overflow-y:auto; padding:10px 14px; font-size:13px; line-height:1.5; white-space:pre-wrap; word-break:break-word; }
+  #log .line { margin:0 0 2px 0; }
+  #inputbar { display:flex; border-top:1px solid var(--border); background:var(--panel); }
+  #cmd { flex:1; background:transparent; border:0; color:#fff; padding:12px 14px; font-family:inherit; font-size:14px; outline:none; }
+  #cmd::placeholder { color:#666; }
+  #sendbtn { background:var(--accent); border:0; color:#fff; padding:0 20px; cursor:pointer; font-family:inherit; }
+  #sendbtn:hover { background:#4c8ae0; }
+  ::-webkit-scrollbar { width:10px; }
+  ::-webkit-scrollbar-thumb { background:#333; border-radius:5px; }
+  #help-hint { font-size:11px; color:#777; padding:4px 14px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>⛏ MINEFLAYER AFK CONSOLE</h1>
+    <div class="info"><span id="status-dot"></span><span id="header-info">connecting…</span></div>
+  </header>
+  <div id="body">
+    <div id="sidebar">
+      <div class="bot-item" data-id="__system__"><span class="dot off" id="dot-__system__"></span><span class="name">System</span></div>
+      <div class="bot-item" data-id="__all__"><span class="dot off"></span><span class="name">All (live)</span></div>
+      <div id="bot-list"></div>
+    </div>
+    <div id="main">
+      <div id="log"></div>
+      <div id="help-hint">Tab = complete · ↑/↓ = history · Enter = send</div>
+      <div id="inputbar">
+        <input id="cmd" autocomplete="off" placeholder="/help for commands, or type a chat message…">
+        <button id="sendbtn">Send</button>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+(function () {
+  const SYSTEM_ID = '__system__', ALL_ID = '__all__'
+  const logEl = document.getElementById('log')
+  const cmdEl = document.getElementById('cmd')
+  const sidebarList = document.getElementById('bot-list')
+  const headerInfo = document.getElementById('header-info')
+  const statusDot = document.getElementById('status-dot')
+  const MAX_DOM_LINES = 2000
 
-// Load persisted history on startup
-const commandHistory = (() => {
-  try {
-    const data = fs.readFileSync(HISTORY_FILE, 'utf8')
-    return data.split('\n').filter(Boolean).slice(-MAX_HISTORY)
-  } catch (_) { return [] }
-})()
-let historyIndex = -1
+  let selected = SYSTEM_ID
+  let activeId = null
+  let botsInfo = []
+  let commandNames = []
+  let history = []
+  let historyIdx = -1
+  let draft = ''
+  let ws = null
 
-function saveHistory() {
-  try { fs.writeFileSync(HISTORY_FILE, commandHistory.join('\n') + '\n') } catch (_) {}
-}
+  const COLOR_MAP = { red:'#ff5555', green:'#50fa7b', blue:'#6ea8fe', cyan:'#67e8f9', magenta:'#f472b6', yellow:'#f1fa8c', white:'#f4f4f8', gray:'#8892b0', grey:'#8892b0', black:'#1a1a2e' }
+  const TAG_RE = /\\{(\\/?)(bold|underline|blink|inverse|red|green|blue|cyan|magenta|yellow|white|gray|grey|black|center|left|right)(-fg|-bg)?\\}/g
 
-inputBox.key('up', () => {
-  if (historyIndex < commandHistory.length - 1) {
-    historyIndex++
-    inputBox.setValue(commandHistory[commandHistory.length - 1 - historyIndex])
-    debouncedRender()
+  function renderLine(text) {
+    let out = '', last = 0, m, stack = []
+    TAG_RE.lastIndex = 0
+    while ((m = TAG_RE.exec(text))) {
+      out += text.slice(last, m.index)
+      last = TAG_RE.lastIndex
+      const closing = m[1] === '/', name = m[2], kind = m[3] || ''
+      if (!closing) {
+        let style = ''
+        if (name === 'bold') style = 'font-weight:700;'
+        else if (name === 'underline') style = 'text-decoration:underline;'
+        else if (COLOR_MAP[name]) style = kind === '-bg' ? ('background-color:' + COLOR_MAP[name] + ';') : ('color:' + COLOR_MAP[name] + ';')
+        out += '<span style="' + style + '">'
+        stack.push(name)
+      } else if (stack.length) {
+        out += '</span>'
+        stack.pop()
+      }
+    }
+    out += text.slice(last)
+    while (stack.length) { out += '</span>'; stack.pop() }
+    return out
   }
-})
 
-inputBox.key('down', () => {
-  if (historyIndex > 0) {
-    historyIndex--
-    inputBox.setValue(commandHistory[commandHistory.length - 1 - historyIndex])
-    debouncedRender()
-  } else if (historyIndex === 0) {
-    historyIndex = -1
-    inputBox.setValue('')
-    debouncedRender()
+  function appendLine(prefixId, text) {
+    const div = document.createElement('div')
+    div.className = 'line'
+    div.dataset.id = prefixId
+    const prefix = (selected === ALL_ID && prefixId !== SYSTEM_ID) ? '<span style="color:#556;">[' + prefixId + ']</span> ' : ''
+    div.innerHTML = prefix + renderLine(text)
+    logEl.appendChild(div)
+    while (logEl.children.length > MAX_DOM_LINES) logEl.removeChild(logEl.firstChild)
+    const atBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 80
+    if (atBottom) logEl.scrollTop = logEl.scrollHeight
   }
-})
 
-inputBox.key('tab', () => {
-  const val = inputBox.getValue()
-  if (val.startsWith('/')) {
-    const available = Object.keys(COMMANDS)
-    const prefix = val.split(' ')[0]
-    const matches = available.filter(c => c.startsWith(prefix))
-    if (matches.length === 1) {
-      // Strip parameter hints (e.g. "/warp <place>" → "/warp ")
-      const base = matches[0].replace(/ [<\[].*$/, '')
-      inputBox.setValue(base + ' ')
-      debouncedRender()
-    } else if (matches.length > 1) {
-      logInfo(`{cyan-fg}Matches:{/cyan-fg} ${matches.map(m => m.split(' ')[0]).join(', ')}`)
+  function shouldShow(id) { return selected === ALL_ID || selected === id }
+
+  function clearLog() { logEl.innerHTML = '' }
+
+  function requestHistory(id) {
+    clearLog()
+    if (id === ALL_ID) return
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'history', id }))
+  }
+
+  function renderSidebar() {
+    sidebarList.innerHTML = ''
+    botsInfo.forEach((b, idx) => {
+      const div = document.createElement('div')
+      div.className = 'bot-item' + (selected === b.id ? ' selected' : '')
+      div.dataset.id = b.id
+      div.innerHTML = '<span class="dot ' + (b.online ? 'on' : 'off') + '"></span>' +
+        '<span class="name">[' + (idx + 1) + '] ' + b.id + (b.id === activeId ? ' ★' : '') + '</span>'
+      div.addEventListener('click', () => selectTab(b.id, true))
+      sidebarList.appendChild(div)
+    })
+    document.querySelectorAll('#sidebar > .bot-item[data-id="' + SYSTEM_ID + '"], #sidebar > .bot-item[data-id="' + ALL_ID + '"]').forEach(el => {
+      el.classList.toggle('selected', el.dataset.id === selected)
+    })
+    const online = botsInfo.filter(b => b.online).length
+    statusDot.className = online > 0 ? 'online' : 'offline'
+    headerInfo.textContent = 'Active: ' + (activeId || 'none') + '  |  ' + online + '/' + botsInfo.length + ' online' +
+      (botsInfo[0] && botsInfo[0].proxy ? '  —  Proxy: ' + botsInfo[0].proxy : '')
+  }
+
+  function selectTab(id, sendSwitch) {
+    selected = id
+    renderSidebar()
+    requestHistory(id)
+    if (sendSwitch && id !== SYSTEM_ID && id !== ALL_ID) {
+      sendCommand('/switch ' + id)
     }
   }
-})
 
-inputBox.on('submit', (input) => {
-  const trimmed = (input || '').trim()
-  inputBox.clearValue()
-  inputBox.focus()
-  debouncedRender()
-
-  if (trimmed.length > 0) {
-    if (commandHistory[commandHistory.length - 1] !== trimmed) {
-      commandHistory.push(trimmed)
-      if (commandHistory.length > MAX_HISTORY) commandHistory.shift()
-      saveHistory()
-    }
-    historyIndex = -1
-    handleCommand(trimmed)
-  }
-})
-
-// Escape key can cause neo-blessed to stop reading input — re-focus immediately
-inputBox.on('cancel', () => {
-  inputBox.clearValue()
-  setImmediate(() => {
-    inputBox.focus()
-    debouncedRender()
+  document.querySelectorAll('#sidebar > .bot-item').forEach(el => {
+    el.addEventListener('click', () => selectTab(el.dataset.id, false))
   })
+
+  function sendCommand(text) {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'command', text }))
+  }
+
+  function connect() {
+    const proto = location.protocol === 'https:' ? 'wss://' : 'ws://'
+    ws = new WebSocket(proto + location.host)
+    ws.onopen = () => { headerInfo.textContent = 'connected' }
+    ws.onclose = () => { statusDot.className = 'offline'; headerInfo.textContent = 'disconnected — retrying…'; setTimeout(connect, 2000) }
+    ws.onerror = () => {}
+    ws.onmessage = (ev) => {
+      let msg
+      try { msg = JSON.parse(ev.data) } catch (_) { return }
+      if (msg.type === 'init') {
+        activeId = msg.activeId
+        botsInfo = msg.bots || []
+        commandNames = Object.keys(msg.commands || {})
+        history = (msg.history || []).slice()
+        if (selected === SYSTEM_ID && activeId) selectTab(activeId, false)
+        else renderSidebar()
+        requestHistory(selected)
+      } else if (msg.type === 'botlist') {
+        activeId = msg.activeId
+        botsInfo = msg.bots || []
+        renderSidebar()
+      } else if (msg.type === 'log') {
+        msg.entries.forEach(en => { if (shouldShow(en.id)) appendLine(en.id, en.text) })
+      } else if (msg.type === 'history') {
+        if (msg.id === selected) {
+          clearLog()
+          msg.logs.forEach(t => appendLine(msg.id, t))
+        }
+      } else if (msg.type === 'clear') {
+        if (msg.id === selected) clearLog()
+      }
+    }
+  }
+  connect()
+
+  cmdEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      const val = cmdEl.value.trim()
+      cmdEl.value = ''
+      historyIdx = -1
+      if (!val) return
+      if (history[history.length - 1] !== val) history.push(val)
+      sendCommand(val)
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault()
+      if (history.length === 0) return
+      if (historyIdx === -1) draft = cmdEl.value
+      if (historyIdx < history.length - 1) historyIdx++
+      cmdEl.value = history[history.length - 1 - historyIdx] || ''
+    } else if (e.key === 'ArrowDown') {
+      e.preventDefault()
+      if (historyIdx > 0) { historyIdx--; cmdEl.value = history[history.length - 1 - historyIdx] }
+      else if (historyIdx === 0) { historyIdx = -1; cmdEl.value = draft }
+    } else if (e.key === 'Tab') {
+      e.preventDefault()
+      const val = cmdEl.value
+      if (!val.startsWith('/')) return
+      const prefix = val.split(' ')[0]
+      const matches = commandNames.filter(c => c.startsWith(prefix))
+      if (matches.length === 1) cmdEl.value = matches[0].replace(/ [<\\[].*$/, '') + ' '
+    }
+  })
+  document.getElementById('sendbtn').addEventListener('click', () => {
+    const val = cmdEl.value.trim()
+    cmdEl.value = ''
+    if (!val) return
+    if (history[history.length - 1] !== val) history.push(val)
+    sendCommand(val)
+  })
+  cmdEl.focus()
+})()
+</script>
+</body>
+</html>`
+
+// ── Connect all bots with staggered delay ─────────────────────────────────────
+let currentConnectDelay = 0;
+BOT_NAMES.forEach((name, index) => {
+  setTimeout(() => {
+    createBotInstance(name)
+    if (index === 0) switchTo(name)
+  }, currentConnectDelay)
+  currentConnectDelay += CONNECT_DELAY_MS + Math.floor(Math.random() * (CONNECT_DELAY_RANDOM_MS + 1))
 })
 
-screen.render()
+// ── Graceful shutdown ────────────────────────────────────────────────────────
+process.on('SIGINT', () => {
+  console.warn('SIGINT received — disconnecting all bots and shutting down…')
+  Object.values(bots).forEach(({ bot }) => { try { bot.quit() } catch (_) {} })
+  try { wss.clients.forEach(c => c.close()) } catch (_) {}
+  server.close(() => process.exit(0))
+  setTimeout(() => process.exit(0), 1500)
+})
+
+server.listen(WEB_PORT, () => {
+  console.log(`Web console listening on http://0.0.0.0:${WEB_PORT} (username: ${ADMIN_USERNAME})`)
+})
