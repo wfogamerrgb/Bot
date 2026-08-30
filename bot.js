@@ -696,6 +696,12 @@ bot.on('resourcePack', (url, hashOrUuid) => {
         i('Right-clicking compass (server selector)…')
         try { bot.activateItem() } catch (err) { e(`activateItem failed: ${sanitize(err.message)}`) }
       }, 3600 + Math.random() * 600)
+    } else {
+      const serverCmd = process.env.SERVER_COMMAND || '/server lifesteal'
+      pushT(() => {
+        i(`Sending server command: ${serverCmd}`)
+        bot.chat(serverCmd)
+      }, 3600 + Math.random() * 600)
     }
   })
 bot.on('windowOpen', (window) => {
