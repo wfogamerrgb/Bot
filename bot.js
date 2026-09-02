@@ -408,7 +408,7 @@ const wss = new WebSocket.Server({ noServer: true, perMessageDeflate: true })
 
 server.on('upgrade', (req, socket, head) => {
   if (!checkAuth(req.headers.authorization)) {
-socket.write('HTTP/1.1 401')
+//socket.write('HTTP/1.1 401')
     socket.destroy()
     return
   }
