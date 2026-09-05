@@ -5,7 +5,7 @@ const path = require('path')
 const http = require('http')
 const crypto = require('crypto')
 const zlib = require('zlib')
-const { exec } = require('child_process')
+const { exec, spawn } = require('child_process')
 const mineflayer = require('mineflayer')
 const armorManager = require('mineflayer-armor-manager')
 const { pathfinder, Movements, goals: { GoalNear } } = require('mineflayer-pathfinder')
@@ -24,6 +24,7 @@ const MAX_RECONNECT = parseInt(process.env.MAX_RECONNECT || '17', 10)
 const GUI_SLOT = parseInt(process.env.GUI_SLOT || '11', 10)
 const WARP_AFK = process.env.WARP_COMMAND || '/warp afk'
 const WARP_BEFORE_CRATE = (process.env.WARP_BEFORE_CRATE ?? process.env.WARPORNOT ?? 'true').toLowerCase() !== 'false'
+const SERVER_COMMAND = (process.env.SERVER_COMMAND ?? '').trim()
 
 // ── Interface config: TUI_GUI + WEB_GUI ──────────────────────────────────────
 // WEB_GUI=true serves the web dashboard; TUI_GUI=true runs the blessed terminal UI.
@@ -39,6 +40,8 @@ const WEB_PORT_MAX_ATTEMPTS = parseInt(process.env.WEB_PORT_MAX_ATTEMPTS || '20'
 const WEB_PASSWORD = process.env.WEB_PASSWORD || null // null → random password generated + printed at startup
 const WEB_SESSION_HOURS = parseFloat(process.env.WEB_SESSION_HOURS || '12')
 const WEB_LOGIN_MAX_FAILS = parseInt(process.env.WEB_LOGIN_MAX_FAILS || '10', 10)
+const WEB_TERMINAL_LOG = /^(1|true|yes|on)$/i.test(process.env.WEB_TERMINAL_LOG ?? 'true')
+const WEB_TERMINAL_ENABLED = /^(1|true|yes|on)$/i.test(process.env.WEB_TERMINAL_ENABLED || 'false')
 const WS_BROADCAST_INTERVAL_MS = parseInt(process.env.WS_BROADCAST_INTERVAL_MS || '100', 10)
 const LOG_MAX_LINES = parseInt(process.env.LOG_MAX_LINES || '5000', 10)
 const WINDOW_DEBUG = /^(1|true|yes|on)$/i.test(process.env.WINDOW_DEBUG || '') // true restores full window slot dumps
@@ -580,6 +583,10 @@ body{background:var(--bg);color:var(--txt);font:13px/1.45 ui-monospace,'Cascadia
 header{grid-area:top;display:flex;align-items:center;gap:14px;padding:0 14px;background:linear-gradient(180deg,#101a24,#0d141c);border-bottom:1px solid var(--line)}
 .logo{font-weight:700;color:#e8f0f6;letter-spacing:.5px}.logo b{color:var(--acc)}
 #chips{display:flex;gap:8px;margin-left:auto;flex-wrap:wrap}
+.wsstate{border:1px solid var(--line);border-radius:6px;padding:2px 8px;font-size:11px;color:var(--dim)}
+.wsstate.up{color:var(--grn);border-color:rgba(74,222,128,.45)}
+.wsstate.wait{color:var(--yel);border-color:rgba(251,191,36,.45)}
+.wsstate.down{color:var(--red);border-color:rgba(248,113,113,.45)}
 .chip{background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:2px 8px;font-size:11px;color:var(--dim)}
 .chip b{color:var(--txt);font-weight:600}
 #logout{background:none;border:1px solid var(--line);color:var(--dim);border-radius:6px;padding:3px 10px;cursor:pointer;font:inherit;font-size:11px}
@@ -606,15 +613,15 @@ main{grid-area:main;display:flex;flex-direction:column;min-width:0}
 button.tb{background:none;border:1px solid var(--line);color:var(--dim);border-radius:6px;padding:3px 9px;cursor:pointer;font:inherit;font-size:11px}
 button.tb:hover{color:var(--txt);border-color:var(--acc)}
 #newchip{position:absolute;top:-9px;right:150px;background:var(--acc);color:#04211d;border-radius:9px;padding:1px 8px;font-size:10px;font-weight:700;cursor:pointer;display:none}
-#logwrap{flex:1;overflow-y:auto;padding:6px 0;background:var(--bg)}
+#logwrap{flex:1;overflow-y:auto;padding:6px 0 70px;background:var(--bg)}
 .ln{padding:0 14px;white-space:pre-wrap;word-break:break-word}
 .ln .tag{color:var(--dim);font-size:11px}
 .c-red{color:var(--red)}.c-green{color:var(--grn)}.c-blue{color:var(--blu)}.c-cyan{color:var(--cyan)}
 .c-magenta{color:var(--mag)}.c-yellow{color:var(--yel)}.c-white{color:#e8f0f6}
 .c-gray,.c-grey{color:var(--dim)}.c-black{color:#0a0e13}.b{font-weight:700}
-#cmdbar{position:relative;display:flex;gap:8px;align-items:center;padding:9px 12px;background:var(--panel);border-top:1px solid var(--line)}
+#cmdbar{position:fixed;left:250px;right:0;bottom:0;z-index:30;display:flex;min-height:56px;gap:8px;align-items:center;padding:9px 12px;background:var(--panel);border-top:1px solid var(--line);box-shadow:0 -6px 18px rgba(0,0,0,.25)}
 .prompt{color:var(--grn);font-weight:700}
-#cmd{flex:1;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:7px 10px;color:var(--txt);font:inherit}
+#cmd{display:block;flex:1 1 auto;min-width:0;height:32px;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:7px 10px;color:var(--txt);font:inherit}
 #cmd:focus{outline:none;border-color:var(--acc)}
 #sugg{position:absolute;bottom:100%;left:12px;right:12px;background:var(--panel2);border:1px solid var(--line);border-radius:8px 8px 0 0;max-height:220px;overflow:auto;z-index:5}
 .sg{padding:6px 10px;cursor:pointer;display:flex;gap:10px}
@@ -625,33 +632,53 @@ button.tb:hover{color:var(--txt);border-color:var(--acc)}
 #help .hcmd{display:flex;gap:12px;padding:4px 0;border-bottom:1px solid #141c26}
 #help .hcmd b{color:var(--cyan);min-width:230px;white-space:nowrap}
 #help .hcmd span{color:var(--dim)}
+#terminal{position:absolute;inset:0;background:#050708;z-index:15;display:flex;flex-direction:column}
+#terminal[hidden]{display:none}
+.terminal-head{display:flex;justify-content:space-between;align-items:center;padding:9px 12px;background:var(--panel);border-bottom:1px solid var(--line);color:var(--acc)}
+#terminalout{flex:1;overflow:auto;padding:12px;color:#b7f7c5;white-space:pre-wrap;word-break:break-word;font:13px/1.4 ui-monospace,'Cascadia Code','SF Mono',Menlo,Consolas,monospace}
+#terminalform{display:flex;gap:8px;align-items:center;padding:9px 12px;background:var(--panel);border-top:1px solid var(--line)}
+#terminalinput{flex:1;min-width:0;height:32px;background:var(--bg);border:1px solid var(--line);border-radius:6px;color:var(--txt);padding:7px 10px;font:inherit}
+#terminalinput:focus{outline:none;border-color:var(--acc)}
 #toasts{position:fixed;right:14px;bottom:70px;display:flex;flex-direction:column;gap:8px;z-index:20}
 .toast{background:var(--panel2);border:1px solid var(--line);border-left:3px solid var(--acc);border-radius:8px;padding:9px 14px;max-width:340px;font-size:12px;box-shadow:0 6px 24px rgba(0,0,0,.5)}
 .toast.bad{border-left-color:var(--red)}.toast.good{border-left-color:var(--grn)}
 .toast.out{opacity:0;transition:opacity .4s}
-@media(max-width:760px){#app{grid-template-columns:1fr;grid-template-areas:"top" "side" "main";grid-template-rows:46px 160px 1fr}#search{width:110px}aside{display:flex;gap:6px;overflow-x:auto;overflow-y:hidden}.bot{min-width:180px}.views{min-width:140px;flex-direction:column}}
+@media(max-width:760px){#app{grid-template-columns:1fr;grid-template-areas:"top" "side" "main";grid-template-rows:46px 160px 1fr}#cmdbar{left:0}#search{width:110px}aside{display:flex;gap:6px;overflow-x:auto;overflow-y:hidden}.bot{min-width:180px}.views{min-width:140px;flex-direction:column}}
 </style></head><body>
 <div id="app">
-<header><div class="logo">⛏ AFK<b>CONSOLE</b></div><div id="chips"></div><button id="logout">sign out</button></header>
-<aside><div class="views"><div class="vchip on" data-view="all">ALL</div><div class="vchip" data-view="system">SYSTEM</div></div><div id="botlist"></div></aside>
+<header><div class="logo">⛏ AFK<b>CONSOLE</b></div><div id="chips"></div><div id="wsstate" class="wsstate down">offline</div><button id="logout">sign out</button></header>
+<aside><div class="views"><div class="vchip on" data-view="all">ALL</div><div class="vchip" data-view="system">SYSTEM</div><button class="vchip" id="terminalbtn" type="button">TERMINAL</button></div><div id="botlist"></div></aside>
 <main>
 <div id="loghead"><span id="channame">ALL CHANNELS</span><span id="newchip"></span>
-<input id="search" placeholder="filter logs…"><button class="tb" id="followbtn">⏸ pause</button>
+<input id="search" placeholder="filter logs…"><button class="tb" id="topbtn" type="button" title="scroll to top">↑ top</button><button class="tb" id="bottombtn" type="button" title="scroll to newest">↓ bottom</button><button class="tb" id="followbtn" type="button">⏸ pause</button>
 <button class="tb" id="clearbtn">clear</button><button class="tb" id="helpbtn">? cmds</button></div>
 <div id="logwrap"><div id="log"></div></div>
-<div id="cmdbar"><div id="sugg" hidden></div><span class="prompt">❯</span>
-<input id="cmd" placeholder="type / for commands — runs on selected bot" autocomplete="off" spellcheck="false">
-<button class="tb" id="sendbtn">send</button></div>
+<form id="cmdbar" action="/command" method="post"><div id="sugg" hidden></div><span class="prompt">❯</span>
+<input id="cmd" name="text" placeholder="type / for commands — runs on selected bot" autocomplete="off" spellcheck="false">
+<button class="tb" id="sendbtn">send</button>
+</form>
 <div id="help" hidden></div>
+<div id="terminal" hidden><div class="terminal-head"><b>bash</b><button class="tb" id="terminalclose" type="button">close</button></div><pre id="terminalout"></pre><form id="terminalform"><span class="prompt">$</span><input id="terminalinput" autocomplete="off" spellcheck="false"><button class="tb" type="submit">run</button></form></div>
 </main>
 </div>
 <div id="toasts"></div>
 <script>
 (function(){
 'use strict'
-var ws=null,view='all',follow=true,lines=[],hist=[],hIdx=-1,pending=0,cmds={},prevOnline={},rcDelay=600,rcTimer=null,rt=null
+var ws=null,view='all',follow=false,scrollOnNextLog=false,lines=[],hist=[],hIdx=-1,pending=0,cmds={},prevOnline={},rcDelay=600,rcTimer=null,rt=null,pollTimer=null,pollBusy=false,queuedCmds=[],terminalOpen=false
 function el(i){return document.getElementById(i)}
-var TAGRE=/\{(\/?)([a-z]+)(-fg|-bg)?\}/g
+function setWsState(kind,text){var state=el('wsstate');state.className='wsstate '+kind;state.textContent=text}
+function terminalWrite(text){var out=el('terminalout');out.textContent+=text;out.scrollTop=out.scrollHeight}
+function openTerminal(){
+if(!ws||ws.readyState!==1){terminalWrite('WebSocket is required for the terminal.\\n');return}
+terminalOpen=true;el('terminal').hidden=false;el('terminalinput').focus();ws.send(JSON.stringify({t:'terminal',action:'open'}))
+}
+function closeTerminal(){terminalOpen=false;el('terminal').hidden=true;if(ws&&ws.readyState===1)ws.send(JSON.stringify({t:'terminal',action:'close'}))}
+function reportClientError(message,stack){
+try{fetch('/api/client-error',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:String(message),stack:stack?String(stack):''})})}catch(_){}}
+window.addEventListener('error',function(e){reportClientError(e.message||'window error',e.error&&e.error.stack)})
+window.addEventListener('unhandledrejection',function(e){reportClientError(e.reason&&e.reason.message||String(e.reason||'unhandled rejection'),e.reason&&e.reason.stack)})
+var TAGRE=/\\{(\\/?)([a-z]+)(-fg|-bg)?\\}/g
 var CLR={'red-fg':'c-red','green-fg':'c-green','blue-fg':'c-blue','cyan-fg':'c-cyan','magenta-fg':'c-magenta','yellow-fg':'c-yellow','white-fg':'c-white','gray-fg':'c-gray','grey-fg':'c-gray','black-fg':'c-black'}
 function seg(t,act){var c=[],k;for(k in act){if(CLR[k])c.push(CLR[k]);if(k==='bold')c.push('b')}return c.length?'<span class="'+c.join(' ')+'">'+t+'</span>':t}
 function parseLine(s){var html='',plain='',act={},last=0,m;TAGRE.lastIndex=0
@@ -660,16 +687,39 @@ var k=m[2]+(m[3]||'');if(m[1]){delete act[k]}else{act[k]=1}
 last=TAGRE.lastIndex}
 var tl=s.slice(last);if(tl){html+=seg(tl,act);plain+=tl}
 return{h:html,p:plain}}
-function connect(){try{ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws')}catch(e){return}
-ws.onopen=function(){rcDelay=600;ws.send(JSON.stringify({t:'sub',id:view}))}
+function startHttpFallback(){
+if(pollTimer)return
+setWsState('wait','http fallback')
+var poll=function(){
+if(pollBusy)return
+pollBusy=true
+fetch('/api/state?view='+encodeURIComponent(view),{credentials:'same-origin',cache:'no-store'}).then(function(r){
+if(!r.ok)throw Error('HTTP '+r.status)
+return r.json()
+}).then(function(m){
+cmds=m.commands||cmds;hist=m.cmdHistory||hist;renderBots(m.bots||[]);renderStats(m.stats||{});buildHelp();setLines(m.lines||[]);setWsState('up','http fallback')
+}).catch(function(){setWsState('down','offline')}).then(function(){pollBusy=false})
+}
+poll();pollTimer=setInterval(poll,2000)
+}
+function stopHttpFallback(){if(pollTimer){clearInterval(pollTimer);pollTimer=null}}
+function scheduleConnect(){if(rcTimer)clearTimeout(rcTimer);rcTimer=setTimeout(function(){rcTimer=null;connect()},rcDelay);rcDelay=Math.min(Math.round(rcDelay*1.7),9000)}
+function connect(){
+if(ws&&(ws.readyState===WebSocket.CONNECTING||ws.readyState===WebSocket.OPEN))return
+setWsState('wait','connecting')
+var endpoint=(location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws'
+try{ws=new WebSocket(endpoint)}catch(e){startHttpFallback();scheduleConnect();return}
+ws.onopen=function(){rcDelay=600;stopHttpFallback();setWsState('up','connected');ws.send(JSON.stringify({t:'sub',id:view}));while(queuedCmds.length)ws.send(JSON.stringify({t:'cmd',text:queuedCmds.shift()}))}
 ws.onmessage=function(ev){var m;try{m=JSON.parse(ev.data)}catch(e){return}
 if(m.t==='hello'){cmds=m.commands||{};hist=m.cmdHistory||[];renderBots(m.bots||[]);renderStats(m.stats||{});buildHelp();toast('connected to console','good')}
 else if(m.t==='log'){addLines(m.entries||[])}
 else if(m.t==='bots'){renderBots(m.bots||[]);renderStats(m.stats||{})}
 else if(m.t==='history'){if(m.id===view)setLines(m.lines||[])}
-else if(m.t==='clear'){if(m.id===view){lines=[];el('log').innerHTML=''}}}
-ws.onclose=function(){if(rcTimer)clearTimeout(rcTimer);rcTimer=setTimeout(function(){rcDelay=Math.min(rcDelay*1.7,9000);connect()},rcDelay)}
-ws.onerror=function(){}}
+else if(m.t==='clear'){if(m.id===view){lines=[];el('log').innerHTML=''}}
+else if(m.t==='terminal'){terminalWrite(m.data||'')}}
+ws.onclose=function(){startHttpFallback();scheduleConnect()}
+ws.onerror=function(){startHttpFallback()}
+}
 function setView(v){view=v;lines=[];pending=0;el('log').innerHTML='';el('newchip').style.display='none'
 el('channame').textContent=v==='all'?'ALL CHANNELS':v==='system'?'SYSTEM':v
 var chips=document.querySelectorAll('.vchip'),i
@@ -677,6 +727,7 @@ for(i=0;i<chips.length;i++)chips[i].classList.toggle('on',chips[i].getAttribute(
 var cards=document.querySelectorAll('.bot')
 for(i=0;i<cards.length;i++)cards[i].classList.toggle('sel',cards[i].getAttribute('data-id')===v)
 if(ws&&ws.readyState===1)ws.send(JSON.stringify({t:'sub',id:v}))
+else if(pollTimer)startHttpFallback()
 setFollow(true)}
 function scrollBottom(){var w=el('logwrap');w.scrollTop=w.scrollHeight;pending=0;el('newchip').style.display='none'}
 function setFollow(f){follow=f;el('followbtn').textContent=f?'⏸ pause':'▶ follow';if(f)scrollBottom()}
@@ -696,7 +747,8 @@ if(!follow)pending++}}
 if(app){L.appendChild(frag)
 while(L.childNodes.length>1200)L.removeChild(L.firstChild)
 while(lines.length>3000)lines.shift()
-if(follow)scrollBottom()
+if(scrollOnNextLog){scrollOnNextLog=false;scrollBottom()}
+else if(follow)scrollBottom()
 else{var c=el('newchip');c.style.display='block';c.textContent=pending+' new ↓';c.onclick=scrollBottom}}}
 function setLines(ls){lines=[];pending=0;el('newchip').style.display='none';var L=el('log');L.innerHTML=''
 for(var i=0;i<ls.length;i++){var pr=parseLine(ls[i]);lines.push({h:pr.h,p:pr.p,pre:''})
@@ -744,7 +796,9 @@ function toast(text,kind){var d=document.createElement('div');d.className='toast
 el('toasts').appendChild(d)
 setTimeout(function(){d.classList.add('out');setTimeout(function(){d.remove()},500)},6000)}
 var cinput=el('cmd')
-function sendCmd(v){hist.push(v);hIdx=-1;if(ws&&ws.readyState===1)ws.send(JSON.stringify({t:'cmd',text:v}))}
+function sendCmd(v){hist.push(v);hIdx=-1;scrollOnNextLog=true;scrollBottom();setTimeout(scrollBottom,0);setTimeout(scrollBottom,180)
+if(ws&&ws.readyState===1){ws.send(JSON.stringify({t:'cmd',text:v}));return}
+fetch('/api/command',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:v})}).then(function(r){if(!r.ok)throw Error('HTTP '+r.status)}).catch(function(){queuedCmds.push(v);setWsState('wait','queued');connect()})}
 function hideSugg(){el('sugg').hidden=true}
 function showSugg(){var v=cinput.value
 if(!v||v.charAt(0)!=='/'){hideSugg();return}
@@ -766,7 +820,12 @@ if(kids.length){cinput.value=kids[0].querySelector('b').textContent;showSugg()}}
 else if(e.key==='ArrowUp'&&!el('sugg').hidden){return}
 else if(e.key==='ArrowUp'){if(hist.length){if(hIdx<0)hIdx=hist.length;hIdx=Math.max(0,hIdx-1);cinput.value=hist[hIdx]||'';e.preventDefault()}}
 else if(e.key==='ArrowDown'){if(hIdx>=0){hIdx++;if(hIdx>=hist.length){hIdx=-1;cinput.value=''}else cinput.value=hist[hIdx];e.preventDefault()}}})
-el('sendbtn').onclick=function(){var v=cinput.value.trim();cinput.value='';hideSugg();if(v)sendCmd(v)}
+el('cmdbar').addEventListener('submit',function(e){e.preventDefault();var v=cinput.value.trim();cinput.value='';hideSugg();if(v)sendCmd(v)})
+el('topbtn').onclick=function(){follow=false;scrollOnNextLog=false;el('followbtn').textContent='▶ follow';el('logwrap').scrollTop=0}
+el('bottombtn').onclick=function(){setFollow(true)}
+el('terminalbtn').onclick=openTerminal
+el('terminalclose').onclick=closeTerminal
+el('terminalform').addEventListener('submit',function(e){e.preventDefault();var input=el('terminalinput');var v=input.value;input.value='';if(ws&&ws.readyState===1&&v)ws.send(JSON.stringify({t:'terminal',action:'input',data:v+'\\n'}))})
 function buildHelp(){var h=el('help');h.innerHTML=''
 var t=document.createElement('h3');t.textContent='COMMANDS — click anywhere to dismiss';h.appendChild(t)
 Object.keys(cmds).forEach(function(k){var r=document.createElement('div');r.className='hcmd'
@@ -796,6 +855,11 @@ logFor(SYSTEM_ID, '{red-fg}✗ WEB_GUI is on but the "ws" package is missing —
 return null
 }
 
+const webTrace = (message) => {
+if (!WEB_TERMINAL_LOG) return
+try { process.stdout.write(`[web] ${new Date().toISOString()} ${message}\n`) } catch (_) {}
+}
+
 const password = WEB_PASSWORD || crypto.randomBytes(9).toString('base64url')
 if (!WEB_PASSWORD) {
 logFor(SYSTEM_ID, `{yellow-fg}⚠ WEB_PASSWORD not set — generated login password: ${password} (set WEB_PASSWORD in .env to pin it){/yellow-fg}`)
@@ -807,7 +871,13 @@ const fails = new Map() // ip → { count, until }
 const clients = new Set() // ws contexts: { ws, view, alive, send }
 const handle = { clients, port: null, url: null }
 
-const pageBuf = Buffer.from(PAGE_HTML, 'utf8')
+// Serve the dashboard script separately. This avoids a large inline script being
+// rejected or truncated by a forwarded browser page while still keeping the UI
+// source co-located with the dashboard markup.
+const appJsMatch = PAGE_HTML.match(/<script>([\s\S]*?)<\/script>/)
+const appJsBuf = Buffer.from(appJsMatch ? appJsMatch[1] : '', 'utf8')
+const pageHtml = PAGE_HTML.replace(/<script>[\s\S]*?<\/script>/, '<script src="/app.js"></script>')
+const pageBuf = Buffer.from(pageHtml, 'utf8')
 let pageGz = null
 try { pageGz = zlib.gzipSync(pageBuf, { level: 6 }) } catch (_) {}
 
@@ -852,6 +922,7 @@ const server = http.createServer(async (req, res) => {
 try {
 const url = new URL(req.url, 'http://localhost')
 const p = url.pathname
+webTrace(`${req.method} ${p} from ${req.socket.remoteAddress || '?'}`)
 if (p === '/health') { res.writeHead(200); res.end('ok'); return }
 if (p === '/favicon.ico') { res.writeHead(204); res.end(); return }
 
@@ -876,10 +947,12 @@ Location: '/',
 })
 res.end()
 logFor(SYSTEM_ID, `{green-fg}✓ Web GUI login from ${ip}{/green-fg}`)
+webTrace(`login success from ${ip}`)
 } else {
 const cnt = ((f && f.count) || 0) + 1
 fails.set(ip, { count: cnt, until: cnt >= WEB_LOGIN_MAX_FAILS ? Date.now() + 10 * 60_000 : 0 })
 if (cnt >= WEB_LOGIN_MAX_FAILS) logFor(SYSTEM_ID, `{red-fg}✗ Web login locked out for ${ip} (10 min){/red-fg}`)
+webTrace(`login failed from ${ip} (attempt ${cnt})`)
 res.writeHead(303, { Location: '/login?e=1' }); res.end()
 }
 return
@@ -892,6 +965,47 @@ res.end()
 return
 }
 if (!sessionValid(tokenFromReq(req, url))) { res.writeHead(303, { Location: '/login' }); res.end(); return }
+webTrace(`authenticated request ${req.method} ${p}`)
+if (p === '/api/client-error' && req.method === 'POST') {
+const body = await readBody(req, 8192)
+let report
+try { report = JSON.parse(body || '{}') } catch (_) { report = null }
+if (report && typeof report.message === 'string') {
+webTrace(`browser error: ${sanitize(report.message).slice(0, 500)}`)
+if (report.stack) webTrace(`browser stack: ${sanitize(String(report.stack)).slice(0, 1200)}`)
+}
+res.writeHead(204); res.end(); return
+}
+if (p === '/api/state' && req.method === 'GET') {
+const view = normalizeView(url.searchParams.get('view') || 'all') || 'all'
+res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
+res.end(JSON.stringify({ commands: COMMANDS, cmdHistory: commandHistory, bots: botSnapshot(), stats: globalStats(), lines: historyForView(view) }))
+return
+}
+if (p === '/api/command' && req.method === 'POST') {
+const body = await readBody(req)
+let msg
+try { msg = JSON.parse(body || '{}') } catch (_) { msg = null }
+if (!msg || typeof msg.text !== 'string' || !msg.text.trim()) { res.writeHead(400); res.end('invalid command'); return }
+const trimmed = msg.text.trim()
+webTrace(`HTTP command: ${sanitize(trimmed).slice(0, 300)}`)
+recordHistory(trimmed)
+handleCommand(trimmed, { selectedId: typeof msg.selectedId === 'string' ? msg.selectedId : null })
+res.writeHead(202, { 'Cache-Control': 'no-store' }); res.end('accepted')
+return
+}
+if (p === '/command' && req.method === 'POST') {
+const body = await readBody(req)
+const text = new URLSearchParams(body || '').get('text') || ''
+if (text.trim()) {
+const trimmed = text.trim()
+webTrace(`form command: ${sanitize(trimmed).slice(0, 300)}`)
+recordHistory(trimmed)
+handleCommand(trimmed, { selectedId: null })
+}
+res.writeHead(303, { Location: '/' }); res.end()
+return
+}
 if (p === '/' && req.method === 'GET') {
 const gz = /\bgzip\b/.test(req.headers['accept-encoding'] || '') && pageGz
 res.writeHead(200, {
@@ -901,21 +1015,32 @@ res.writeHead(200, {
 res.end(gz ? pageGz : pageBuf)
 return
 }
+if (p === '/app.js' && req.method === 'GET') {
+webTrace(`serving dashboard script (${appJsBuf.length} bytes)`)
+res.writeHead(200, { 'Content-Type': 'application/javascript; charset=utf-8', 'Cache-Control': 'no-store' })
+res.end(appJsBuf)
+return
+}
 res.writeHead(404); res.end('not found')
-} catch (_) { try { res.writeHead(500); res.end('error') } catch (__) {} }
+} catch (err) {
+webTrace(`request error: ${sanitize(err.stack || err.message || String(err)).slice(0, 1600)}`)
+try { res.writeHead(500); res.end('error') } catch (_) {}
+}
 })
 
 const wss = new WebSocket.Server({ noServer: true })
 server.on('upgrade', (req, socket, head) => {
 let url
 try { url = new URL(req.url, 'http://localhost') } catch (_) { socket.destroy(); return }
+webTrace(`upgrade ${req.url} from ${req.socket.remoteAddress || '?'}`)
 if (url.pathname !== '/ws') { socket.destroy(); return }
 if (!sessionValid(tokenFromReq(req, url))) {
+webTrace('upgrade rejected: invalid or missing session')
 socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n')
 socket.destroy()
 return
 }
-wss.handleUpgrade(req, socket, head, ws => addClient(ws))
+wss.handleUpgrade(req, socket, head, ws => { webTrace('upgrade accepted'); addClient(ws) })
 })
 
 function normalizeView(v) {
@@ -938,14 +1063,43 @@ return e ? e.logs.slice(-400).map(l => escHtml(l.text)) : []
 
 function addClient(ws) {
 const ctx = { ws, view: 'all', alive: true }
+webTrace('websocket client connected')
+let terminalProcess = null
+const closeTerminalProcess = () => {
+if (!terminalProcess) return
+try { terminalProcess.kill('SIGTERM') } catch (_) {}
+terminalProcess = null
+}
+const openTerminalProcess = () => {
+if (!WEB_TERMINAL_ENABLED) { ctx.send({ t: 'terminal', data: 'Web terminal is disabled. Set WEB_TERMINAL_ENABLED=true in .env.\n' }); return }
+if (terminalProcess) return
+terminalProcess = spawn('/bin/bash', ['-i'], {
+cwd: __dirname,
+env: { ...process.env, TERM: 'xterm-256color' },
+stdio: ['pipe', 'pipe', 'pipe']
+})
+const forward = chunk => ctx.send({ t: 'terminal', data: chunk.toString() })
+terminalProcess.stdout.on('data', forward)
+terminalProcess.stderr.on('data', forward)
+terminalProcess.on('error', err => { webTrace(`terminal error: ${err.message}`); ctx.send({ t: 'terminal', data: `\nTerminal error: ${err.message}\n` }) })
+terminalProcess.on('close', code => { ctx.send({ t: 'terminal', data: `\n[terminal exited with code ${code}]\n` }); terminalProcess = null })
+ctx.send({ t: 'terminal', data: `bash started in ${__dirname}\n` })
+}
 ctx.send = obj => { if (ws.readyState === WebSocket.OPEN) { try { ws.send(JSON.stringify(obj)) } catch (_) {} } }
 clients.add(ctx)
 ws.on('pong', () => { ctx.alive = true })
 ws.on('error', () => {})
-ws.on('close', () => { clients.delete(ctx) })
+ws.on('close', (code, reason) => { closeTerminalProcess(); clients.delete(ctx); webTrace(`websocket client closed code=${code} reason=${sanitize(String(reason || ''))}`) })
 ws.on('message', raw => {
 let msg
-try { msg = JSON.parse(raw) } catch (_) { return }
+try { msg = JSON.parse(raw) } catch (_) { webTrace('websocket received invalid JSON'); return }
+webTrace(`websocket message type=${msg.t || 'unknown'}`)
+if (msg.t === 'terminal') {
+if (msg.action === 'open') openTerminalProcess()
+else if (msg.action === 'close') closeTerminalProcess()
+else if (msg.action === 'input' && terminalProcess && typeof msg.data === 'string') terminalProcess.stdin.write(msg.data)
+return
+}
 if (msg.t === 'cmd' && typeof msg.text === 'string') {
 const trimmed = msg.text.trim()
 if (!trimmed) return
@@ -1020,6 +1174,7 @@ logFor(SYSTEM_ID, `{yellow-fg}⚠ Web port ${port} unavailable (${err.code}) —
 listenFallback(port + 1, triesLeft - 1)
 } else {
 logFor(SYSTEM_ID, `{red-fg}✗ Web GUI failed to start: ${sanitize(err.message)}{/red-fg}`)
+try { process.stderr.write(`[web] failed to start on ${WEB_BIND}:${port}: ${err.message}\n`) } catch (_) {}
 }
 }
 server.once('error', onError)
@@ -1028,6 +1183,7 @@ server.removeListener('error', onError)
 handle.port = port
 handle.url = `http://${WEB_BIND === '0.0.0.0' ? 'localhost' : WEB_BIND}:${port}`
 logFor(SYSTEM_ID, `{green-fg}✓ Web GUI listening on ${WEB_BIND}:${port}${port !== WEB_PORT ? ` (WEB_PORT ${WEB_PORT} was taken — fell back automatically)` : ''}{/green-fg}`)
+try { process.stdout.write(`[web] listening on ${WEB_BIND}:${port} — open port ${port} in the VS Code Ports panel\n`) } catch (_) {}
 })
 }
 listenFallback(WEB_PORT, WEB_PORT_MAX_ATTEMPTS)
@@ -1319,11 +1475,10 @@ pushT(() => {
 i('Right-clicking compass (server selector)…')
 try { bot.activateItem() } catch (err) { e(`activateItem failed: ${sanitize(err.message)}`) }
 }, 3600 + Math.random() * 600)
-} else {
-const serverCmd = process.env.SERVER_COMMAND || '/server lifesteal'
+} else if (SERVER_COMMAND) {
 pushT(() => {
-i(`Sending server command: ${serverCmd}`)
-bot.chat(serverCmd)
+i(`Sending configured server command: ${SERVER_COMMAND}`)
+bot.chat(SERVER_COMMAND)
 }, 3600 + Math.random() * 600)
 }
 })
@@ -1500,13 +1655,15 @@ notifyBotsChanged()
 return bot
 }
 
-// ── Connect all bots with staggered delay ─────────────────────────────────────
-let currentConnectDelay = 0;
+// ── Connect all bots with staggered delay ───────────────────────────────────
+let currentConnectDelay = 0
+const initialConnectTimers = []
 BOT_NAMES.forEach((name, index) => {
-setTimeout(() => {
+const timer = setTimeout(() => {
 createBotInstance(name)
 if (index === 0) switchTo(name)
 }, currentConnectDelay)
+initialConnectTimers.push(timer)
 currentConnectDelay += CONNECT_DELAY_MS + Math.floor(Math.random() * (CONNECT_DELAY_RANDOM_MS + 1))
 })
 
@@ -2513,7 +2670,9 @@ break
 
 case '/exit':
 logWarn('Exiting all bots…')
-Object.values(bots).forEach(({ bot }) => { try { bot.quit() } catch (_) {} })
+initialConnectTimers.forEach(clearTimeout)
+initialConnectTimers.length = 0
+Object.values(bots).forEach(entry => { try { entry.disconnectManually() } catch (_) {} })
 setTimeout(() => process.exit(0), 300)
 break
 

@@ -6,14 +6,13 @@
   "scripts": {
     "start": "node bot.js",
     "test": "echo \"Error: no test specified\" && exit 1",
-    "postinstall": "npx patch-package mineflayer"
+    "postinstall": "npx patch-package mineflayer || echo 'mineflayer patch already included or not applicable'"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
-    "blessed": "^0.1.81",
     "dotenv": "^17.4.2",
     "minecraft-data": "^3.113.1",
     "minecraft-protocol": "^1.66.2",
@@ -21,10 +20,9 @@
     "mineflayer-armor-manager": "^2.0.1",
     "mineflayer-pathfinder": "^2.4.5",
     "neo-blessed": "^0.2.0",
+    "patch-package": "^8.0.1",
     "prismarine-chunk": "^1.41.0",
-    "socks": "^2.8.9"
-  },
-  "devDependencies": {
-    "patch-package": "^8.0.1"
+    "socks": "^2.8.9",
+    "ws": "^8.21.3"
   }
 }
