@@ -605,7 +605,7 @@ aside{grid-area:side;background:var(--panel);border-right:1px solid var(--line);
 .batt{margin-left:auto;font-size:10px;color:var(--yel)}
 .bmeta{display:flex;gap:10px;margin-top:5px;font-size:11px;color:var(--dim);flex-wrap:wrap}
 canvas{display:block;margin-top:5px;width:100%;height:16px}
-main{grid-area:main;display:flex;flex-direction:column;min-width:0}
+main{grid-area:main;display:flex;flex-direction:column;min-width:0;min-height:0}
 #loghead{position:relative;display:flex;align-items:center;gap:8px;padding:7px 12px;background:var(--panel);border-bottom:1px solid var(--line)}
 #channame{color:var(--acc);font-weight:700}
 #search{margin-left:auto;background:var(--bg);border:1px solid var(--line);border-radius:6px;color:var(--txt);padding:3px 8px;width:180px;font:inherit;font-size:12px}
@@ -613,7 +613,7 @@ main{grid-area:main;display:flex;flex-direction:column;min-width:0}
 button.tb{background:none;border:1px solid var(--line);color:var(--dim);border-radius:6px;padding:3px 9px;cursor:pointer;font:inherit;font-size:11px}
 button.tb:hover{color:var(--txt);border-color:var(--acc)}
 #newchip{position:absolute;top:-9px;right:150px;background:var(--acc);color:#04211d;border-radius:9px;padding:1px 8px;font-size:10px;font-weight:700;cursor:pointer;display:none}
-#logwrap{flex:1;overflow-y:auto;padding:6px 0 70px;background:var(--bg)}
+#logwrap{flex:1;min-height:0;overflow-y:auto;padding:6px 0 70px;background:var(--bg)}
 .ln{padding:0 14px;white-space:pre-wrap;word-break:break-word}
 .ln .tag{color:var(--dim);font-size:11px}
 .c-red{color:var(--red)}.c-green{color:var(--grn)}.c-blue{color:var(--blu)}.c-cyan{color:var(--cyan)}
