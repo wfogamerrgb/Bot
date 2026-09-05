@@ -35,7 +35,7 @@ const WARP_BEFORE_CRATE = (process.env.WARP_BEFORE_CRATE ?? process.env.WARPORNO
 // customizing it further.
 //   e.g. "fatal|red;crate|key|candle"  →  (contains "fatal" OR "red") AND (contains "crate" OR "key" OR "candle")
 const GUI_ITEM_SEARCH_ENABLED = /^(1|true|yes|on)$/i.test(process.env.GUI_ITEM_SEARCH_ENABLED || 'false')
-const GUI_ITEM_SEARCH_TERMS   = process.env.GUI_ITEM_SEARCH_TERMS || 'fatal|red;crate|key|candle'
+const GUI_ITEM_SEARCH_TERMS   = process.env.GUI_ITEM_SEARCH_TERMS || 'red candle'
 const GUI_ITEM_SEARCH_GROUPS  = GUI_ITEM_SEARCH_TERMS
   .split(';').map(g => g.trim()).filter(Boolean)
   .map(g => g.split('|').map(s => s.trim().toLowerCase()).filter(Boolean))
