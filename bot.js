@@ -25,6 +25,7 @@ const GUI_SLOT = parseInt(process.env.GUI_SLOT || '11', 10)
 const WARP_AFK = process.env.WARP_COMMAND || '/warp afk'
 const WARP_BEFORE_CRATE = (process.env.WARP_BEFORE_CRATE ?? process.env.WARPORNOT ?? 'true').toLowerCase() !== 'false'
 const SERVER_COMMAND = (process.env.SERVER_COMMAND ?? '').trim()
+const CLICK_COMPASS_ENABLED = /^(1|true|yes|on)$/i.test(process.env.CLICK_COMPASS || '')
 
 // ── Interface config: TUI_GUI + WEB_GUI ──────────────────────────────────────
 // WEB_GUI=true serves the web dashboard; TUI_GUI=true runs the blessed terminal UI.
@@ -1470,16 +1471,17 @@ if (bot.entity) {
 try { bot.armorManager.equipAll() } catch (_) {}
 }
 }, 2000)
-if (process.env.CLICK_COMPASS) {
+if (CLICK_COMPASS_ENABLED) {
 pushT(() => {
 i('Right-clicking compass (server selector)…')
 try { bot.activateItem() } catch (err) { e(`activateItem failed: ${sanitize(err.message)}`) }
-}, 3600 + Math.random() * 600)
-} else if (SERVER_COMMAND) {
+}, 3000 + Math.random() * 2000)
+} else {
+const spawnCommand = SERVER_COMMAND || '/server lifesteal'
 pushT(() => {
-i(`Sending configured server command: ${SERVER_COMMAND}`)
-bot.chat(SERVER_COMMAND)
-}, 3600 + Math.random() * 600)
+i(`Sending server command after spawn: ${spawnCommand}`)
+try { bot.chat(spawnCommand) } catch (err) { e(`Server command failed: ${sanitize(err.message)}`) }
+}, 3000 + Math.random() * 2000)
 }
 })
 
