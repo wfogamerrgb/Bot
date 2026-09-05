@@ -665,7 +665,7 @@ button.tb:hover{color:var(--txt);border-color:var(--acc)}
 <script>
 (function(){
 'use strict'
-var ws=null,view='all',follow=false,scrollOnNextLog=false,lines=[],hist=[],hIdx=-1,pending=0,cmds={},prevOnline={},rcDelay=600,rcTimer=null,rt=null,pollTimer=null,pollBusy=false,queuedCmds=[],terminalOpen=false
+var ws=null,view='all',follow=true,scrollOnNextLog=false,lines=[],hist=[],hIdx=-1,pending=0,cmds={},prevOnline={},rcDelay=600,rcTimer=null,rt=null,pollTimer=null,pollBusy=false,queuedCmds=[],terminalOpen=false
 function el(i){return document.getElementById(i)}
 function setWsState(kind,text){var state=el('wsstate');state.className='wsstate '+kind;state.textContent=text}
 function terminalWrite(text){var out=el('terminalout');out.textContent+=text;out.scrollTop=out.scrollHeight}
@@ -753,7 +753,7 @@ else{var c=el('newchip');c.style.display='block';c.textContent=pending+' new ↓
 function setLines(ls){lines=[];pending=0;el('newchip').style.display='none';var L=el('log');L.innerHTML=''
 for(var i=0;i<ls.length;i++){var pr=parseLine(ls[i]);lines.push({h:pr.h,p:pr.p,pre:''})
 var d=document.createElement('div');d.className='ln';d.innerHTML=pr.h;L.appendChild(d)}
-scrollBottom()}
+if(follow)scrollBottom()}
 function rebuild(){var L=el('log'),q=el('search').value.trim().toLowerCase(),n=0,frag=document.createDocumentFragment()
 L.innerHTML=''
 for(var i=0;i<lines.length&&n<1200;i++){var l=lines[i];if(q&&l.p.toLowerCase().indexOf(q)<0)continue
@@ -796,7 +796,7 @@ function toast(text,kind){var d=document.createElement('div');d.className='toast
 el('toasts').appendChild(d)
 setTimeout(function(){d.classList.add('out');setTimeout(function(){d.remove()},500)},6000)}
 var cinput=el('cmd')
-function sendCmd(v){hist.push(v);hIdx=-1;scrollOnNextLog=true;scrollBottom();setTimeout(scrollBottom,0);setTimeout(scrollBottom,180)
+function sendCmd(v){hist.push(v);hIdx=-1;setFollow(true);scrollOnNextLog=true;scrollBottom();setTimeout(scrollBottom,0);setTimeout(scrollBottom,180)
 if(ws&&ws.readyState===1){ws.send(JSON.stringify({t:'cmd',text:v}));return}
 fetch('/api/command',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:v})}).then(function(r){if(!r.ok)throw Error('HTTP '+r.status)}).catch(function(){queuedCmds.push(v);setWsState('wait','queued');connect()})}
 function hideSugg(){el('sugg').hidden=true}

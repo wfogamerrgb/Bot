@@ -24,5 +24,8 @@
     "prismarine-chunk": "^1.41.0",
     "socks": "^2.8.9",
     "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "node-pty": "^1.1.0"
   }
 }
