@@ -78,6 +78,64 @@ node bot-rtp.js
 `BOT_NAMES` is required by `bot.js`. If it is missing or empty, the process
 exits instead of starting with no managed bots.
 
+## Docker
+
+The Docker helper uses numbered environment files. Create `.env.docker1`,
+`.env.docker2`, and so on; each file starts one container. Copy only valid
+`KEY=VALUE` lines into these files; the repository `.env` may contain notes or
+section headings that Docker rejects:
+
+```bash
+# Create .env.docker1 manually, or copy it and remove all non-KEY=VALUE lines.
+./run-docker.sh
+```
+
+The helper builds the image, starts Tor when the local proxy is enabled, and
+maps each container's web port to the next available host port. Use these
+commands to inspect or stop the managed containers:
+
+```bash
+./run-docker.sh status
+./run-docker.sh logs 1
+./run-docker.sh stop
+```
+
+Do not use a plain `.env.docker`; only `.env.dockerN` files are discovered.
+Docker env files must contain `KEY=VALUE` lines or comments beginning with
+`#`.
+
+### SSH terminal
+
+The browser TERMINAL tab is disabled unless both `SSH=true` and
+`WEB_TERMINAL_ENABLED=true` are set. When enabled, it opens a shell on the
+configured main host through SSH; it does not open a shell in the bot
+container. The main host must already run an SSH service reachable from the
+container:
+
+```dotenv
+SSH=true
+WEB_TERMINAL_ENABLED=true
+SSH_HOST=host.docker.internal
+SSH_PORT=22
+SSH_USER=replace-me
+SSH_PASSWORD=replace-me
+# Required unless SSH_SKIP_HOST_KEY_VERIFY=true is explicitly chosen.
+SSH_HOST_KEY_FINGERPRINT=SHA256:replace-me
+# Optional key authentication instead of SSH_PASSWORD.
+# SSH_PRIVATE_KEY_FILE=/run/secrets/main-host-key
+# SSH_KEY_PASSPHRASE=replace-me
+SSH_READY_TIMEOUT_MS=10000
+```
+
+Host-key verification is required by default. Set `SSH_HOST_KEY_FINGERPRINT`
+to the main host's SSH SHA-256 fingerprint. Disabling verification with
+`SSH_SKIP_HOST_KEY_VERIFY=true` is insecure. For production, use a dedicated
+unprivileged SSH account and key-based authentication. SSH passwords and keys
+are never written to logs or documentation. When `SSH=false`, no SSH or local
+shell process is started.
+The Docker helper adds the Linux host-gateway mapping when the default
+`host.docker.internal` address is used.
+
 ## Interfaces
 
 ### Browser dashboard

@@ -118,6 +118,13 @@ for f in $ordered; do
   vol_flags=""
   [ "$PERSIST_TOR" = "1" ] && vol_flags="-v ${PREFIX}-tor-${n}:/var/lib/tor"
 
+  extra_host_flags=""
+  ssh_enabled=$(grep -E '^ *SSH *=' "$f" 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -d '[:space:]' || true)
+  ssh_host=$(grep -E '^ *SSH_HOST *=' "$f" 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -d '[:space:]' || true)
+  if [[ "$ssh_enabled" =~ ^(1|true|yes|on)$ ]] && [[ -z "$ssh_host" || "$ssh_host" == "host.docker.internal" ]]; then
+    extra_host_flags="--add-host host.docker.internal:host-gateway"
+  fi
+
   hport=""
   for attempt in 1 2 3 4 5 6; do
     tried=0
@@ -133,7 +140,7 @@ for f in $ordered; do
       --init --restart unless-stopped \
       --env-file "$f" \
       -p "${next}:${cport}" \
-      $vol_flags $DOCKER_RUN_FLAGS \
+      $vol_flags $extra_host_flags $DOCKER_RUN_FLAGS \
       "${IMAGE}:latest" 2>&1) && { hport="$next"; break; }
     # start failed — only retry if the port was snatched in the race window
     if port_free "$next"; then

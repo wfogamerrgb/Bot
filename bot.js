@@ -5,7 +5,8 @@ const path = require('path')
 const http = require('http')
 const crypto = require('crypto')
 const zlib = require('zlib')
-const { exec, spawn } = require('child_process')
+const { exec } = require('child_process')
+const { createTerminal, sshConfig } = require('./expose-terminal')
 const mineflayer = require('mineflayer')
 const armorManager = require('mineflayer-armor-manager')
 const { pathfinder, Movements, goals: { GoalNear } } = require('mineflayer-pathfinder')
@@ -43,6 +44,8 @@ const WEB_SESSION_HOURS = parseFloat(process.env.WEB_SESSION_HOURS || '12')
 const WEB_LOGIN_MAX_FAILS = parseInt(process.env.WEB_LOGIN_MAX_FAILS || '10', 10)
 const WEB_TERMINAL_LOG = /^(1|true|yes|on)$/i.test(process.env.WEB_TERMINAL_LOG ?? 'true')
 const WEB_TERMINAL_ENABLED = /^(1|true|yes|on)$/i.test(process.env.WEB_TERMINAL_ENABLED || 'false')
+const SSH_CONFIG = sshConfig()
+const SSH_ENABLED = SSH_CONFIG.enabled
 const WS_BROADCAST_INTERVAL_MS = parseInt(process.env.WS_BROADCAST_INTERVAL_MS || '100', 10)
 const LOG_MAX_LINES = parseInt(process.env.LOG_MAX_LINES || '5000', 10)
 const WINDOW_DEBUG = /^(1|true|yes|on)$/i.test(process.env.WINDOW_DEBUG || '') // true restores full window slot dumps
@@ -666,11 +669,12 @@ button.tb:hover{color:var(--txt);border-color:var(--acc)}
 <script>
 (function(){
 'use strict'
-var ws=null,view='all',follow=true,scrollOnNextLog=false,lines=[],hist=[],hIdx=-1,pending=0,cmds={},prevOnline={},rcDelay=600,rcTimer=null,rt=null,pollTimer=null,pollBusy=false,queuedCmds=[],terminalOpen=false
+var ws=null,view='all',follow=true,scrollOnNextLog=false,lines=[],hist=[],hIdx=-1,pending=0,cmds={},prevOnline={},rcDelay=600,rcTimer=null,rt=null,pollTimer=null,pollBusy=false,queuedCmds=[],terminalOpen=false,terminalEnabled=false
 function el(i){return document.getElementById(i)}
 function setWsState(kind,text){var state=el('wsstate');state.className='wsstate '+kind;state.textContent=text}
 function terminalWrite(text){var out=el('terminalout');out.textContent+=text;out.scrollTop=out.scrollHeight}
 function openTerminal(){
+if(!terminalEnabled){toast('SSH terminal is disabled','bad');return}
 if(!ws||ws.readyState!==1){terminalWrite('WebSocket is required for the terminal.\\n');return}
 terminalOpen=true;el('terminal').hidden=false;el('terminalinput').focus();ws.send(JSON.stringify({t:'terminal',action:'open'}))
 }
@@ -698,7 +702,7 @@ fetch('/api/state?view='+encodeURIComponent(view),{credentials:'same-origin',cac
 if(!r.ok)throw Error('HTTP '+r.status)
 return r.json()
 }).then(function(m){
-cmds=m.commands||cmds;hist=m.cmdHistory||hist;renderBots(m.bots||[]);renderStats(m.stats||{});buildHelp();setLines(m.lines||[]);setWsState('up','http fallback')
+cmds=m.commands||cmds;hist=m.cmdHistory||hist;terminalEnabled=!!m.terminalEnabled;el('terminalbtn').hidden=!terminalEnabled;renderBots(m.bots||[]);renderStats(m.stats||{});buildHelp();setLines(m.lines||[]);setWsState('up','http fallback')
 }).catch(function(){setWsState('down','offline')}).then(function(){pollBusy=false})
 }
 poll();pollTimer=setInterval(poll,2000)
@@ -712,7 +716,7 @@ var endpoint=(location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws'
 try{ws=new WebSocket(endpoint)}catch(e){startHttpFallback();scheduleConnect();return}
 ws.onopen=function(){rcDelay=600;stopHttpFallback();setWsState('up','connected');ws.send(JSON.stringify({t:'sub',id:view}));while(queuedCmds.length)ws.send(JSON.stringify({t:'cmd',text:queuedCmds.shift()}))}
 ws.onmessage=function(ev){var m;try{m=JSON.parse(ev.data)}catch(e){return}
-if(m.t==='hello'){cmds=m.commands||{};hist=m.cmdHistory||[];renderBots(m.bots||[]);renderStats(m.stats||{});buildHelp();toast('connected to console','good')}
+if(m.t==='hello'){cmds=m.commands||{};hist=m.cmdHistory||[];terminalEnabled=!!m.terminalEnabled;el('terminalbtn').hidden=!terminalEnabled;renderBots(m.bots||[]);renderStats(m.stats||{});buildHelp();toast('connected to console','good')}
 else if(m.t==='log'){addLines(m.entries||[])}
 else if(m.t==='bots'){renderBots(m.bots||[]);renderStats(m.stats||{})}
 else if(m.t==='history'){if(m.id===view)setLines(m.lines||[])}
@@ -740,7 +744,7 @@ el('followbtn').onclick=function(){setFollow(!follow)}
 function matchFilter(p){var q=el('search').value.trim().toLowerCase();return !q||p.toLowerCase().indexOf(q)>=0}
 function addLines(es){var frag=document.createDocumentFragment(),app=false,L=el('log')
 for(var i=0;i<es.length;i++){var e=es[i]
-if(view!=='all'&&e.id!==view&&e.id!=='__system__')continue
+if(view!=='all'&&e.id!==view)continue
 var pr=parseLine(e.text),pre=(view==='all'&&e.id!=='__system__')?'<span class="tag">['+e.id+']</span> ':''
 lines.push({h:pr.h,p:pr.p,pre:pre})
 if(matchFilter(pr.p)){var d=document.createElement('div');d.className='ln';d.innerHTML=pre+pr.h;frag.appendChild(d);app=true
@@ -826,6 +830,11 @@ el('topbtn').onclick=function(){follow=false;scrollOnNextLog=false;el('followbtn
 el('bottombtn').onclick=function(){setFollow(true)}
 el('terminalbtn').onclick=openTerminal
 el('terminalclose').onclick=closeTerminal
+window.addEventListener('resize',function(){
+if(!terminalOpen||!ws||ws.readyState!==1)return
+var box=el('terminalout'),cols=Math.max(20,Math.min(400,Math.floor(box.clientWidth/8))),rows=Math.max(5,Math.min(200,Math.floor(box.clientHeight/18)))
+ws.send(JSON.stringify({t:'terminal',action:'resize',cols:cols,rows:rows}))
+})
 el('terminalform').addEventListener('submit',function(e){e.preventDefault();var input=el('terminalinput');var v=input.value;input.value='';if(ws&&ws.readyState===1&&v)ws.send(JSON.stringify({t:'terminal',action:'input',data:v+'\\n'}))})
 function buildHelp(){var h=el('help');h.innerHTML=''
 var t=document.createElement('h3');t.textContent='COMMANDS — click anywhere to dismiss';h.appendChild(t)
@@ -841,7 +850,7 @@ el('logout').onclick=function(){fetch('/logout',{method:'POST'}).then(function()
 document.addEventListener('keydown',function(e){
 if(e.key==='/'&&document.activeElement!==cinput&&document.activeElement!==el('search')){
 cinput.focus();if(!cinput.value)cinput.value='/';e.preventDefault()}})
-var chips=document.querySelectorAll('.vchip')
+var chips=document.querySelectorAll('.vchip[data-view]')
 for(var ci=0;ci<chips.length;ci++)chips[ci].onclick=(function(v){return function(){setView(v)}})(chips[ci].getAttribute('data-view'))
 connect()
 })()
@@ -858,6 +867,9 @@ return null
 
 const webTrace = (message) => {
 if (!WEB_TERMINAL_LOG) return
+const line = `[web] ${message}`
+const noisy = /^(GET \/api\/state|websocket message type=)/.test(message)
+if (!noisy) logFor(SYSTEM_ID, `{gray-fg}${sanitize(line)}{/gray-fg}`)
 try { process.stdout.write(`[web] ${new Date().toISOString()} ${message}\n`) } catch (_) {}
 }
 
@@ -980,7 +992,7 @@ res.writeHead(204); res.end(); return
 if (p === '/api/state' && req.method === 'GET') {
 const view = normalizeView(url.searchParams.get('view') || 'all') || 'all'
 res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
-res.end(JSON.stringify({ commands: COMMANDS, cmdHistory: commandHistory, bots: botSnapshot(), stats: globalStats(), lines: historyForView(view) }))
+res.end(JSON.stringify({ commands: COMMANDS, cmdHistory: commandHistory, bots: botSnapshot(), stats: globalStats(), terminalEnabled: SSH_ENABLED && WEB_TERMINAL_ENABLED, lines: historyForView(view) }))
 return
 }
 if (p === '/api/command' && req.method === 'POST') {
@@ -1065,26 +1077,36 @@ return e ? e.logs.slice(-400).map(l => escHtml(l.text)) : []
 function addClient(ws) {
 const ctx = { ws, view: 'all', alive: true }
 webTrace('websocket client connected')
-let terminalProcess = null
+let terminalSession = null
 const closeTerminalProcess = () => {
-if (!terminalProcess) return
-try { terminalProcess.kill('SIGTERM') } catch (_) {}
-terminalProcess = null
+if (!terminalSession) return
+try { terminalSession.close() } catch (_) {}
+terminalSession = null
 }
 const openTerminalProcess = () => {
-if (!WEB_TERMINAL_ENABLED) { ctx.send({ t: 'terminal', data: 'Web terminal is disabled. Set WEB_TERMINAL_ENABLED=true in .env.\n' }); return }
-if (terminalProcess) return
-terminalProcess = spawn('/bin/bash', ['-i'], {
-cwd: __dirname,
-env: { ...process.env, TERM: 'xterm-256color' },
-stdio: ['pipe', 'pipe', 'pipe']
+if (!SSH_ENABLED || !WEB_TERMINAL_ENABLED) {
+ctx.send({ t: 'terminal', data: 'SSH terminal is disabled. Set SSH=true and WEB_TERMINAL_ENABLED=true in .env.\n' })
+return
+}
+if (terminalSession) return
+terminalSession = createTerminal()
+const session = terminalSession
+session.onData(chunk => ctx.send({ t: 'terminal', data: chunk.toString() }))
+session.onClose(() => {
+logFor(SYSTEM_ID, '{yellow-fg}[ssh] Remote terminal closed.{/yellow-fg}')
+ctx.send({ t: 'terminal', data: '\n[SSH terminal disconnected]\n' })
+if (terminalSession === session) terminalSession = null
 })
-const forward = chunk => ctx.send({ t: 'terminal', data: chunk.toString() })
-terminalProcess.stdout.on('data', forward)
-terminalProcess.stderr.on('data', forward)
-terminalProcess.on('error', err => { webTrace(`terminal error: ${err.message}`); ctx.send({ t: 'terminal', data: `\nTerminal error: ${err.message}\n` }) })
-terminalProcess.on('close', code => { ctx.send({ t: 'terminal', data: `\n[terminal exited with code ${code}]\n` }); terminalProcess = null })
-ctx.send({ t: 'terminal', data: `bash started in ${__dirname}\n` })
+logFor(SYSTEM_ID, `{cyan-fg}[ssh] Connecting terminal to ${SSH_CONFIG.username}@${SSH_CONFIG.host}:${SSH_CONFIG.port}…{/cyan-fg}`)
+session.connect().then(() => {
+logFor(SYSTEM_ID, `{green-fg}[ssh] Remote terminal connected as ${SSH_CONFIG.username}@${SSH_CONFIG.host}.{/green-fg}`)
+ctx.send({ t: 'terminal', data: `SSH connected to ${SSH_CONFIG.host} as ${SSH_CONFIG.username}\n` })
+}).catch(err => {
+logFor(SYSTEM_ID, `{red-fg}[ssh] Terminal connection failed: ${sanitize(err.message)}{/red-fg}`)
+ctx.send({ t: 'terminal', data: `\nSSH connection failed: ${sanitize(err.message)}\n` })
+session.close()
+if (terminalSession === session) terminalSession = null
+})
 }
 ctx.send = obj => { if (ws.readyState === WebSocket.OPEN) { try { ws.send(JSON.stringify(obj)) } catch (_) {} } }
 clients.add(ctx)
@@ -1098,7 +1120,19 @@ webTrace(`websocket message type=${msg.t || 'unknown'}`)
 if (msg.t === 'terminal') {
 if (msg.action === 'open') openTerminalProcess()
 else if (msg.action === 'close') closeTerminalProcess()
-else if (msg.action === 'input' && terminalProcess && typeof msg.data === 'string') terminalProcess.stdin.write(msg.data)
+else if (msg.action === 'input' && terminalSession && typeof msg.data === 'string') {
+if (msg.data.length > 8192) {
+logFor(SYSTEM_ID, '{yellow-fg}[ssh] Rejected oversized terminal input.{/yellow-fg}')
+} else {
+terminalSession.write(msg.data)
+}
+} else if (msg.action === 'resize' && terminalSession) {
+const cols = Number.parseInt(msg.cols, 10)
+const rows = Number.parseInt(msg.rows, 10)
+if (Number.isInteger(cols) && Number.isInteger(rows) && cols >= 20 && cols <= 400 && rows >= 5 && rows <= 200) {
+terminalSession.resize(cols, rows)
+}
+}
 return
 }
 if (msg.t === 'cmd' && typeof msg.text === 'string') {
@@ -1112,7 +1146,7 @@ const v = normalizeView(msg.id)
 if (v) { ctx.view = v; ctx.send({ t: 'history', id: v, lines: historyForView(v) }) }
 }
 })
-ctx.send({ t: 'hello', commands: COMMANDS, cmdHistory: commandHistory, bots: botSnapshot(), stats: globalStats() })
+ctx.send({ t: 'hello', commands: COMMANDS, cmdHistory: commandHistory, bots: botSnapshot(), stats: globalStats(), terminalEnabled: SSH_ENABLED && WEB_TERMINAL_ENABLED })
 }
 
 // Batched log flush with per-connection routing: a client only receives lines
@@ -1129,7 +1163,7 @@ for (const ctx of clients) {
 let entries
 if (ctx.view === 'all') entries = batch
 else if (ctx.view === 'system') entries = batch.filter(e => e.id === SYSTEM_ID)
-else entries = batch.filter(e => e.id === ctx.view || e.id === SYSTEM_ID)
+else entries = batch.filter(e => e.id === ctx.view)
 if (entries.length) ctx.send({ t: 'log', entries })
 }
 }
