@@ -73,7 +73,7 @@ notifyClose()
             })
 dataHandlers.forEach(handler =>{
 stream.on('data',handler)
-stream.stderr?.on('data',handler')
+stream.stderr?.on('data',handler)
   
 })
             
