@@ -65,14 +65,18 @@ function createTerminal(options = {}) {
               return
             }
             stream = shell
-            stream.once('close', () => {
-              notifyClose()
-              try { client.end() } catch (_) {}
+            
+  stream.setEncoding('utf8')
+            stream.once('close',()=>{
+notifyClose()
+              try {client.end() } catch (_) {}
             })
-            dataHandlers.forEach(handler => {
-              stream.on('data', handler)
-              stream.stderr?.on('data', handler)
-            })
+dataHandlers.forEach(handler =>{
+stream.on('data',handler)
+stream.stderr?.on('data',handler')
+  
+})
+            
             resolve(terminal)
           })
         }
