@@ -609,7 +609,7 @@ aside{grid-area:side;background:var(--panel);border-right:1px solid var(--line);
 .batt{margin-left:auto;font-size:10px;color:var(--yel)}
 .bmeta{display:flex;gap:10px;margin-top:5px;font-size:11px;color:var(--dim);flex-wrap:wrap}
 canvas{display:block;margin-top:5px;width:100%;height:16px}
-main{grid-area:main;display:flex;flex-direction:column;min-width:0;min-height:0}
+main{grid-area:main;position:relative;display:flex;flex-direction:column;min-width:0;min-height:0}
 #loghead{position:relative;display:flex;align-items:center;gap:8px;padding:7px 12px;background:var(--panel);border-bottom:1px solid var(--line)}
 #channame{color:var(--acc);font-weight:700}
 #search{margin-left:auto;background:var(--bg);border:1px solid var(--line);border-radius:6px;color:var(--txt);padding:3px 8px;width:180px;font:inherit;font-size:12px}
@@ -624,6 +624,7 @@ button.tb:hover{color:var(--txt);border-color:var(--acc)}
 .c-magenta{color:var(--mag)}.c-yellow{color:var(--yel)}.c-white{color:#e8f0f6}
 .c-gray,.c-grey{color:var(--dim)}.c-black{color:#0a0e13}.b{font-weight:700}
 #cmdbar{position:fixed;left:250px;right:0;bottom:0;z-index:30;display:flex;min-height:56px;gap:8px;align-items:center;padding:9px 12px;background:var(--panel);border-top:1px solid var(--line);box-shadow:0 -6px 18px rgba(0,0,0,.25)}
+#cmdbar.cmdbar-hidden{display:none}
 .prompt{color:var(--grn);font-weight:700}
 #cmd{display:block;flex:1 1 auto;min-width:0;height:32px;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:7px 10px;color:var(--txt);font:inherit}
 #cmd:focus{outline:none;border-color:var(--acc)}
@@ -636,7 +637,7 @@ button.tb:hover{color:var(--txt);border-color:var(--acc)}
 #help .hcmd{display:flex;gap:12px;padding:4px 0;border-bottom:1px solid #141c26}
 #help .hcmd b{color:var(--cyan);min-width:230px;white-space:nowrap}
 #help .hcmd span{color:var(--dim)}
-#terminal{position:absolute;inset:0;background:#050708;z-index:15;display:flex;flex-direction:column}
+#terminal{position:absolute;inset:0;background:#050708;z-index:40;display:flex;flex-direction:column}
 #terminal[hidden]{display:none}
 .terminal-head{display:flex;justify-content:space-between;align-items:center;padding:9px 12px;background:var(--panel);border-bottom:1px solid var(--line);color:var(--acc)}
 #terminalout{flex:1;overflow:auto;padding:12px;color:#b7f7c5;white-space:pre-wrap;word-break:break-word;font:13px/1.4 ui-monospace,'Cascadia Code','SF Mono',Menlo,Consolas,monospace}
@@ -672,13 +673,29 @@ button.tb:hover{color:var(--txt);border-color:var(--acc)}
 var ws=null,view='all',follow=true,scrollOnNextLog=false,lines=[],hist=[],hIdx=-1,pending=0,cmds={},prevOnline={},rcDelay=600,rcTimer=null,rt=null,pollTimer=null,pollBusy=false,queuedCmds=[],terminalOpen=false,terminalEnabled=false
 function el(i){return document.getElementById(i)}
 function setWsState(kind,text){var state=el('wsstate');state.className='wsstate '+kind;state.textContent=text}
-function terminalWrite(text){var out=el('terminalout');out.textContent+=text;out.scrollTop=out.scrollHeight}
+// Strips ANSI/VT100 escape and control sequences (color codes, cursor moves,
+// title-set OSC sequences, bracketed-paste toggles, etc.) that a real
+// interactive shell (xterm-256color) constantly emits. This is a plain <pre>
+// box, not a full terminal emulator, so those bytes must never be shown raw —
+// left unstripped they render as the "random mystery characters" bug.
+var ANSI_CSI_RE=/\\x1b\\[[0-9;?]*[ -\\/]*[@-~]/g
+var ANSI_OSC_RE=/\\x1b\\][^\\x07\\x1b]*(?:\\x07|\\x1b\\\\)/g
+var ANSI_OTHER_RE=/\\x1b[@-Z\\\\-_]/g
+var CTRL_STRIP_RE=/[\\x00-\\x08\\x0b\\x0c\\x0e-\\x1f\\x7f]/g
+function stripAnsi(text){
+return String(text)
+.replace(ANSI_OSC_RE,'')
+.replace(ANSI_CSI_RE,'')
+.replace(ANSI_OTHER_RE,'')
+.replace(CTRL_STRIP_RE,'')
+}
+function terminalWrite(text){var out=el('terminalout');out.textContent+=stripAnsi(text);out.scrollTop=out.scrollHeight}
 function openTerminal(){
 if(!terminalEnabled){toast('SSH terminal is disabled','bad');return}
 if(!ws||ws.readyState!==1){terminalWrite('WebSocket is required for the terminal.\\n');return}
-terminalOpen=true;el('terminal').hidden=false;el('terminalinput').focus();ws.send(JSON.stringify({t:'terminal',action:'open'}))
+terminalOpen=true;el('terminal').hidden=false;el('cmdbar').classList.add('cmdbar-hidden');el('terminalinput').focus();ws.send(JSON.stringify({t:'terminal',action:'open'}))
 }
-function closeTerminal(){terminalOpen=false;el('terminal').hidden=true;if(ws&&ws.readyState===1)ws.send(JSON.stringify({t:'terminal',action:'close'}))}
+function closeTerminal(){terminalOpen=false;el('terminal').hidden=true;el('cmdbar').classList.remove('cmdbar-hidden');if(ws&&ws.readyState===1)ws.send(JSON.stringify({t:'terminal',action:'close'}))}
 function reportClientError(message,stack){
 try{fetch('/api/client-error',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:String(message),stack:stack?String(stack):''})})}catch(_){}}
 window.addEventListener('error',function(e){reportClientError(e.message||'window error',e.error&&e.error.stack)})
@@ -1771,7 +1788,7 @@ const COMMANDS = {
 '/reconnect': 'Reconnect the active bot',
 '/reconnect-all': 'Reconnect every currently disconnected bot',
 '/reconnect-all-slow': 'Reconnect ALL bots (online or offline) with a 30s delay between each to avoid rate limits',
-'/new-bot <name> [host] [port] [ver]': 'Create and connect a new bot',
+'/new-bot <n> [host] [port] [ver]': 'Create and connect a new bot',
 '/switch <id>': 'Switch view to a different bot by name or number',
 '/uptime': 'Show uptime for all bots',
 '/proxy': 'Show the currently configured outbound proxy',
