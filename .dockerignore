@@ -1,0 +1,8 @@
+node_modules
+.git
+.env
+.env.*
+patches/.git
+.command_history
+*.log
+run-docker.sh

@@ -1,452 +1,380 @@
-# Mineflayer TUI Multi-Bot Manager
+# Minecraft Multi-Bot Console
 
-A terminal-based multi-bot manager for Minecraft, built with Node.js, [Mineflayer](https://github.com/PrismarineJS/mineflayer) and [neo-blessed](https://github.com/chjj/blessed).
+Node.js tools for running and supervising multiple Mineflayer bots. The main
+entry point, `bot.js`, provides both a browser dashboard and an optional
+terminal UI. `bot-rtp.js` is the exploration-oriented variant with RTP,
+base detection, survival helpers, and Discord alerts.
 
-It connects and manages multiple Minecraft bots at once through a single Terminal User Interface (TUI), with automatic server authentication, GUI navigation (compass clicking), independent per-bot logging, and advanced features like base detection, player tracking, and Discord alerts.
+## What This Repository Does
 
-## Features
+### `bot.js`
 
-### `bot.js` — AFK Console
+- Connects multiple Minecraft accounts with staggered startup timing.
+- Automatically responds to `/register` and `/login` prompts.
+- Handles server-selector GUI navigation and configurable crate selection.
+- Keeps per-bot logs, status, reconnect state, and command history.
+- Reconnects after kicks, socket failures, and common proxy-transfer crashes.
+- Supports direct connections, SOCKS5 proxies, and HTTP CONNECT proxies.
+- Serves an authenticated browser dashboard over HTTP/WebSocket.
+- Provides an optional `neo-blessed` terminal UI when attached to a TTY.
 
-- **Interactive TUI** — view logs, send commands, and monitor bots without terminal spam.
-- **Multi-bot management** — connect any number of bots, staggered on startup to avoid anti-bot throttling.
-- **Auto-authentication** — sends `/register` and `/login` automatically before spawning in.
-- **Auto-navigation** — right-clicks a server-selector compass and clicks a configured GUI slot after spawn.
-- **Auto-reconnect** — any disconnect (kick, error, dropped socket) is retried automatically, with exponential backoff.
-- **Isolated state** — each bot keeps its own log history, connection state, and timers.
-- **Outbound proxy support** — route all bot connections through a SOCKS5 or HTTP proxy.
+### `bot-rtp.js`
 
-### `bot-rtp.js` — RTP + Base Finder
+The RTP variant shares the connection and management model, then adds:
 
-- Everything from `bot.js` **plus**:
-- **Automatic Random Teleport (RTP)** — bots RTP at configurable intervals to explore and gather resources.
-- **Base detection** — scans for storage blocks (chests, barrels, shulker boxes, anvils, enchanting tables) and alerts when a base is found.
-- **Totem management** — automatically equips Totems of Undying in the offhand; alerts when one pops.
-- **Auto-eat** — keeps hunger above a threshold by automatically consuming food.
-- **Player proximity alerts** — warns when other players come within range.
-- **Discord webhook integration** — sends real-time alerts for bases, totem pops, player proximity, and RTP locations.
-- **RTP location history** — tracks visited chunk areas to detect repeated spawns.
+- Scheduled random teleporting.
+- Storage/base scanning.
+- Nearby-player alerts.
+- Auto-eating and totem handling.
+- Discord webhook notifications.
+- RTP location history.
 
-## Prerequisites
+## Requirements
 
-- Node.js v18+
-- A Minecraft server to connect to
-- A `.env` file with configuration (see below)
+- Node.js 18 or newer.
+- Access to the Minecraft server you want to connect to.
+- One or more bot usernames.
+- A `.env` file in the repository root.
 
-## Quick Start
-
-### 1. Clone and Install
+## Install
 
 ```bash
-git clone <repository-url>
-cd Bot
 npm install
 ```
 
-### 2. Create `.env` File
-
-**You MUST create a `.env` file after cloning.** Copy the example below and customize it:
+The `postinstall` script applies the repository's Mineflayer patch:
 
 ```bash
-# Server connection
-HOST=play.fatalmc.org
-PORT=25565
-VERSION=1.21.2
-LOGIN_PASSWORD=your_password_here
-
-# Bot names (comma-separated, no spaces after commas)
-BOT_NAMES=Bot1,Bot2,Bot3
-
-# Connection timing
-CONNECT_DELAY_MS=39500
-
-# GUI navigation
-GUI_SLOT=11
-
-# Optional: Outbound proxy
-# PROXY_HOST=proxy.example.com
-# PROXY_PORT=1080
-# PROXY_TYPE=socks5
+npm run postinstall
 ```
 
-### 3. Run
+The patch is included for the server/proxy behavior this project targets. Do
+not omit it when setting up a fresh environment.
 
-```bash
-# Run the AFK bot console
-node bot.js
+## Minimal Configuration
 
-# OR run the RTP + base finder (with bot-rtp.js settings)
-node bot-rtp.js
-```
+Create `.env` in the repository root:
 
-## Configuration
-
-### `.env` Variables
-
-All configuration is done via the `.env` file in the root directory.
-
-#### Common to Both Scripts
-
-| Variable | Default | Description |
-|---|---|---|
-| `HOST` | `play.fatalmc.org` | Target server address |
-| `PORT` | `25565` | Target server port |
-| `VERSION` | `1.21.2` (bot.js) / `1.21.1` (bot-rtp.js) | Minecraft protocol version |
-| `LOGIN_PASSWORD` | `123456` | Password for all bots to use for `/register` and `/login` |
-| `BOT_NAMES` | (required) | Comma-separated bot usernames (e.g., `Bot1,Bot2,Bot3`) |
-| `CONNECT_DELAY_MS` | `39500` | Milliseconds to wait between each bot's initial connection |
-| `GUI_SLOT` | `11` | Inventory slot number to click in the server-selector GUI (0-indexed) |
-
-#### Proxy (Optional)
-
-| Variable | Default | Description |
-|---|---|---|
-| `PROXY_HOST` | (empty) | Outbound proxy server address; leave empty for direct connection |
-| `PROXY_PORT` | `1080` | Outbound proxy port |
-| `PROXY_TYPE` | `socks5` | Proxy type: `socks5` or `http` |
-
-> **Note:** If `PROXY_TYPE=socks5`, you need to install the `socks` package: `npm install socks`
-
-#### `bot-rtp.js` Only
-
-| Variable | Default | Description |
-|---|---|---|
-| `BOT_RTP_BOTS` | `S3gF4ult_0x00, Hypr_P4ck3t_X, Nul1_P01nt3r, H3adl3ss_T1ck, F1shyShellArch` | Override default RTP bot names |
-| `MODE` | `roam` | `roam` to enable RTP/base scanning, or `afk` for idle mode |
-| `RTP_COMMAND` | `/rtp world world` | Command to send for random teleport |
-| `RTP_INTERVAL_MS` | `34800` | Milliseconds between RTP commands (plus random jitter) |
-| `BASE_SCAN_INTERVAL_MS` | `12000` | Milliseconds between base scans |
-| `BASE_SCAN_RADIUS` | `256` | Maximum block distance for base detection |
-| `BASE_ALERT_THRESHOLD` | `4` | Minimum storage blocks in a chunk to trigger an alert |
-| `RTP_PAUSE_ON_BASE_MS` | `600000` | How long to pause RTP after finding a base (10 minutes default) |
-| `PLAYER_PROXIMITY_RADIUS` | `32` | Blocks away to consider a player "nearby" |
-| `PLAYER_PROXIMITY_INTERVAL_MS` | `5000` | Milliseconds between player proximity checks |
-| `PLAYER_PROXIMITY_COOLDOWN_MS` | `300000` | Cooldown between alerts for the same player |
-| `FOOD_CHECK_INTERVAL_MS` | `5000` | Milliseconds between food checks |
-| `FOOD_EAT_THRESHOLD` | `18` | Hunger level below which the bot auto-eats |
-
-#### Discord Alerts (`bot-rtp.js` only)
-
-| Variable | Default | Description |
-|---|---|---|
-| `DISCORD_WEBHOOK_URL` | (empty) | Discord webhook URL for alerts; leave empty to disable |
-| `DISCORD_USER_ID` | (empty) | Discord user ID to mention in alerts (optional) |
-
-> To get a Discord webhook URL: [Create a webhook in your Discord server](https://support.discord.com/hc/en-us/articles/228383668-Webhooks-Basics)
-
-### Example `.env` for `bot.js`
-
-```
-HOST=localhost
-PORT=25565
-VERSION=1.21.2
-LOGIN_PASSWORD=secretpassword
-BOT_NAMES=Alice,Bob,Charlie
-CONNECT_DELAY_MS=40000
-GUI_SLOT=11
-```
-
-### Example `.env` for `bot-rtp.js`
-
-```
+```dotenv
 HOST=play.example.com
 PORT=25565
-VERSION=1.21.1
-LOGIN_PASSWORD=mysecret
-BOT_RTP_BOTS=Scout1,Scout2,Scout3
-MODE=roam
-RTP_COMMAND=/rtp world world
-RTP_INTERVAL_MS=35000
-BASE_SCAN_INTERVAL_MS=10000
-BASE_SCAN_RADIUS=256
-BASE_ALERT_THRESHOLD=3
-PLAYER_PROXIMITY_RADIUS=48
-FOOD_EAT_THRESHOLD=15
-DISCORD_WEBHOOK_URL=https://discordapp.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKEN
-DISCORD_USER_ID=123456789
-PROXY_HOST=
-PROXY_PORT=1080
+VERSION=1.21.2
+LOGIN_PASSWORD=replace-me
+BOT_NAMES=BotOne,BotTwo
 ```
 
-## Running the Bots
+Never commit `.env`, passwords, proxy credentials, or Discord webhook URLs.
 
-### Start `bot.js`
-
-```bash
-node bot.js
-```
-
-The console will:
-
-1. Load all `BOT_NAMES` from `.env`
-2. Connect them in staggered intervals (`CONNECT_DELAY_MS`)
-3. Auto-authenticate each bot
-4. Navigate to the warp/teleport GUI
-
-### Start `bot-rtp.js`
+## Start
 
 ```bash
+# Browser dashboard plus TUI when a terminal is attached
+npm start
+
+# RTP/base-finder variant
 node bot-rtp.js
 ```
 
-Same startup sequence, but after GUI navigation:
+`BOT_NAMES` is required by `bot.js`. If it is missing or empty, the process
+exits instead of starting with no managed bots.
 
-- Begins RTP exploration
-- Scans for bases and logs findings to Discord
-- Manages food and totems automatically
-- Checks for nearby players
+## Docker
 
-## The Interface
-
-### Layout
-
-```
-┌─────────────────────────────────────────────────────┐
-│  ⛏  MINEFLAYER AFK CONSOLE  —  Active: [1] Bot1    │
-├─────────────────────────────────────────────────────┤
-│                                                       │
-│  [Activity Log - scrollable]                        │
-│                                                       │
-│  [← scroll up to see older logs]                    │
-│                                                       │
-├─────────────────────────────────────────────────────┤
-│ ❯ Command: _                                        │
-└─────────────────────────────────────────────────────┘
-```
-
-- **Header** — shows active bot and list of other connected bots (switch with `/switch`)
-- **Log Box** — displays events, chat, and errors for the active bot only; scrollable with mouse or arrow keys
-- **Input Box** — type commands or chat messages; use `Up`/`Down` arrows to cycle history; `Tab` to autocomplete
-
-## Commands
-
-### Universal Commands (Both Scripts)
-
-| Command | Description |
-|---|---|
-| `/help` | List all available commands |
-| `/list` | Show online/offline status for all bots |
-| `/status` | Active bot's position, health, food, ping, uptime |
-| `/inv` | Active bot's inventory contents |
-| `/players` | Online players from the active bot's view |
-| `/disconnect`, `/dc` | Disconnect active bot (stops auto-reconnect) |
-| `/reconnect` | Manually reconnect the active bot |
-| `/reconnect-all` | Reconnect all offline bots |
-| `/switch <id>` | Switch view to another bot by name or list number |
-| `/uptime` | Show uptime for all bots |
-| `/proxy` | Display current proxy configuration |
-| `/all <cmd>` | Run a local command on every bot, or broadcast chat to all |
-| `/chat <msg>` | Send a message (won't be misread as a command) |
-| `/new-bot <name>` | Create and connect a new bot at runtime |
-| `/clear` | Clear active bot's log view |
-| `/exit` | Disconnect all bots and close the program |
-
-### RTP-Only Commands (`bot-rtp.js`)
-
-| Command | Description |
-|---|---|
-| `/rtp` | Manually send the RTP command from active bot |
-| `/overview` | Dashboard showing all bots' health, food, ping, shard count |
-| `/mem` | Show memory usage and log/history statistics |
-
-## Event Flow & Startup Sequence
-
-### On Connect
-
-1. **Login** — bot connects to server socket
-2. **Auth** — listens for `/register` or `/login` prompts; sends `LOGIN_PASSWORD` automatically
-3. **Spawn** — bot appears in world; right-clicks compass (held item)
-4. **Window Open** — detects GUI window; clicks `GUI_SLOT`; waits for server transfer
-
-### After Spawn (bot.js)
-
-- Bot stays idle, listening for commands via the TUI
-
-### After Spawn (bot-rtp.js, if `MODE=roam`)
-
-- Sends `RTP_COMMAND` and waits 5 seconds for teleport
-- Enters roaming loop:
-  - Scans for bases every `BASE_SCAN_INTERVAL_MS`
-  - Checks for nearby players every `PLAYER_PROXIMITY_INTERVAL_MS`
-  - Manages food every `FOOD_CHECK_INTERVAL_MS`
-  - Auto-equips totems continuously
-  - Schedules next RTP at `RTP_INTERVAL_MS` (plus random jitter)
-
-## Reconnect Behavior
-
-Every disconnect triggers a reconnect with exponential backoff:
-
-```
-delay = min(base_delay × 1.3^attempt, max_delay)
-```
-
-- **Proxy transfer crash** (detected via pattern matching): flat 3–10 second delay, no backoff increment
-- **Real kick / error**: exponential backoff starting at 8–10 seconds, up to 5 minutes
-- **Stable for 60 seconds**: attempt counter resets to 0
-
-This continues indefinitely; there is no give-up point.
-
-## Troubleshooting
-
-### Program exits immediately on startup
-
-**"No BOT_NAMES defined in .env"**
-
-- Create a `.env` file with `BOT_NAMES=Bot1,Bot2`
-- Do not include spaces after commas
-
-**"Failed to load module"**
-
-- Run `npm install` to install dependencies
-- Check that Node.js v18+ is installed: `node --version`
-
-### Bots get kicked immediately
-
-- Increase `CONNECT_DELAY_MS` to spread out connections (try `60000`)
-- Server may have anti-bot throttling enabled
-
-### "Cannot read properties of null" or "socket hang up"
-
-- This often happens during Velocity/BungeeCord server transfers
-- The bot detects these as "proxy transfer crashes" and retries automatically with a fast reconnect (3–10 seconds)
-- If it repeats, check server logs or increase `RTP_PAUSE_ON_BASE_MS` to pause exploration longer
-
-### Bots connect but don't proceed past spawn
-
-- Check that `GUI_SLOT` is correct for your server's compass GUI (usually 11)
-- Verify the GUI has at least `GUI_SLOT + 1` items
-- Check server logs; the bot may need a delay between compass click and GUI slot click
-
-### Discord webhook alerts aren't sending
-
-- Verify `DISCORD_WEBHOOK_URL` is valid and not expired
-- Check that Node.js v18+ supports `fetch()` globally
-- Look in the bot's log for `[discord]` error messages
-
-### High memory usage
-
-- Use `/mem` command to see breakdown
-- Increase `BASE_SCAN_RADIUS` to reduce block checks (or lower it to scan more)
-- Restart the bot to clear accumulated logs
-
-## Dependencies
-
-- **[mineflayer](https://github.com/PrismarineJS/mineflayer)** — Minecraft bot API
-- **[neo-blessed](https://github.com/chjj/blessed)** — Terminal UI framework
-- **[mineflayer-armor-manager](https://github.com/PrismarineJS/mineflayer-armor-manager)** — Auto-equip armor plugin
-- **[dotenv](https://github.com/motdotla/dotenv)** — `.env` file loader
-- **[socks](https://github.com/JoshGlazebrook/socks)** — SOCKS5 proxy support (optional, only needed if `PROXY_TYPE=socks5`)
-
-## Installation Command
+The Docker helper uses numbered environment files. Create `.env.docker1`,
+`.env.docker2`, and so on; each file starts one container. Copy only valid
+`KEY=VALUE` lines into these files; the repository `.env` may contain notes or
+section headings that Docker rejects:
 
 ```bash
-npm install mineflayer neo-blessed mineflayer-armor-manager dotenv
+# Create .env.docker1 manually, or copy it and remove all non-KEY=VALUE lines.
+./run-docker.sh
 ```
 
-For SOCKS5 proxy support:
+The helper builds the image, starts Tor when the local proxy is enabled, and
+maps each container's web port to the next available host port. Use these
+commands to inspect or stop the managed containers:
 
 ```bash
-npm install socks
+./run-docker.sh status
+./run-docker.sh logs 1
+./run-docker.sh stop
 ```
 
-## License
+Do not use a plain `.env.docker`; only `.env.dockerN` files are discovered.
+Docker env files must contain `KEY=VALUE` lines or comments beginning with
+`#`.
 
-This project is provided as-is. Use it at your own risk on your Minecraft servers.
+### SSH terminal
 
----
+The browser TERMINAL tab is disabled unless both `SSH=true` and
+`WEB_TERMINAL_ENABLED=true` are set. When enabled, it opens a shell on the
+configured main host through SSH; it does not open a shell in the bot
+container. The main host must already run an SSH service reachable from the
+container:
 
-**Questions or issues?** Check the server logs and the bot's activity log in the TUI for error messages. Most issues are related to:
-
-1. Missing or incorrect `.env` file
-2. Wrong server address / port / version
-3. `BOT_NAMES` format (no spaces, comma-separated)
-4. Firewall or proxy blocking connections
-FOR THE RENDER BRANCH MAKE SURE TO SETUP UPTIME bot, to ping it otherwise it will go offline in 15 minutes DW IT IS FREE <https://uptimerobot.com/> NOT SPONSERED set it to 12 minutes not 5 minutes
-
-# bot.js changes
-
-Documents only the two features added on top of the existing bot.js. Everything else in the bot is unchanged.
-
----
-
-## 1. GUI item search (toggleable slot selection)
-
-Previously, the compass GUI handler always clicked a hardcoded `GUI_SLOT`, with a separate hardcoded "Fatal Crate/Key" search baked into the code. That's now a single, optional, configurable feature — **off by default**.
-
-### New env vars
-
-```bash
-# Off by default. When false/unset, the bot always clicks GUI_SLOT — original behavior.
-GUI_ITEM_SEARCH_ENABLED=false
-
-# Only used when GUI_ITEM_SEARCH_ENABLED=true.
-# Syntax: ";" separates AND-groups, "|" separates OR-alternatives within a group.
-# An item matches only if it satisfies EVERY group (groups are AND'd together).
-GUI_ITEM_SEARCH_TERMS=fatal|red;crate|key|candle
+```dotenv
+SSH=true
+WEB_TERMINAL_ENABLED=true
+SSH_HOST=host.docker.internal
+SSH_PORT=22
+SSH_USER=replace-me
+SSH_PASSWORD=replace-me
+# Required unless SSH_SKIP_HOST_KEY_VERIFY=true is explicitly chosen.
+SSH_HOST_KEY_FINGERPRINT=SHA256:replace-me
+# Optional key authentication instead of SSH_PASSWORD.
+# SSH_PRIVATE_KEY_FILE=/run/secrets/main-host-key
+# SSH_KEY_PASSPHRASE=replace-me
+SSH_READY_TIMEOUT_MS=10000
 ```
 
-### How matching works
+Host-key verification is required by default. Set `SSH_HOST_KEY_FINGERPRINT`
+to the main host's SSH SHA-256 fingerprint. Disabling verification with
+`SSH_SKIP_HOST_KEY_VERIFY=true` is insecure. For production, use a dedicated
+unprivileged SSH account and key-based authentication. SSH passwords and keys
+are never written to logs or documentation. When `SSH=false`, no SSH or local
+shell process is started.
+The Docker helper adds the Linux host-gateway mapping when the default
+`host.docker.internal` address is used.
 
-`GUI_ITEM_SEARCH_TERMS=fatal|red;crate|key|candle` means:
+## Interfaces
 
-- Group 1: `fatal` **OR** `red`
-- Group 2: `crate` **OR** `key` **OR** `candle`
-- Match requires **both groups** to be satisfied — e.g. an item named "Fatal Crate" matches (fatal ✓, crate ✓). An item named just "Key" does **not** match (group 1 never satisfied).
+### Browser dashboard
 
-The comparison is case-insensitive and checks the item's display name / name string.
+The web dashboard is enabled by default. It provides:
 
-### Behavior when enabled
+- Bot cards with online state, health, food, ping, uptime, and ping history.
+- `ALL`, `SYSTEM`, and per-bot log views.
+- Searchable logs and command suggestions.
+- A browser terminal when explicitly enabled.
+- WebSocket updates with HTTP polling fallback.
+- Persistent command history shared with the terminal UI.
 
-1. Scans every slot in the opened window.
-2. First slot whose item satisfies all AND-groups is clicked.
-3. If no slot matches, **falls back to `GUI_SLOT`** (same as if the feature were off).
+The dashboard listens on `WEB_BIND` and starts at `WEB_PORT`. If the selected
+port is unavailable, it tries subsequent ports automatically. At startup, a
+random login password is generated when `WEB_PASSWORD` is not set; read the
+startup output and set a fixed password for long-running deployments.
 
-### Example configs
+The log view follows new messages automatically. Scrolling upward pauses
+following so older messages can be read; sending a command or selecting the
+bottom action resumes following.
 
-```bash
-# Reproduce the old hardcoded Fatal Crate/Key behavior exactly
-GUI_ITEM_SEARCH_ENABLED=true
-GUI_ITEM_SEARCH_TERMS=fatal|red;crate|key|candle
+### Terminal UI
 
-# Look for anything called "diamond"
-GUI_ITEM_SEARCH_ENABLED=true
-GUI_ITEM_SEARCH_TERMS=diamond
+The TUI is enabled automatically when stdout is a TTY. Set it explicitly when
+needed:
 
-# "legendary" AND ("crate" OR "box")
+```dotenv
+TUI_GUI=true
+WEB_GUI=true
+```
+
+For a web-only process:
+
+```dotenv
+TUI_GUI=false
+WEB_GUI=true
+```
+
+## `bot.js` Configuration
+
+### Connection and startup
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `HOST` | `play.fatalmc.org` | Minecraft server host |
+| `PORT` | `25565` | Minecraft server port |
+| `VERSION` | `1.21.2` | Minecraft protocol version |
+| `LOGIN_PASSWORD` | `123456` | Password sent to register/login prompts |
+| `BOT_NAMES` | required | Comma-separated bot usernames |
+| `CONNECT_DELAY_MS` | `39500` | Delay between initial bot connections |
+| `CONNECT_DELAY_RANDOM_MS` | `0` | Additional random delay range |
+| `MAX_RECONNECT` | `17` | Maximum normal reconnect attempts |
+| `SERVER_COMMAND` | empty | Command sent after spawn instead of compass navigation |
+| `CLICK_COMPASS` | empty | Set to enable compass activation after spawn |
+
+### GUI and crate automation
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `GUI_SLOT` | `11` | Fallback inventory slot, zero-indexed |
+| `GUI_ITEM_SEARCH_ENABLED` | `false` | Search GUI item names instead of using only `GUI_SLOT` |
+| `GUI_ITEM_SEARCH_TERMS` | `fatal\|red;crate\|key\|candle` | Semicolon-separated AND groups, pipe-separated OR terms |
+| `WARP_COMMAND` | `/warp afk` | Destination after GUI/crate handling |
+| `WARP_BEFORE_CRATE` | `true` | Warp to the crate location before scanning |
+| `CRATE_COMMAND` | `/warp crates` | Command used to reach the crate area |
+| `CRATE_SHULKER_BLOCK` | `red_shulker_box` | Default shulker block target |
+| `CRATE_SCAN_RADIUS` | `20` | Maximum crate scan distance |
+| `CRATE_REACH` | `3.5` | Maximum walking distance from a crate |
+
+Search terms are case-insensitive. For example:
+
+```dotenv
 GUI_ITEM_SEARCH_ENABLED=true
 GUI_ITEM_SEARCH_TERMS=legendary;crate|box
 ```
 
-> ⚠️ Must be **one line** in `.env` — a value can't wrap onto a second line without quoting/escaping. If it wraps, the second line has no `=` and dotenv silently ignores it.
+This matches an item containing `legendary` and either `crate` or `box`. If no
+item matches, the bot falls back to `GUI_SLOT`.
 
----
+### Proxy
 
-## 2. Crate color argument (`[color]`)
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `PROXY_HOST` | empty | Enables outbound proxying when set |
+| `PROXY_PORT` | `1080` | Proxy port |
+| `PROXY_TYPE` | `socks5` | `socks5` or `http` |
+| `PROXY_STALL_WATCHDOG` | enabled | Set to `0` to disable stall recovery |
+| `PROXY_STALL_TIMEOUT_MS` | `90000` | Silence period before forcing reconnect |
+| `PROXY_STALL_CHECK_MS` | `20000` | Watchdog polling interval |
+| `PROXY_STALL_RATIO` | `0.5` | Fraction of stalled bots that triggers proxy restart |
+| `PROXY_RESTART_CMD` | local Tor restart when applicable | Optional proxy restart command |
 
-`/crates`, `/crates-loop`, `/crates-all`, and `/crates-solo` now accept an optional trailing `[color]` argument. Omit it and behavior is unchanged — it uses the existing `CRATE_SHULKER_BLOCK` env var as before.
+### Web dashboard
 
-```bash
-# Existing var, unchanged — default crate color when no [color] arg is given
-CRATE_SHULKER_BLOCK=red_shulker_box
-```
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `WEB_GUI` | `true` | Enable the browser dashboard |
+| `WEB_BIND` | `0.0.0.0` | Listening interface |
+| `WEB_PORT` | `80` | Starting HTTP port |
+| `WEB_PORT_MAX_ATTEMPTS` | `20` | Number of fallback ports |
+| `WEB_PASSWORD` | generated | Dashboard login password |
+| `WEB_SESSION_HOURS` | `12` | Sliding session lifetime |
+| `WEB_LOGIN_MAX_FAILS` | `10` | Failed logins before temporary lockout |
+| `WEB_TERMINAL_ENABLED` | `false` | Allow the browser terminal |
+| `WEB_TERMINAL_LOG` | `true` | Include web server trace messages |
+| `WS_BROADCAST_INTERVAL_MS` | `100` | WebSocket log batching interval |
+| `LOG_MAX_LINES` | `5000` | Stored lines per bot/system channel |
+| `WINDOW_DEBUG` | `false` | Include complete inventory slot dumps |
+| `CONFIG_PACKET_LOG_LIMIT` | `120` | Configuration packet log limit; `0` means unlimited |
 
-### Usage
+## Commands
 
-```
-/crates purple
-/crates-loop 5 purple
-/crates-all 3 purple
-/crates-solo Bot2 purple
-```
+Commands typed in the browser or TUI apply to the selected bot unless noted.
+Any unrecognized input is sent as a Minecraft chat message or command.
 
-- Accepts a bare color name (`purple`) or a full block id (`purple_shulker_box`).
-- Valid colors: `white, orange, magenta, light_blue, yellow, lime, pink, gray, light_gray, cyan, purple, blue, brown, green, red, black`.
-- An unrecognized color logs a warning listing valid options and aborts — it will not silently run against the wrong block.
-- `/help` and the command list (`/help`) reflect the new `[n] [color]` usage.
+| Command | Description |
+| --- | --- |
+| `/help` | Show the command list |
+| `/list` | Show all bots and their connection state |
+| `/status` | Show position, health, food, ping, and uptime |
+| `/stats` | Show process memory, event-loop lag, log rate, viewers, and uptime |
+| `/overview` | Query shards, coins, and balance for every bot |
+| `/inv` | List the active bot's inventory |
+| `/players` | List players visible to the active bot |
+| `/uptime` | Show uptime for every bot |
+| `/proxy` | Show proxy and stall-watchdog configuration |
+| `/switch <id>` | Select a bot by name or list number |
+| `/new-bot <name> [host] [port] [version]` | Create a bot at runtime |
+| `/chat <message>` | Send a chat message without local command parsing |
+| `/all <command>` | Run a local command on every bot or broadcast chat |
+| `/clear` | Clear the active bot's stored log view |
+| `/disconnect`, `/dc` | Stop the active bot and automatic reconnect |
+| `/reconnect` | Reconnect the active bot |
+| `/reconnect-all` | Reconnect currently offline bots |
+| `/reconnect-all-slow` | Reconnect all bots with a configurable stagger |
+| `/closeBot` | Disconnect and remove the active bot |
+| `/dump` | TPA and deposit inventory into nearby chests |
+| `/crates [color]` | Run one crate collection cycle |
+| `/crates-loop [n] [color]` | Repeat crate collection |
+| `/crates-all [n] [color]` | Run shardshop, crates, and dump across bots |
+| `/crates-solo [bot] [color]` | Run that sequence for one bot |
+| `/exit` | Disconnect all bots and exit |
 
-### Note on `/crates-solo [bot] [color]`
+Valid crate colors include `white`, `orange`, `magenta`, `light_blue`,
+`yellow`, `lime`, `pink`, `gray`, `light_gray`, `cyan`, `purple`, `blue`,
+`brown`, `green`, `red`, and `black`. A color may be written as a bare name or
+as a full block name such as `purple_shulker_box`.
 
-Since this command already takes an optional `[bot]`, the first word is checked against existing bot names/numbers first; if it doesn't match a bot, it's treated as the color instead (and the active bot is used).
-`CRATE_COMMAND` sets the chat command the bot sends when `/crates` (and `/crates-loop`, `/crates-all`, `/crates-solo`) warps to the crate area — for example, setting `CRATE_COMMAND=/warp afk` in `.env` makes it warp to afk instead of the default `/warp crates`.
-RUN npx patch-package mineflayer FOR BANNNASMP
-OR npm run postinstall
+## Reconnect Behavior
+
+Normal disconnects use exponential backoff, capped at five minutes. Common
+Velocity/Bungee transfer failures use a fast reconnect path and do not consume
+the normal retry budget. After a bot remains stable for 60 seconds, its normal
+retry counter is reset.
+
+The proxy stall watchdog can destroy a silent raw socket so the existing
+reconnect flow can recover it. When many bots stall together, the configured
+proxy restart command may run.
+
+## `bot-rtp.js` Settings
+
+The RTP variant has additional settings, including:
+
+| Variable | Purpose |
+| --- | --- |
+| `BOT_RTP_BOTS` | Bot names for the RTP runner |
+| `MODE` | `roam` for exploration or `afk` for idle operation |
+| `RTP_COMMAND` | Random teleport command |
+| `RTP_INTERVAL_MS` | Time between RTP attempts |
+| `BASE_SCAN_INTERVAL_MS` | Base scan interval |
+| `BASE_SCAN_RADIUS` | Base scan radius |
+| `BASE_ALERT_THRESHOLD` | Storage count required for an alert |
+| `RTP_PAUSE_ON_BASE_MS` | Pause duration after a base finding |
+| `PLAYER_PROXIMITY_RADIUS` | Nearby-player distance |
+| `PLAYER_PROXIMITY_INTERVAL_MS` | Nearby-player check interval |
+| `PLAYER_PROXIMITY_COOLDOWN_MS` | Repeat-alert cooldown |
+| `FOOD_CHECK_INTERVAL_MS` | Hunger check interval |
+| `FOOD_EAT_THRESHOLD` | Hunger threshold for auto-eating |
+| `DISCORD_WEBHOOK_URL` | Discord webhook; empty disables alerts |
+| `DISCORD_USER_ID` | Optional Discord mention target |
+
+## Keep-Alive Hosting
+
+For a free hosted deployment, configure [UptimeRobot](https://uptimerobot.com/)
+to request the bot's `/health` endpoint. Set the monitor interval to **12
+minutes**, not 5 minutes. The endpoint returns `ok` and does not require a
+dashboard login.
+
+## Troubleshooting
+
+### The process exits immediately
+
+Check that `.env` exists and contains a non-empty `BOT_NAMES` value. Then run
+`npm install` and confirm Node.js is version 18 or newer.
+
+### The browser dashboard does not open
+
+Read the startup log for the actual fallback port. Port 80 may be unavailable
+for an unprivileged process, in which case the server automatically tries the
+next ports. Also check the container or host port-forwarding rules.
+
+### The browser log will not scroll
+
+Restart the process after source changes so the embedded dashboard HTML is
+regenerated, then refresh the browser. The dashboard follows new logs until
+you scroll upward manually; sending a command resumes following.
+
+### Bots are kicked during connection or transfer
+
+Increase `CONNECT_DELAY_MS`, confirm `VERSION` matches the server, and inspect
+the per-bot log for protocol or proxy-transfer errors. If a proxy is used,
+check its stability and the stall-watchdog settings.
+
+### GUI navigation does not select the expected item
+
+Confirm `GUI_SLOT` is zero-indexed and inspect the opened inventory. Enable
+`WINDOW_DEBUG=true` temporarily for slot details, or enable item search with
+`GUI_ITEM_SEARCH_ENABLED=true` and suitable search terms.
+
+### Discord alerts are missing in the RTP runner
+
+Check `DISCORD_WEBHOOK_URL`, verify that the webhook is active, and inspect the
+RTP log for webhook errors. Node.js 18+ is required for the built-in `fetch`.
+
+## Project Files
+
+| File | Role |
+| --- | --- |
+| `bot.js` | Main multi-bot manager and web/TUI dashboard |
+| `bot-rtp.js` | RTP, scanning, survival helpers, and Discord alerts |
+| `package.json` | Dependencies and startup/postinstall scripts |
+| `Dockerfile` | Container image definition |
+| `docker-entrypoint.sh` | Container startup entrypoint |
+| `run-docker.sh` | Local Docker run helper |
+| `patches/` | Mineflayer compatibility patches |
+| `api.md` | Mineflayer API reference used by the project |
+
+## License
+
+This project is provided as-is. Use it only on servers and accounts you are
+authorized to automate.
