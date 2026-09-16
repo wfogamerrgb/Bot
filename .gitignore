@@ -7,3 +7,6 @@ node_modules
 bannana
 node_modules/
 .env*
+
+# /spawners production data store + /data snapshot backups (SPAWNER_DATA_DIR)
+data/

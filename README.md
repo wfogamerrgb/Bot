@@ -530,6 +530,9 @@ Any unrecognized input is sent as a Minecraft chat message or command.
 | `/crates-loop [n] [color]` | Repeat crate collection |
 | `/crates-all [n] [color]` | Run shardshop, crates, and dump across bots |
 | `/crates-solo [bot] [color]` | Run that sequence for one bot |
+| `/spawners` | Without moving, right-click every spawner in reach (GUI slot 13 → 53); every run is recorded for `/data` |
+| `/dump-spawners` | Deposit only spawners into nearby chests |
+| `/data [local]` | Compile the recorded `/spawners` production (coins, rank, balance, per-spawner `$` and `$/hour`, locations) and push the snapshot to Google Sheets |
 | `/drop [count]` | Drop the held stack (or `count` items from it) |
 | `/pickup [all]` | Pathfind to the nearest dropped item and collect it (`all` = sweep the area) |
 | `/gui <server command>` | Open a server GUI and manage it manually (no auto-click/auto-warp) |
@@ -630,6 +633,130 @@ several commands back-to-back and would otherwise trip the server cooldown
 (the old code only spaced `/fix` → `/rank`, so `/fix` still got rate-limited
 and showed N/A). Override the command and spacing with `RANK_FIX_COMMAND` and
 `RANK_COOLDOWN_MS`.
+
+## Spawner production data (`/spawners` → `/data`)
+
+Every `/spawners` run records what it produced, per bot, and `/data` compiles
+all of it — coins, rank, balance, per-spawner money, rate, and locations — into
+one snapshot that is pushed to a Google Sheet (and backed up locally).
+
+### What is recorded on every `/spawners` run
+
+- **The run**: `/bal` before the first spawner, the balance after the last one,
+  the `$` earned this run, the time since that bot's previous `/spawners` run,
+  and the bot's own position (X/Y/Z + dimension).
+- **Each spawner**: its index (`Spawner 1`, `Spawner 2`, … — kept in that form),
+  its block coordinates, the `$` delta measured by running `/bal` right after
+  that spawner was clicked, and the balance before/after it.
+- **The rate**: `$/hour = $ earned this run ÷ (time since last /spawners run)`,
+  reported **both** as raw `$` for the run and as `$/hour`.
+
+First run (or a cleared store) has no previous timestamp, so it records the
+**baseline `/bal` only** and shows `rate N/A` — the rate starts on the next run.
+A `/bal` that does not answer is stored as `balance N/A` and skipped instead of
+being counted as zero, and the run keeps going.
+
+### Storage
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `SPAWNER_DATA_ENABLED` | `true` | Record `/spawners` runs; `0` disables all recording |
+| `SPAWNER_DATA_DIR` | `data/` | Store directory (`spawner-data.sqlite`, `latest-snapshot.json`) |
+| `SPAWNER_DATA_STORE` | `auto` | `auto` (SQLite when available, else JSON), `sqlite`, or `json` |
+| `SPAWNER_DATA_BAL_PER_SPAWNER` | `true` | Run `/bal` after **every** spawner click for accurate per-spawner attribution; `false` = one `/bal` per run (faster) |
+| `SPAWNER_DATA_BAL_DELAY_MS` | `1200` | Gap before each per-spawner `/bal`, to stay clear of command cooldowns |
+| `SPAWNER_DATA_BAL_TIMEOUT_MS` | `2500` | How long to wait for a `/bal` reply before storing `N/A` |
+| `SPAWNER_DATA_SHEET_URL` | *(empty)* | Apps Script web app URL the `/data` snapshot is POSTed to |
+| `SPAWNER_DATA_SHEET_TOKEN` | *(empty)* | Optional shared secret sent as `token` in the payload and `X-Auth-Token` |
+| `SPAWNER_DATA_PUSH_TIMEOUT_MS` | `20000` | Webhook POST timeout |
+
+Recording uses SQLite through Node's built-in `node:sqlite` (Node 22.5+) and
+falls back to a plain JSON file on older runtimes — no extra dependency, and
+`node:sqlite` may print a one-time `ExperimentalWarning` at startup (set
+`SPAWNER_DATA_STORE=json` to avoid it). Nothing is created until the first
+`/spawners` run, and the store directory is git-ignored.
+
+Per-spawner `/bal` is the accurate option but it is also the slow one: each
+spawner costs one extra command plus `SPAWNER_DATA_BAL_DELAY_MS`. Set
+`SPAWNER_DATA_BAL_PER_SPAWNER=false` to keep the run fast — per-spawner rows
+still get their coordinates, just `$ N/A` instead of a per-spawner amount (the
+run total and `$/hour` are still measured).
+
+### `/data`
+
+`/data` queries live `/shards`, `/coins`, `/bal`, and the rank probe for every
+bot, merges that with the stored production history, prints the summary
+(per bot, then `Spawner 1`, `Spawner 2`, … with `$` and `$/hour`, plus the bot
+position and a lifetime-totals line), writes `latest-snapshot.json` into
+`SPAWNER_DATA_DIR`, and — when `SPAWNER_DATA_SHEET_URL` is set — POSTs the
+snapshot with `mode: "replace"` so the sheet always holds **one current row per
+bot/spawner** instead of growing forever. `/data local` does everything except
+the push. Like `/overview`, `/data` is fleet-wide: run it directly or from cron,
+not through `/all`.
+
+Run it on a schedule with the existing cron support, e.g. in `.env`:
+
+```dotenv
+CRON_JOB_3=0 */6 * * *|/data
+```
+
+### Google Sheets setup (options)
+
+1. **Apps Script webhook — implemented above, recommended.** No OAuth, no
+   service account, no extra dependency. `SPAWNER_DATA_SHEET_URL` + paste the
+   script below into the sheet.
+2. **Google Sheets API v4 with a service account.** Full control over ranges and
+   formatting, but needs a cloud project, a JSON key, a share on the sheet, and
+   a JWT-signing dependency — say the word and I can wire it as an alternative
+   backend.
+3. **Zapier / Make / n8n webhook → Sheets.** Same POST shape, third-party hop in
+   the middle; only worth it if you already use one of them.
+4. **Sheet pulls the data itself.** If the bot exposes its snapshot JSON at a
+   public URL, the sheet can use `IMPORTDATA("https://…/latest-snapshot.json")`
+   and needs no push at all — but the URL must be publicly reachable.
+
+### Apps Script for option 1
+
+In the target spreadsheet: **Extensions → Apps Script**, paste this, save, then
+**Deploy → New deployment → Web app** with *Execute as: me* and *Who has
+access: Anyone*. Copy the `/exec` URL into `SPAWNER_DATA_SHEET_URL`.
+
+```javascript
+const CONFIG = { token: '', spreadsheetId: '' } // token '' disables the check
+
+function doPost (e) {
+  const body = JSON.parse(e.postData.contents)
+  if (CONFIG.token && body.token !== CONFIG.token) {
+    return JSON.stringify({ ok: false, error: 'bad token' })
+  }
+  const ss = CONFIG.spreadsheetId
+    ? SpreadsheetApp.openById(CONFIG.spreadsheetId)
+    : SpreadsheetApp.getActiveSpreadsheet()
+  const tabs = body.sheetTabs || {}
+  Object.keys(tabs).forEach(function (name) {
+    const tab = tabs[name]
+    const sheet = ss.getSheetByName(name) || ss.insertSheet(name)
+    sheet.clearContents() // mode: "replace" — one current row per bot/spawner
+    const rows = [tab.header].concat(tab.rows || [])
+    if (name === 'Totals' && tab.summary) {
+      rows.push([])
+      rows.push(['LIFETIME', tab.summary.bots + ' bot(s)', tab.summary.runs + ' run(s)',
+        tab.summary.spawners + ' spawner click(s)', tab.summary.earned])
+    }
+    const width = rows.reduce(function (max, r) { return Math.max(max, r.length) }, 1)
+    const padded = rows.map(function (r) { const c = r.slice(); while (c.length < width) c.push(''); return c })
+    sheet.getRange(1, 1, padded.length, width).setValues(padded)
+  })
+  return JSON.stringify({ ok: true, generatedAt: body.generatedAtIso })
+}
+```
+
+The script writes three tabs — `Bots` (rank, coins, shards, balance, lifetime
+`$`, last run and `$/hour`), `Spawners` (one current row per bot/spawner with
+`$`, `$/hour`, coordinates, bot position) and `Totals` (lifetime per bot plus an
+overall `LIFETIME` row). A 302 redirect to `googleusercontent.com` after a push
+is normal for Apps Script; the rows land in the sheet either way, so `/data`
+reports the HTTP status and treats any non-4xx/5xx as delivered.
 
 ## Chat activity watchdog
 
@@ -749,6 +876,7 @@ RTP log for webhook errors. Node.js 18+ is required for the built-in `fetch`.
 | `bot.js` | Main multi-bot manager and web/TUI dashboard |
 | `bot-rtp.js` | RTP, scanning, survival helpers, and Discord alerts |
 | `cron.js` | Dependency-free cron scheduler (`/cron`, `CRON_JOB_<N>` env jobs) |
+| `spawner-data.js` | `/spawners` production store (SQLite/JSON), `/data` snapshot builder, Google Sheets webhook push |
 | `package.json` | Dependencies and startup/postinstall scripts |
 | `Dockerfile` | Container image definition |
 | `docker-entrypoint.sh` | Container startup entrypoint |
