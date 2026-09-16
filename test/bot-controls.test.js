@@ -1,7 +1,7 @@
 'use strict'
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const { readDelayMs, shuffledCopy, createSlowBroadcast, createSlowBroadcastManager, parseProxyGroups, resolveBotProxy } = require('../bot-controls')
+const { readDelayMs, readInt, readNumber, parseDumpMode, parseDataArgs, shuffledCopy, createSlowBroadcast, createSlowBroadcastManager, parseProxyGroups, resolveBotProxy } = require('../bot-controls')
 
 function clock() {
   let time = 0, sequence = 0
@@ -22,6 +22,29 @@ function clock() {
     }
   }
 }
+
+test('readInt and readNumber fall back on missing, junk, or out-of-range values', () => {
+  assert.equal(readInt(undefined, 50), 50)
+  assert.equal(readInt('', 50), 50)
+  assert.equal(readInt('500', 50), 500)
+  assert.equal(readInt('0', 50, 1, 500), 50)
+  assert.equal(readInt('501', 50, 1, 500), 50)
+  assert.equal(readInt('12.4', 50), 12)
+  assert.equal(readInt('junk', 50), 50)
+  assert.equal(readNumber('30', 30, 1, 256), 30)
+  assert.equal(readNumber('3.5', 10, 0.5, 1000), 3.5)
+  assert.equal(readNumber('0.1', 10, 0.5, 1000), 10)
+  assert.equal(readNumber('nope', 10, 0.5, 1000), 10)
+})
+
+test('parseDumpMode flags a typo instead of silently starting a TPA dump', () => {
+  assert.deepEqual(parseDumpMode(undefined), { mode: 'tpa', unknown: null })
+  assert.deepEqual(parseDumpMode(''), { mode: 'tpa', unknown: null })
+  assert.deepEqual(parseDumpMode('HOME'), { mode: 'home', unknown: null })
+  assert.deepEqual(parseDumpMode('hidden'), { mode: 'hidden', unknown: null })
+  assert.deepEqual(parseDumpMode('cancel'), { mode: 'cancel', unknown: null })
+  assert.deepEqual(parseDumpMode('hiden'), { mode: 'tpa', unknown: 'hiden' })
+})
 
 test('delay defaults and validation never let Node clamp invalid values to 1ms', () => {
   for (const value of [undefined, '', ' ', 'NaN', 'Infinity', '-1', '0', '1.5', '15000junk', '2147483648']) assert.equal(readDelayMs(value), 15000)
@@ -188,4 +211,21 @@ test('multi-task createSlowBroadcastManager: concurrent tasks, independent timer
   assert.equal(manager.cancelAll(), 2)
   assert.equal(manager.running, false)
   assert.equal(c.timers.size, 0)
+})
+
+test('parseDataArgs defaults to push and reads subcommands', () => {
+  assert.deepEqual(parseDataArgs(''), { action: 'push', unknown: null })
+  assert.deepEqual(parseDataArgs(undefined), { action: 'push', unknown: null })
+  assert.deepEqual(parseDataArgs('   '), { action: 'push', unknown: null })
+  assert.deepEqual(parseDataArgs(' check '), { action: 'check', unknown: null })
+  assert.deepEqual(parseDataArgs('CHECK'), { action: 'check', unknown: null })
+  assert.deepEqual(parseDataArgs('doctor'), { action: 'check', unknown: null })
+  assert.deepEqual(parseDataArgs('status'), { action: 'status', unknown: null })
+})
+
+// A typo must never silently start a real push without saying so.
+test('parseDataArgs reports an unknown option but still pushes', () => {
+  assert.deepEqual(parseDataArgs('chekc'), { action: 'push', unknown: 'chekc' })
+  assert.deepEqual(parseDataArgs('pussh now'), { action: 'push', unknown: 'pussh' })
+  assert.deepEqual(parseDataArgs('CHECK extra'), { action: 'check', unknown: null })
 })

@@ -55,16 +55,61 @@ function buildSnapshot (state, now = Date.now()) {
   }
 }
 
-async function pushWebhook (url, payload, fetchImpl = globalThis.fetch) {
-  if (!url) return { pushed: false, skipped: true }
-  if (typeof fetchImpl !== 'function') throw new Error('global fetch is unavailable')
-  const response = await fetchImpl(url, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(payload)
-  })
-  if (!response.ok) throw new Error(`data webhook returned HTTP ${response.status}`)
-  return { pushed: true, status: response.status }
+// Appends the shared secret as a query parameter. Apps Script web apps expose
+// query parameters (e.parameter) but never request headers, so the secret has to
+// travel in the URL and/or the JSON body.
+function withSecret (url, secret) {
+  if (!secret) return url
+  const separator = url.includes('?') ? '&' : '?'
+  return `${url}${separator}secret=${encodeURIComponent(secret)}`
 }
 
-module.exports = { emptyState, loadState, saveState, calculateProduction, upsertBot, upsertSpawner, buildSnapshot, pushWebhook }
+// POSTs a snapshot to the configured webhook (normally a Google Apps Script
+// doPost). The response body is parsed and validated, because a web app that is
+// not deployed with "Who has access: Anyone" answers with an HTML login page and
+// HTTP 200 — the push looked successful while the sheet never updated.
+//
+// Resolves with { pushed, status, response } where `response` is the parsed JSON
+// body (null when the endpoint returned no body, e.g. in unit tests).
+async function pushWebhook (url, payload, fetchImpl = globalThis.fetch, { secret = '', timeoutMs = 0 } = {}) {
+  if (!url) return { pushed: false, skipped: true, response: null }
+  if (typeof fetchImpl !== 'function') throw new Error('global fetch is unavailable')
+
+  const body = JSON.stringify(secret ? { ...payload, secret } : payload)
+  const options = {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body
+  }
+  if (timeoutMs > 0 && typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+    options.signal = AbortSignal.timeout(timeoutMs)
+  }
+
+  let response
+  try {
+    response = await fetchImpl(withSecret(url, secret), options)
+  } catch (err) {
+    const timedOut = err && (err.name === 'TimeoutError' || err.name === 'AbortError')
+    const reason = timedOut ? `timed out after ${timeoutMs}ms` : (err && err.message ? err.message : String(err))
+    throw new Error(`data webhook request failed: ${reason}`)
+  }
+  if (!response || !response.ok) throw new Error(`data webhook returned HTTP ${response ? response.status : 'no response'}`)
+
+  const text = typeof response.text === 'function' ? await response.text() : ''
+  let parsed = null
+  if (text && text.trim()) {
+    try {
+      parsed = JSON.parse(text)
+    } catch (_) {
+      const preview = text.trim().replace(/\s+/g, ' ').slice(0, 140)
+      throw new Error(`data webhook answered with non-JSON content (${preview}) — check that the Apps Script web app is deployed with "Execute as: me" and "Who has access: Anyone"`)
+    }
+  }
+  if (parsed && parsed.ok === false) {
+    const detail = Array.isArray(parsed.errors) && parsed.errors.length ? parsed.errors.join('; ') : 'no detail reported'
+    throw new Error(`Apps Script reported a failure: ${detail}`)
+  }
+  return { pushed: true, status: response.status, response: parsed }
+}
+
+module.exports = { emptyState, loadState, saveState, calculateProduction, upsertBot, upsertSpawner, buildSnapshot, pushWebhook, withSecret }

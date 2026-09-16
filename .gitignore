@@ -8,3 +8,4 @@ bannana
 node_modules/
 .env*
 data/*.json
+cron-jobs.json

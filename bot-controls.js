@@ -7,6 +7,43 @@ function readDelayMs(value, fallback = 15000) {
   return Number.isSafeInteger(ms) && ms >= 1 && ms <= 2147483647 ? ms : fallback
 }
 
+// Integer env reader with range clamping: missing, non-numeric, or out-of-range
+// values fall back instead of silently becoming NaN/0.
+function readInt(value, fallback, min = 0, max = Number.MAX_SAFE_INTEGER) {
+  if (value == null || String(value).trim() === '') return fallback
+  const n = Number(value)
+  if (!Number.isFinite(n) || n < min || n > max) return fallback
+  return Math.round(n)
+}
+
+// Same contract as readInt, but keeps fractional values (distances, radii).
+function readNumber(value, fallback, min = -Infinity, max = Infinity) {
+  if (value == null || String(value).trim() === '') return fallback
+  const n = Number(value)
+  return Number.isFinite(n) && n >= min && n <= max ? n : fallback
+}
+
+// `/dump` accepts an optional mode. A typo must not silently start a real TPA
+// dump, so unknown tokens are reported back instead of being ignored.
+function parseDumpMode(args) {
+  const mode = String(args || '').trim().toLowerCase()
+  if (!mode) return { mode: 'tpa', unknown: null }
+  if (mode === 'home' || mode === 'hidden' || mode === 'cancel') return { mode, unknown: null }
+  return { mode: 'tpa', unknown: mode }
+}
+
+// `/data` takes an optional subcommand. `check` verifies the Apps Script
+// webhook end-to-end (GET health + a note about what the answer means) instead
+// of pushing a snapshot; an unknown token must not silently trigger a push.
+function parseDataArgs(args) {
+  const tokens = String(args || '').trim().split(/\s+/).filter(Boolean)
+  if (!tokens.length) return { action: 'push', unknown: null }
+  const sub = tokens[0].toLowerCase()
+  if (sub === 'check' || sub === 'doctor') return { action: 'check', unknown: null }
+  if (sub === 'status') return { action: 'status', unknown: null }
+  return { action: 'push', unknown: sub }
+}
+
 function shuffledCopy(values, random = Math.random) {
   const result = values.slice()
   for (let i = result.length - 1; i > 0; i--) {
@@ -325,6 +362,10 @@ function resolveBotProxy(username, groups, fallback = null) {
 
 module.exports = {
   readDelayMs,
+  readInt,
+  readNumber,
+  parseDumpMode,
+  parseDataArgs,
   shuffledCopy,
   parseNameList,
   hasInventoryItems,

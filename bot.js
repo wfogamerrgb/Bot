@@ -1,6 +1,9 @@
 require('dotenv').config() // npm install dotenv ws — neo-blessed only if TUI_GUI, socks only for PROXY_HOST
 const {
   readDelayMs,
+  readInt,
+  readNumber,
+  parseDumpMode,
   shuffledCopy,
   createSlowBroadcast,
   createSlowBroadcastManager,
@@ -10,6 +13,7 @@ const {
   parseCommandChain,
   executeCommandChain: executeCommandChainBase,
   parseNameList,
+  parseDataArgs,
   hasInventoryItems,
   randomInt,
   buildHiddenDumpPlan
@@ -53,6 +57,17 @@ const DUMP_HOME_COMMAND = (process.env.DUMP_HOME_COMMAND || '/home stash').trim(
 const DUMP_MIN_TPA_GAP_MS = Math.max(180000, parseInt(process.env.DUMP_MIN_TPA_GAP_MS || '180000', 10))
 const DUMP_HIDDEN_MIN_MS = Math.max(60000, parseInt(process.env.DUMP_HIDDEN_MIN_MS || '480000', 10))
 const DUMP_HIDDEN_MAX_MS = Math.max(DUMP_HIDDEN_MIN_MS, parseInt(process.env.DUMP_HIDDEN_MAX_MS || '720000', 10))
+// /dump + /dump-spawners tuning. Every value has the long-standing default, so
+// an existing .env needs no changes; invalid values fall back instead of
+// producing NaN timers.
+const DUMP_TPA_TIMEOUT_MS = readDelayMs(process.env.DUMP_TPA_TIMEOUT_MS, 45000)
+const DUMP_TPA_MIN_DISTANCE = readNumber(process.env.DUMP_TPA_MIN_DISTANCE, 10, 0.5, 1000)
+const DUMP_SETTLE_MS = readDelayMs(process.env.DUMP_SETTLE_MS, 2500)
+const DUMP_WARP_DELAY_MS = readDelayMs(process.env.DUMP_WARP_DELAY_MS, 2500)
+const DUMP_CLICK_DELAY_MS = readDelayMs(process.env.DUMP_CLICK_DELAY_MS, 120)
+const DUMP_OPEN_TIMEOUT_MS = readDelayMs(process.env.DUMP_OPEN_TIMEOUT_MS, 15000)
+const CHEST_SCAN_RADIUS = readNumber(process.env.CHEST_SCAN_RADIUS, 30, 1, 256)
+const CHEST_SCAN_COUNT = readInt(process.env.CHEST_SCAN_COUNT, 50, 1, 500)
 let hiddenDumpRun = null
 
 // ── Persistent /data recorder ───────────────────────────────────────────────
@@ -60,7 +75,10 @@ let hiddenDumpRun = null
 // snapshot and optionally POSTs that snapshot to a Google Apps Script webhook.
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data', 'spawner-data.json')
 const DATA_WEBHOOK_URL = (process.env.DATA_WEBHOOK_URL || '').trim()
-const DATA_WEBHOOK_TIMEOUT_MS = parseInt(process.env.DATA_WEBHOOK_TIMEOUT_MS || '15000', 10)
+// Shared secret for the Apps Script endpoint (matched against its WEBHOOK_SECRET
+// script property, or "secret" in the POST body). Empty disables the check.
+const DATA_WEBHOOK_SECRET = (process.env.DATA_WEBHOOK_SECRET || '').trim()
+const DATA_WEBHOOK_TIMEOUT_MS = readDelayMs(process.env.DATA_WEBHOOK_TIMEOUT_MS, 15000)
 const dataState = dataStore.loadState(DATA_FILE)
 function persistData () {
   dataState.updatedAt = new Date().toISOString()
@@ -129,11 +147,20 @@ return u.toString()
 }
 const SSH_CONFIG = sshConfig()
 const SSH_ENABLED = SSH_CONFIG.enabled
-const WS_BROADCAST_INTERVAL_MS = parseInt(process.env.WS_BROADCAST_INTERVAL_MS || '100', 10)
+const WS_BROADCAST_INTERVAL_MS = readDelayMs(process.env.WS_BROADCAST_INTERVAL_MS, 100)
 const WS_SEND_MAX_BUFFERED = 1 << 20 // 1MB; drop pushes to clients this far behind instead of buffering
-// Dashboard only renders the last 400 lines/bot, so 1500 is generous headroom
-// while keeping memory low on small hosts (env override still available).
-const LOG_MAX_LINES = parseInt(process.env.LOG_MAX_LINES || '1500', 10)
+// Dashboard only sends LOG_VIEW_LINES per channel, so 1500 stored lines is
+// generous headroom while keeping memory low on small hosts.
+const LOG_MAX_LINES = readInt(process.env.LOG_MAX_LINES, 1500, 50, 200000)
+const LOG_VIEW_LINES = readInt(process.env.LOG_VIEW_LINES, 400, 10, 200000)
+// Log retention: lines older than LOG_PRUNE_MINUTES are dropped every
+// LOG_PRUNE_INTERVAL_MS. Set LOG_PRUNE_MINUTES=0 to keep logs for the session.
+const LOG_PRUNE_MINUTES = readNumber(process.env.LOG_PRUNE_MINUTES, 20, 0, 1440)
+const LOG_PRUNE_INTERVAL_MS = readDelayMs(process.env.LOG_PRUNE_INTERVAL_MS, 60000)
+// Dashboard knobs: page title and the HTTP fallback poll cadence used when the
+// browser cannot open a WebSocket (WS push cadence: WS_BROADCAST_INTERVAL_MS).
+const DASHBOARD_TITLE = (process.env.DASHBOARD_TITLE || 'AFK Console').trim() || 'AFK Console'
+const WEB_REFRESH_MS = readDelayMs(process.env.WEB_REFRESH_MS, 2000)
 const WINDOW_DEBUG = /^(1|true|yes|on)$/i.test(process.env.WINDOW_DEBUG || '') // true restores full window slot dumps
 const CONFIG_PACKET_LOG_LIMIT = parseInt(process.env.CONFIG_PACKET_LOG_LIMIT || '120', 10) // 0 = unlimited config packet logging
 
@@ -401,22 +428,22 @@ return parts.join(' ')
 // compound like {type:'compound', value:{text:{type:'string', value:'Sword'}}}),
 // and arrays (extra lists).
 function textParts (node, out) {
-if (node == null) return out
+if (node == null)  return out
 if (typeof node === 'string') {
 try {
 const parsed = JSON.parse(node)
-if (typeof parsed === 'string') { out.push(parsed); return out }
+if (typeof parsed === 'string') { out.push(parsed);  return out }
 return textParts(parsed, out)
-} catch (_) { out.push(node); return out }
+} catch (_) { out.push(node);  return out }
 }
-if (typeof node === 'number' || typeof node === 'boolean') { out.push(String(node)); return out }
-if (Array.isArray(node)) { node.forEach(n => textParts(n, out)); return out }
+if (typeof node === 'number' || typeof node === 'boolean') { out.push(String(node));  return out }
+if (Array.isArray(node)) { node.forEach(n => textParts(n, out));  return out }
 if (typeof node === 'object') {
 // NBT tag wrapper: { type: 'string'|'compound'|'list'|…, value: … }
 if (typeof node.type === 'string' && Object.prototype.hasOwnProperty.call(node, 'value')) {
 if (node.type === 'string') {
 const rawStr = String(node.value)
-try { return textParts(JSON.parse(rawStr), out) } catch (_) { out.push(rawStr); return out }
+try { return textParts(JSON.parse(rawStr), out) } catch (_) { out.push(rawStr);  return out }
 }
 return textParts(node.value, out)
 }
@@ -520,7 +547,7 @@ function logWarn(msg) { log(`{yellow-fg}⚠ ${msg}{/yellow-fg}`) }
 // loads them at startup. Schedules are 5-field cron ("0 4 * * *") or
 // "@every <seconds>" (min 5). Jobs dispatch with /all semantics: known local
 // commands run per bot, everything else is broadcast as chat to spawned bots.
-const { CronManager, parseBotTargetCommand } = require('./cron')
+const { CronManager, parseBotTargetCommand, matchBotName, parseCronAddArgs } = require('./cron')
 // Per-bot dispatch with /all semantics: manual commands route through their own
 // router, known local commands run through handleCommand (arguments preserved),
 // everything else is sent as chat to that bot. Returns true when dispatched.
@@ -546,20 +573,64 @@ function dispatchCommandToAllBots (msg) {
   }
   return sent
 }
+// Resolves a job's @targets against the live roster (case-insensitive) so
+// `@hypr_7_core` still finds `Hypr_7_core`. Unknown names are reported with a
+// hint instead of silently skipping the job.
+function resolveCronTargets (targetIds) {
+  const roster = Object.keys(bots)
+  const resolved = []
+  const unknown = []
+  for (const name of targetIds) {
+    const match = matchBotName(name, roster)
+    if (match) resolved.push(match)
+    else unknown.push(name)
+  }
+  return { resolved, unknown, roster }
+}
+// Cheap "did you mean" for a mistyped target: prefix, substring, or the target
+// being a prefix of a real name (e.g. "@Hypr" → Hypr_7_core).
+function suggestBotName (name, roster) {
+  const want = String(name || '').trim().toLowerCase()
+  if (!want) return null
+  return roster.find(id => id.toLowerCase().startsWith(want)) ||
+    roster.find(id => id.toLowerCase().includes(want)) ||
+    roster.find(id => want.startsWith(id.toLowerCase())) ||
+    null
+}
+function describeUnknownTargets (unknown, roster) {
+  return unknown.map(name => {
+    const hint = suggestBotName(name, roster)
+    const near = hint ? ` (did you mean ${hint}?)` : ''
+    return `${name}${near}`
+  }).join(', ')
+}
+// Cron persistence: jobs added with `/cron add` are written to CRON_STATE_FILE
+// and reloaded on the next start, so runtime jobs survive a restart. Set
+// CRON_PERSIST=false to keep jobs in memory only (CRON_JOB_<N> in .env is
+// always loaded and wins over a duplicate in the file).
+const CRON_PERSIST = !/^(0|false|no|off)$/i.test((process.env.CRON_PERSIST || '').trim())
+const CRON_STATE_FILE = CRON_PERSIST
+  ? ((process.env.CRON_STATE_FILE || '').trim() || path.join(__dirname, 'cron-jobs.json'))
+  : ''
 const cronManager = new CronManager({
+  stateFile: CRON_STATE_FILE,
   dispatch: (command) => {
     const parsed = parseBotTargetCommand(command)
     const trimmed = parsed.command
     const targetIds = parsed.botIds
     if (targetIds) {
-      const unknown = targetIds.filter(id => !bots[id])
+      const { resolved, unknown, roster } = resolveCronTargets(targetIds)
       if (unknown.length) {
-        logFor(SYSTEM_ID, `{red-fg}✗ Cron target bot(s) not found: ${unknown.join(', ')} — job skipped.{/red-fg}`)
+        logFor(SYSTEM_ID, `{red-fg}✗ Cron target bot(s) not found: ${describeUnknownTargets(unknown, roster)} — job skipped. Known bots: ${roster.join(', ') || 'none'}{/red-fg}`)
         return 0
       }
-      if (trimmed.startsWith('/data')) return compileAndPushData(() => {}, targetIds)
+      if (trimmed.startsWith('/data')) {
+        // /data pushes per targeted bot; its check/status subcommands are global.
+        if (parseDataArgs(trimmed.slice('/data'.length)).action !== 'push') return handleCommand(trimmed)
+        return compileAndPushData(() => {}, resolved)
+      }
       let sent = 0
-      for (const id of targetIds) {
+      for (const id of resolved) {
         try { if (dispatchCommandToBot(trimmed, id)) sent++ } catch (_) {}
       }
       return sent
@@ -572,15 +643,22 @@ const cronManager = new CronManager({
   },
   log: (msg) => logFor(SYSTEM_ID, msg)
 })
-const CRON_ENV_LOADED = cronManager.loadFromEnv(process.env)
-cronManager.start()
+// CRON_ENABLED=0 stops the scheduler entirely; jobs can still be added and
+// fired by hand with /cron run. CRON_TICK_MS tunes the scheduler resolution.
+const CRON_ENABLED = !/^(0|false|no|off)$/i.test((process.env.CRON_ENABLED || '').trim())
+const CRON_TICK_MS = readDelayMs(process.env.CRON_TICK_MS, 1000)
+// .env first (authoritative), then the saved state file on top of it.
+const CRON_ENV_LOADED = CRON_ENABLED ? cronManager.loadFromEnv(process.env) : 0
+const CRON_FILE_LOADED = CRON_ENABLED ? cronManager.loadFromFile() : 0
+if (CRON_ENABLED) cronManager.start(CRON_TICK_MS)
 
-// 20-minute log pruning (original behavior), timers unref'd so they never hold the process open
+// Log pruning (default 20 minutes, env-tunable); timers unref'd so they never
+// hold the process open.
 const pruneTimer = setInterval(() => {
-const cutoff = Date.now() - (20 * 60 * 1000)
+const cutoff = LOG_PRUNE_MINUTES > 0 ? Date.now() - (LOG_PRUNE_MINUTES * 60 * 1000) : 0
 Object.values(bots).forEach(botState => { botState.logs = botState.logs.filter(l => l.time > cutoff) })
 systemLogs.splice(0, systemLogs.length, ...systemLogs.filter(l => l.time > cutoff))
-}, 60000)
+}, LOG_PRUNE_INTERVAL_MS)
 if (pruneTimer.unref) pruneTimer.unref()
 
 // Runtime stats probes (event-loop lag + log throughput)
@@ -848,7 +926,7 @@ return t
 
 // ── Web GUI: login page ──────────────────────────────────────────────────────
 const LOGIN_HTML = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Sign in — AFK Console</title>
+<title>Sign in — ${DASHBOARD_TITLE}</title>
 <style>
 body{background:#0a0e13;color:#c7d2dc;font:14px ui-monospace,'Cascadia Code','SF Mono',Menlo,Consolas,monospace;display:grid;place-items:center;height:100vh;margin:0}
 .card{background:#0f151d;border:1px solid #1d2836;border-radius:12px;padding:34px 38px;width:320px;text-align:center;box-shadow:0 12px 40px rgba(0,0,0,.45)}
@@ -866,7 +944,7 @@ button{width:100%;background:#2dd4bf;color:#04211d;border:0;border-radius:8px;pa
 
 // ── Web GUI: dashboard page ──────────────────────────────────────────────────
 const PAGE_HTML = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AFK Console</title>
+<title>${DASHBOARD_TITLE}</title>
 <style>
 :root{--bg:#0a0e13;--panel:#0f151d;--panel2:#131b25;--line:#1d2836;--txt:#c7d2dc;--dim:#5b6b7a;--acc:#2dd4bf;--red:#f87171;--grn:#4ade80;--yel:#fbbf24;--cyan:#67e8f9;--mag:#e879f9;--blu:#7db3f5}
 *{box-sizing:border-box;margin:0;padding:0}
@@ -1068,7 +1146,7 @@ return r.json()
 cmds=m.commands||cmds;hist=m.cmdHistory||hist;terminalEnabled=!!m.terminalEnabled;el('terminalbtn').hidden=!terminalEnabled;renderBots(m.bots||[]);renderStats(m.stats||{});buildHelp();if(view===requestedView)setLines(m.lines||[]);setWsState('up','http fallback')
 }).catch(function(){setWsState('down','offline')}).then(function(){pollBusy=false})
 }
-poll();pollTimer=setInterval(poll,2000)
+poll();pollTimer=setInterval(poll,${WEB_REFRESH_MS})
 }
 function stopHttpFallback(){if(pollTimer){clearInterval(pollTimer);pollTimer=null}}
 function scheduleConnect(){if(rcTimer)clearTimeout(rcTimer);rcTimer=setTimeout(function(){rcTimer=null;connect()},rcDelay);rcDelay=Math.min(Math.round(rcDelay*1.7),9000)}
@@ -1696,15 +1774,15 @@ return null
 }
 function botViewId(v) { return (v !== 'all' && v !== 'system') ? v : null }
 function historyForView(v) {
-if (v === 'system') return systemLogs.slice(-400).map(l => escHtml(l.text))
+if (v === 'system') return systemLogs.slice(-LOG_VIEW_LINES).map(l => escHtml(l.text))
 if (v === 'all') {
-const all = systemLogs.slice(-400)
-Object.values(bots).forEach(e => { all.push(...e.logs.slice(-400)) })
+const all = systemLogs.slice(-LOG_VIEW_LINES)
+Object.values(bots).forEach(e => { all.push(...e.logs.slice(-LOG_VIEW_LINES)) })
 all.sort((a, b) => a.time - b.time)
-return all.slice(-400).map(l => escHtml(l.text))
+return all.slice(-LOG_VIEW_LINES).map(l => escHtml(l.text))
 }
 const e = bots[v]
-return e ? e.logs.slice(-400).map(l => escHtml(l.text)) : []
+return e ? e.logs.slice(-LOG_VIEW_LINES).map(l => escHtml(l.text)) : []
 }
 
 function addClient(ws) {
@@ -2535,7 +2613,7 @@ const COMMANDS = {
 '/crates-all [n] [color]': `Run shardshop → crates → dump on bots 1 through n (default: all bots) targeting crate [color] (default: ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')}), ${(CRATES_ALL_STAGGER_MS / 1000).toFixed(0)}s apart so they don't hit the server at once`,
 '/crates-solo [bot] [color]': 'Run shardshop → crates → dump on just one bot (default: active bot) targeting crate [color] — not all bots',
 '/spawners': `Without moving, right-click every ${SPAWNER_BLOCK.replace(/_/g, ' ')} already within reach (${SPAWNER_REACH} blocks), clicking GUI slot ${SPAWNER_SLOT_FIRST} then slot ${SPAWNER_SLOT_SECOND} on each one`,
-'/data': 'Compile all saved bot/spawner data, save the local JSON snapshot, and push the current snapshot to the Google Sheets Apps Script webhook',
+'/data': 'Compile all saved bot/spawner data, save the local JSON snapshot, and push the current snapshot to the Google Sheets Apps Script webhook. Subcommands: /data check (verify the webhook deployment end-to-end), /data status (show webhook config + tracked counts)',
 '/list': 'Compact one-line-per-bot status list (online / offline / last kick)',
 '/chat <msg>': 'Send a chat message from the active bot (avoids triggering local commands); /-prefixed server commands open their GUI without auto-clicking',
 '/disconnect': 'Disconnect the active bot (stops auto-reconnect). Alias: /dc',
@@ -2546,7 +2624,7 @@ const COMMANDS = {
 '/inv': 'List active bot\'s inventory',
 '/tpauto on|off': 'Toggle automatic /tpaccept for trusted bot names only',
 '/find <name>': 'Search EVERY bot\'s inventory and open window for an item by display, custom, or registry name',
-'/cron': 'List scheduled jobs; /cron add <schedule> <cmd> | rm <id> | on|off <id> | run <id> — schedules are 5-field cron or "@every <secs>"; env CRON_JOB_<N>="<schedule>|<command>"',
+'/cron': 'List scheduled jobs; /cron add <schedule> <cmd> | rm <id> | on|off <id> | run <id> — add jobs with /cron add <schedule> <command>, optionally prefixed with @BotName to target a single bot; jobs are saved to CRON_STATE_FILE and reloaded on restart. Schedules are 5-field cron or "@every <secs>"; env CRON_JOB_<N>="<schedule>|<command>"',
 
 '/players': 'List players online from the active bot\'s perspective',
 '/exit': 'Disconnect all bots and close the program',
@@ -2682,7 +2760,7 @@ if (spawnersOnly) {
 }
 
 const tpaTarget = options.target || TPA_MAIN_PLAYER
-const scanRadius = parseInt(process.env.CHEST_SCAN_RADIUS || '30', 10)
+const scanRadius = CHEST_SCAN_RADIUS
 
 if (useHome) {
   bot.chat(DUMP_HOME_COMMAND)
@@ -2701,11 +2779,11 @@ await new Promise((resolve, reject) => {
 const startPos = bot.entity.position.clone()
 const timeout = setTimeout(() => {
 bot.removeListener('move', onMove)
-reject(new Error('Teleport timed out'))
-}, 45000)
+reject(new Error(`Teleport timed out after ${DUMP_TPA_TIMEOUT_MS}ms`))
+}, DUMP_TPA_TIMEOUT_MS)
 
 function onMove() {
-if (bot.entity.position.distanceTo(startPos) > 10) {
+if (bot.entity.position.distanceTo(startPos) > DUMP_TPA_MIN_DISTANCE) {
 clearTimeout(timeout)
 bot.removeListener('move', onMove)
 resolve()
@@ -2714,7 +2792,7 @@ resolve()
 bot.on('move', onMove)
 })
 logFor(id, `{cyan-fg}› Teleport detected! Looking for chests...{/cyan-fg}`)
-await new Promise(r => setTimeout(r, 2500))
+await new Promise(r => setTimeout(r, DUMP_SETTLE_MS))
 } catch (err) {
 logFor(id, `{yellow-fg}⚠ ${err.message}. Looking for chests nearby anyway...{/yellow-fg}`)
 }
@@ -2732,7 +2810,7 @@ bot.registry.blocksByName.trapped_chest.id
 const chestBlocks = bot.findBlocks({
 matching: chestIds,
 maxDistance: scanRadius,
-count: 50
+count: CHEST_SCAN_COUNT
 })
 
 if (chestBlocks.length === 0) {
@@ -2742,7 +2820,13 @@ chestBlocks.sort((a, b) => {
 return bot.entity.position.distanceTo(a) - bot.entity.position.distanceTo(b)
 })
 
+let chestsOpened = 0
+let stacksMoved = 0
 for (const chestPos of chestBlocks) {
+if (bots[id]?.dumpCancelRequested) {
+  logFor(id, `{yellow-fg}⚠ ${label}: cancelled — stopping before the next chest.{/yellow-fg}`)
+  break
+}
 const itemsToDump = spawnersOnly
   ? bot.inventory.items().filter(isSpawnerItem)
   : bot.inventory.items()
@@ -2752,10 +2836,24 @@ if (itemsToDump.length === 0) {
 }
 
 const chestBlock = bot.blockAt(chestPos)
+if (!chestBlock) {
+  logFor(id, `{yellow-fg}⚠ ${label}: the chest at ${chestPos.x}, ${chestPos.y}, ${chestPos.z} is not loaded — skipping it.{/yellow-fg}`)
+  continue
+}
 let chestContainer
+let chestMoved = 0
+let openTimer = null
 
 try {
-chestContainer = await bot.openContainer(chestBlock)
+// mineflayer can wait forever when a chest is unreachable, which used to leave
+// the whole dump silently stuck; give up on this chest after DUMP_OPEN_TIMEOUT_MS
+// and clear the timer as soon as the chest actually opens.
+chestContainer = await Promise.race([
+  bot.openContainer(chestBlock),
+  new Promise((_, reject) => { openTimer = setTimeout(() => reject(new Error(`opening the chest timed out after ${DUMP_OPEN_TIMEOUT_MS}ms`)), DUMP_OPEN_TIMEOUT_MS) })
+])
+if (openTimer) { clearTimeout(openTimer); openTimer = null }
+chestsOpened++
 
 // Slots in chestContainer:
 // [0, chestContainer.inventoryStart - 1] are chest slots.
@@ -2773,8 +2871,9 @@ for (let s = invStart; s < invEnd; s++) {
     // Shift-click the item from bot inventory into the chest.
     // Mode 1, button 0 = shift-click in Minecraft protocol.
     await bot.clickWindow(s, 0, 1)
-    await new Promise(r => setTimeout(r, 120))
-  } catch (_) {
+    await new Promise(r => setTimeout(r, DUMP_CLICK_DELAY_MS))
+  } catch (err) {
+    logFor(id, `{yellow-fg}⚠ ${label}: shift-click failed on slot ${s}: ${sanitize(err && err.message ? err.message : err)}{/yellow-fg}`)
     break
   }
 
@@ -2788,10 +2887,17 @@ for (let s = invStart; s < invEnd; s++) {
     // Only partially deposited — chest is full!
     break
   }
+  chestMoved++
 }
+
+stacksMoved += chestMoved
+if (chestMoved) logFor(id, `{cyan-fg}› ${label}: deposited ${chestMoved} stack(s) into the chest at ${chestPos.x}, ${chestPos.y}, ${chestPos.z}.{/cyan-fg}`)
 
 await chestContainer.close()
 } catch (err) {
+if (openTimer) { clearTimeout(openTimer); openTimer = null }
+logFor(id, `{yellow-fg}⚠ ${label}: could not use the chest at ${chestPos.x}, ${chestPos.y}, ${chestPos.z}: ${sanitize(err && err.message ? err.message : err)}{/yellow-fg}`)
+
 if (chestContainer) {
 try { await chestContainer.close() } catch (_) {}
 }
@@ -2802,13 +2908,13 @@ const remaining = spawnersOnly
   ? bot.inventory.items().filter(isSpawnerItem)
   : bot.inventory.items()
 if (remaining.length === 0) {
-  logFor(id, `{green-fg}✓ ${label}: all ${spawnersOnly ? 'spawners' : 'items'} successfully dumped into chests.{/green-fg}`)
+  logFor(id, `{green-fg}✓ ${label}: all ${spawnersOnly ? 'spawners' : 'items'} successfully dumped into chests (${stacksMoved} stack(s) across ${chestsOpened} usable chest(s)).{/green-fg}`)
 } else {
-  logFor(id, `{yellow-fg}⚠ ${label}: nearby chests are full — ${remaining.length} stack(s) remaining in inventory.{/yellow-fg}`)
+  logFor(id, `{yellow-fg}⚠ ${label}: ${remaining.length} stack(s) still in the inventory — ${chestsOpened} usable chest(s) took ${stacksMoved} stack(s).{/yellow-fg}`)
 }
 }
 
-await new Promise(r => setTimeout(r, 2500))
+await new Promise(r => setTimeout(r, DUMP_WARP_DELAY_MS))
 if (!bot.entity || bots[id]?.dumpCancelRequested) return
 if (!skipWarp) {
   logFor(id, `{cyan-fg}› Warping back to AFK…{/cyan-fg}`)
@@ -2937,7 +3043,8 @@ if (alt) logFor(id, `    ↳ ${sanitize(alt)}`)
 return true
 }
 case '/dump': {
-const mode = (parts[1] || '').toLowerCase()
+const { mode, unknown: unknownMode } = parseDumpMode(parts[1])
+if (unknownMode) logFor(id, `{yellow-fg}⚠ Unknown /dump option "${sanitize(unknownMode)}" — running the default TPA dump instead. Options: home, hidden, cancel.{/yellow-fg}`)
 if (mode === 'cancel') { cancelHiddenDump(); cancelDumpForBot(id); return true }
 if (mode === 'hidden') return startHiddenDump()
 if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
@@ -3746,13 +3853,103 @@ async function compileAndPushData (log = () => {}, onlyIds = null) {
   persistData()
   const snapshot = dataStore.buildSnapshot(dataState)
   try {
-    const result = await dataStore.pushWebhook(DATA_WEBHOOK_URL, snapshot)
-    log(result.pushed ? `Data snapshot pushed to Google Sheets webhook (${snapshot.bots.length} bot(s), ${snapshot.spawners.length} spawner(s)).` : `Data snapshot saved locally (${DATA_FILE}); no webhook configured.`)
+    const result = await dataStore.pushWebhook(DATA_WEBHOOK_URL, snapshot, globalThis.fetch, {
+      secret: DATA_WEBHOOK_SECRET,
+      timeoutMs: DATA_WEBHOOK_TIMEOUT_MS
+    })
+    const written = result.response && result.response.written
+    const writtenText = written ? ` — rows written: ${Object.keys(written).map(key => `${key} ${written[key]}`).join(', ')}` : ''
+    log(result.pushed
+      ? `Data snapshot pushed to Google Sheets webhook (${snapshot.bots.length} bot(s), ${snapshot.spawners.length} spawner(s)${writtenText}).`
+      : `Data snapshot saved locally (${DATA_FILE}); no webhook configured.`)
     return snapshot
   } catch (err) {
     log(`Data snapshot saved locally, but Google Sheets push failed: ${err.message}`)
     return snapshot
   }
+}
+
+// Shows what /data will do without touching the network — the fastest way to
+// confirm which webhook, secret, timeout, and local file are actually in use.
+function logDataStatus (log = () => {}) {
+  log('{bold}── /data status ──{/bold}')
+  log(`webhook: ${DATA_WEBHOOK_URL || '(not set — snapshots stay local)'}`)
+  log(`secret: ${DATA_WEBHOOK_SECRET ? `set (${DATA_WEBHOOK_SECRET.length} chars)` : 'not set'} · timeout: ${DATA_WEBHOOK_TIMEOUT_MS}ms`)
+  log(`local file: ${DATA_FILE}`)
+  log(`tracked: ${Object.keys(dataState.bots).length} bot(s) and ${Object.keys(dataState.spawners).length} spawner(s) · connected now: ${Object.keys(bots).length} bot(s)`)
+  if (DATA_FILE && !fs.existsSync(DATA_FILE)) log('note: the local snapshot file does not exist yet — run /data once to create it.')
+}
+
+// Verifies the Apps Script webhook without pushing a snapshot: GETs the /exec
+// URL, which Code.gs answers with a JSON health document (doGet). This is what
+// tells apart a private deployment (HTML sign-in page served with HTTP 200), a
+// missing SPREADSHEET_ID script property, and a genuinely healthy endpoint —
+// all three used to look like a successful push against a stale spreadsheet.
+async function checkDataWebhook (log = {}) {
+  const info = typeof log.info === 'function' ? log.info : () => {}
+  const warn = typeof log.warn === 'function' ? log.warn : () => {}
+  const error = typeof log.error === 'function' ? log.error : () => {}
+  const success = typeof log.success === 'function' ? log.success : info
+
+  if (!DATA_WEBHOOK_URL) {
+    warn('DATA_WEBHOOK_URL is not set, so /data only saves locally. Paste the Apps Script /exec URL into .env as DATA_WEBHOOK_URL and restart.')
+    return false
+  }
+  if (typeof globalThis.fetch !== 'function') { error('global fetch is unavailable in this Node build.'); return false }
+  info('Checking the webhook with a GET request (this does not write to the sheet)…')
+
+  const options = { method: 'GET', redirect: 'follow' }
+  if (DATA_WEBHOOK_TIMEOUT_MS > 0 && typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') options.signal = AbortSignal.timeout(DATA_WEBHOOK_TIMEOUT_MS)
+
+  let response
+  try {
+    response = await globalThis.fetch(DATA_WEBHOOK_URL, options)
+  } catch (err) {
+    const timedOut = err && (err.name === 'TimeoutError' || err.name === 'AbortError')
+    error(timedOut
+      ? `No answer within ${DATA_WEBHOOK_TIMEOUT_MS}ms — check DATA_WEBHOOK_URL and that the deployment is live (raise DATA_WEBHOOK_TIMEOUT_MS if Google is slow).`
+      : `Could not reach the webhook: ${sanitize(err && err.message ? err.message : String(err))}`)
+    return false
+  }
+
+  let text = ''
+  try { text = await response.text() } catch (_) {}
+  const body = String(text || '').trim()
+
+  if (body.startsWith('<')) {
+    error(`Got an HTML page (HTTP ${response.status}) instead of JSON — this deployment is NOT public, so bot.js can never write to the sheet. Fix it in Apps Script: Deploy → Manage deployments → pencil icon → Execute as: Me, Who has access: Anyone → Version: New version → Deploy.`)
+    return false
+  }
+  let health = null
+  try { health = JSON.parse(body) } catch (_) {
+    error(`The webhook answered with non-JSON content (HTTP ${response.status}): ${sanitize(body.slice(0, 200)) || '(empty body)'}`)
+    return false
+  }
+  if (!health || health.service !== 'openmontage-data') {
+    warn(`Reached the URL (HTTP ${response.status}) but the response is not the OpenMontage doGet health document (service: ${health && health.service ? health.service : 'unset'}). Paste the updated google-apps-script/Code.gs, then Deploy → Manage deployments → Version: New version.`)
+    return false
+  }
+
+  info(`HTTP ${response.status} · spreadsheet: ${health.spreadsheetId || '(unset)'} · version: ${health.version || '?'}`)
+  info(`sheets: ${(health.sheets || []).join(', ') || '(none yet)'} · secret required: ${health.secretRequired ? 'yes' : 'no'} · history tab: ${health.historySheet || 'off'}`)
+
+  let ok = true
+  if (!health.ok) {
+    error(health.spreadsheetError
+      ? `Spreadsheet problem: ${sanitize(health.spreadsheetError)}`
+      : 'The endpoint reports ok:false — run setSpreadsheetId with the spreadsheet id once in the Apps Script editor (or fill SPREADSHEET_ID_OVERRIDE), then redeploy a new version.')
+    ok = false
+  }
+  if (health.secretRequired && !DATA_WEBHOOK_SECRET) {
+    warn('The webhook requires a secret but DATA_WEBHOOK_SECRET is empty in .env — every push will be rejected. Add the value you passed to setWebhookSecret in Apps Script.')
+    ok = false
+  }
+  if (!health.secretRequired && DATA_WEBHOOK_SECRET) {
+    warn('DATA_WEBHOOK_SECRET is set but the webhook does not require one — run setWebhookSecret in Apps Script with the same value to enforce it.')
+    ok = false
+  }
+  if (ok) success('Webhook looks healthy: the deployment is public, Code.gs is current, and the spreadsheet opened successfully.')
+  return ok
 }
 
 // ── Command router (real tail + context routing prologue for the web GUI) ────
@@ -3766,6 +3963,12 @@ function executeCommandChain(chain, ctx, overrides = {}) {
 function handleCommand(raw, ctx) {
   const trimmed = String(raw ?? '').trim()
   if (!trimmed) return
+
+  // /cron add keeps everything after the schedule as the job command, so `&&`
+  // and `;` inside it must reach the cron handler intact instead of being split
+  // into a command chain here (cron commands support chaining, e.g. `@Bot /data
+  // && sleep 5s && /dump`).
+  if (/^\/cron\s+add(?:\s|$)/i.test(trimmed)) return handleSingleCommand(trimmed, ctx)
 
   const chain = parseCommandChain(trimmed)
   if (chain.length === 0) return
@@ -3879,40 +4082,43 @@ if (trimmed === '/cron' || trimmed.startsWith('/cron ')) {
       const last = job.lastRun ? job.lastRun.toLocaleString() : 'never'
       log(` [{bold}${job.id}{/bold}] ${state} — ${job.schedule} — ${job.command} (runs: ${job.runs}, last: ${last}, next: ${next})`)
     })
-    logInfo('Usage: /cron add <schedule> <command> · /cron rm <id> · /cron on|off <id> · /cron run <id>')
+    logInfo(`Usage: /cron add <schedule> <command> · /cron rm <id> · /cron on|off <id> · /cron run <id> — jobs ${CRON_STATE_FILE ? 'are saved to ' + CRON_STATE_FILE : 'live in memory only (CRON_PERSIST=false)'}`)
     return
   }
   if (sub === 'add') {
-    const rest = trimmed.slice(trimmed.indexOf('add') + 3).trim()
-    let schedule
-    let command
-    const restTrim = rest
-    if (restTrim.startsWith('"')) {
-      const close = restTrim.indexOf('"', 1)
-      if (close > 0) {
-        schedule = restTrim.slice(1, close).trim()
-        command = restTrim.slice(close + 1).trim()
-      }
-    }
-    if (!schedule) {
-      const tokens = restTrim.split(/\s+/)
-      if (tokens[0] && /^@every$/i.test(tokens[0])) {
-        schedule = tokens.slice(0, 2).join(' ')
-        command = tokens.slice(2).join(' ')
-      } else {
-        schedule = tokens.slice(0, 5).join(' ')
-        command = tokens.slice(5).join(' ')
-      }
-    }
-    if (!schedule || !command) { logWarn('Usage: /cron add <schedule> <command> — schedule = 5-field cron ("0 4 * * *") or "@every <seconds>"; command = anything /all would run'); return }
+    // The schedule is a quoted token or the next 5 fields (@every is two);
+    // everything after it is the job command. A bot target may sit on either
+    // side of the schedule:
+    //   /cron add @BotA @every 300 /spawners
+    //   /cron add @every 300 @BotA /spawners
+    const rest = trimmed.replace(/^\/cron\s+add\b/i, '')
+    let parsed
     try {
-      const job = cronManager.add(schedule, command)
+      parsed = parseCronAddArgs(rest)
+    } catch (err) {
+      logWarn(`Usage: /cron add <schedule> <command> — schedule = 5-field cron ("0 4 * * *") or "@every <seconds>"; command = anything /all would run, optionally prefixed with @BotName{,BotName} to target specific bots. (${err.message})`)
+      return
+    }
+    try {
+      const job = cronManager.add(parsed.schedule, parsed.command)
       logSuccess(`Cron job ${job.id} added: "${job.schedule}" → ${job.command} (next run ${job.nextRun ? job.nextRun.toLocaleString() : '—'})`)
+      if (!CRON_ENABLED) logWarn(`CRON_ENABLED is off — job ${job.id} is stored but will not fire until cron is turned back on; /cron run ${job.id} fires it once right now.`)
+      // Report unknown targets at add time instead of only when the job skips.
+      const targets = parseBotTargetCommand(parsed.command)
+      if (targets.botIds) {
+        const { unknown, roster } = resolveCronTargets(targets.botIds)
+        if (unknown.length) {
+          logWarn(`Cron job ${job.id} targets ${describeUnknownTargets(unknown, roster)}, which ${unknown.length === 1 ? 'is not a bot' : 'are not bots'} in this roster. Known bots: ${roster.join(', ') || 'none'}`)
+        } else {
+          logInfo(`Cron job ${job.id} will run on: ${targets.botIds.join(', ')}`)
+        }
+      }
     } catch (err) {
       logError(`Could not add cron job: ${err.message}`)
     }
     return
   }
+
   if (sub === 'rm' || sub === 'remove') {
     const id = parts[1]
     if (!id) { logWarn('Usage: /cron rm <id>'); return }
@@ -3996,12 +4202,27 @@ logSuccess(`${isLocal ? 'Ran locally on' : 'Broadcasted to'} ${sent} bots.`)
 return
 }
 
-// ── /overview ───────────────────────────────
-if (trimmed === '/data') {
+// ── /data [check|status] ─────────────────────
+if (trimmed === '/data' || trimmed.startsWith('/data ')) {
+  const dataArgs = parseDataArgs(trimmed.slice('/data'.length))
+  if (dataArgs.unknown) {
+    logWarn(`Unknown /data option ${sanitize(dataArgs.unknown)} — pushing a snapshot instead. Options: /data check (verify the webhook), /data status (show webhook config + tracked counts)`)
+  }
+  if (dataArgs.action === 'check') {
+    checkDataWebhook({ info: message => logInfo(message), warn: message => logWarn(message), error: message => logError(message), success: message => logSuccess(message) })
+      .catch(err => logError(`Webhook check failed: ${sanitize(err.message)}`))
+    return
+  }
+  if (dataArgs.action === 'status') {
+    logDataStatus(message => logInfo(message))
+    return
+  }
   logInfo('Compiling saved bot, spawner, production, location, and lifetime data…')
   compileAndPushData(message => logInfo(message)).catch(err => logError(`Data compilation failed: ${sanitize(err.message)}`))
   return
 }
+
+// ── /overview ───────────────────────────────
 
 if (trimmed === '/overview') {
 const names = Object.keys(bots)

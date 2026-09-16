@@ -86,7 +86,26 @@ randomized multi-bot TPA chain and spreads its actions across a random 8–12
 minute run, with at least three minutes between TPA actions. Because that
 minimum gap limits how many actions fit in 8–12 minutes, extra bots in a
 larger roster are logged as skipped for that run. `/dump cancel` cancels
-pending dump timers; disconnecting a bot cancels its own pending work.
+pending dump timers; disconnecting a bot cancels its own pending work. An
+unrecognized option (`/dump hiden`) is reported and then runs the default TPA
+dump instead of silently doing something you did not ask for.
+
+Every step of a run is logged: chests opened, stacks deposited per chest, chests
+that could not be opened (with the reason), and stacks left behind, so a dump
+that finds nothing or gets stuck is diagnosable from the log alone. A chest that
+would not open is abandoned after `DUMP_OPEN_TIMEOUT_MS` instead of stalling the
+rest of the run.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `DUMP_TPA_TIMEOUT_MS` | `45000` | How long to wait for the TPA/home teleport |
+| `DUMP_TPA_MIN_DISTANCE` | `10` | Blocks of movement that count as "the teleport happened" |
+| `DUMP_SETTLE_MS` | `2500` | Pause after the teleport before scanning for chests |
+| `DUMP_WARP_DELAY_MS` | `2500` | Pause after dumping before warping back to AFK |
+| `DUMP_CLICK_DELAY_MS` | `120` | Pause between shift-clicks while depositing |
+| `DUMP_OPEN_TIMEOUT_MS` | `15000` | Give up on a chest that will not open |
+| `CHEST_SCAN_RADIUS` | `30` | Chest search radius around the bot |
+| `CHEST_SCAN_COUNT` | `50` | Maximum chests considered per dump |
 
 ### Persistent spawner data and `/data`
 
@@ -101,11 +120,42 @@ not create a rate. `/data` queries current bot balances, coins, shards, and
 rank, compiles the saved spawner history into one latest snapshot, and saves it
 locally. It also POSTs the snapshot to `DATA_WEBHOOK_URL` when configured.
 
-To publish to Google Sheets without OAuth, deploy a Google Apps Script web app
-with a `doPost(e)` handler that parses `e.postData.contents`, replaces the
-latest snapshot tab, and optionally appends the spawner rows to a history tab.
-Set the resulting `/exec` URL as `DATA_WEBHOOK_URL`. Keep the URL private; the
-Apps Script endpoint should validate a shared secret if the sheet is exposed.
+### Publishing to Google Sheets
+
+`google-apps-script/Code.gs` is the ready-to-deploy endpoint for `/data`. Paste
+it into an Apps Script project, run `setSpreadsheetId('<id>')` once in the
+editor, then deploy it as a web app with **Execute as: me** and **Who has
+access: Anyone**, and set the resulting `/exec` URL as `DATA_WEBHOOK_URL`.
+
+- `doPost` replaces the `Bots`, `Spawners`, and `Lifetime` tabs on every push.
+  The header row is the union of every row's keys, so rows that differ (a
+  baseline row with no rate yet, a bot with no rank yet) can no longer throw
+  mid-write and leave the sheet stale, and an empty `lifetime` object no longer
+  aborts the run. It answers with JSON — `{ ok, written: { Bots, Spawners,
+  Lifetime }, errors: [ ... ] }` — and the bot logs the row counts it reported,
+  so a push is verifiable from the dashboard log.
+- Opening the `/exec` URL in a browser (`doGet`) returns a health JSON with the
+  spreadsheet id, tab names, and whether a secret is required. Seeing a Google
+  sign-in page instead of JSON means the deployment is not public: that is the
+  classic cause of "the bot says it pushed but the spreadsheet never updates".
+  The bot now fails loudly when a webhook answers with HTML instead of JSON.
+- `setWebhookSecret('<value>')` in the editor plus `DATA_WEBHOOK_SECRET=<value>`
+  in `.env` enables the shared-secret check. Apps Script web apps cannot read
+  request headers, so the secret is sent as `?secret=...` and in the JSON body.
+- `setHistorySheet('<name>')` turns on the append-only history tab; each `/data`
+  push appends the current spawner rows with an `appendedAt` stamp. It stays off
+  until that script property exists.
+- `testWrite()` runs a sample snapshot through the real write path from the
+  editor — the fastest way to check sheet permissions and headers.
+- `DATA_WEBHOOK_TIMEOUT_MS` (default 15000) bounds each request.
+- `/data check` performs that same public-deployment check from the bot: it
+  GETs `DATA_WEBHOOK_URL`, prints the health JSON (spreadsheet id, tabs, whether
+  a secret is required), and explains exactly which Apps Script step is missing
+  when it sees an HTML sign-in page, a non-JSON body, or `ok:false`.
+  `/data status` prints the active webhook URL, secret length, timeout, local
+  snapshot file, and how many bots/spawners are tracked — none of it touches the
+  network.
+
 The existing `/cron` command can run `/spawners` on a schedule; run `/data`
 afterward when you want to publish the current snapshot.
 
@@ -352,7 +402,12 @@ Bots not listed in any `PROXY_GROUP_<N>_BOTS` fall back to the global `PROXY_HOS
 | `WEB_TERMINAL_ENABLED` | `false` | Allow the browser terminal |
 | `WEB_TERMINAL_LOG` | `true` | Include web server trace messages |
 | `WS_BROADCAST_INTERVAL_MS` | `100` | WebSocket log batching interval |
-| `LOG_MAX_LINES` | `1500` | Stored lines per bot/system channel (dashboard renders the last 400; lower = less memory) |
+| `DASHBOARD_TITLE` | `AFK Console` | Browser tab title for the dashboard and sign-in page |
+| `WEB_REFRESH_MS` | `2000` | HTTP fallback poll cadence for dashboards without a WebSocket |
+| `LOG_MAX_LINES` | `1500` | Stored lines per bot/system channel (dashboard sends the last `LOG_VIEW_LINES`; lower = less memory) |
+| `LOG_VIEW_LINES` | `400` | Lines per channel sent to the dashboard on connect/refresh |
+| `LOG_PRUNE_MINUTES` | `20` | Drop log lines older than this; `0` keeps the whole session |
+| `LOG_PRUNE_INTERVAL_MS` | `60000` | How often expired log lines are swept |
 | `WINDOW_DEBUG` | `false` | Include complete inventory slot dumps |
 | `CONFIG_PACKET_LOG_LIMIT` | `120` | Configuration packet log limit; `0` means unlimited |
 
@@ -527,10 +582,13 @@ The schedule is either a standard 5-field cron expression
 Sunday) or `@every <seconds>` (minimum 5). Fields support `*`, `*/n`, `a-b`,
 `a-b/n`, and comma-separated lists.
 
-Jobs are also managed from the terminal with `/cron` (list), `/cron add
-<schedule> <command>`, `/cron rm <id>`, `/cron on|off <id>`, and `/cron run
-<id>` (run fires immediately, even for a disabled job). Terminal-added jobs
-last until the process exits; `.env` jobs reload on restart.
+Jobs are also managed from the terminal or the dashboard with `/cron` (list),
+`/cron add <schedule> <command>`, `/cron rm <id>`, `/cron on|off <id>`, and
+`/cron run <id>` (run fires immediately, even for a disabled job). Jobs added at
+runtime are written to `CRON_STATE_FILE` and reloaded on the next start, so
+`/cron add` survives a restart; `.env` jobs load first and win over a saved
+copy of the same `schedule|command`. Set `CRON_PERSIST=false` to keep runtime
+jobs in memory only.
 
 The schedule may be quoted (`/cron add "0 4 * * *" /crates-all`) or bare
 (`/cron add 0 4 * * * /crates-all`, `/cron add @every 60 /status`); the rest
@@ -540,8 +598,21 @@ day-of-month and day-of-week are restricted, cron fires when either matches
 arrives is skipped (no overlapping runs), and dispatcher errors are logged to
 the system channel.
 
+`/cron add` treats everything after the schedule as the job command, so chained
+commands work exactly like they do in `CRON_JOB_<N>`:
+
+```text
+/cron add @every 3600 @Hypr_7_core /spawners && sleep 10s && /data
+```
+
 To target specific bots, prefix the command with `@BotName` or a comma-separated
-list. The `@every` token still controls timing; `@BotName` controls delivery:
+list. The target may sit on either side of the schedule:
+
+```text
+/cron add @every 3000 @Hypr_7_core /spawners
+/cron add @Hypr_7_core @every 3000 /spawners
+/cron add 0 4 * * * @BotA,BotB /data
+```
 
 ```dotenv
 CRON_JOB_3=@every 3000|@Hypr_7_core /spawners
@@ -549,8 +620,26 @@ CRON_JOB_4=@every 3000|@BotA,BotB /data
 ```
 
 Without a target prefix, local commands retain their existing all-bots behavior.
-Unknown target names cause that job to be skipped and logged instead of being
-sent to the wrong bot.
+Target names are matched case-insensitively, so `@hypr_7_core` finds
+`Hypr_7_core`. Unknown target names cause that job to be skipped and logged
+(with the current roster) instead of being sent to the wrong bot, and `/cron add`
+warns about them immediately after adding the job.
+
+`CRON_ENABLED=false` stops the scheduler without deleting jobs: they stay listed,
+and `/cron run <id>` still fires one by hand. `CRON_TICK_MS` (default 1000)
+sets how often due jobs are checked.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CRON_ENABLED` | `true` | Set to `false` to stop firing jobs (they stay listed and runnable by hand) |
+| `CRON_TICK_MS` | `1000` | How often due jobs are checked |
+| `CRON_PERSIST` | `true` | Set to `false` to keep runtime jobs in memory only |
+| `CRON_STATE_FILE` | `cron-jobs.json` | Where `/cron add` jobs are saved and reloaded from |
+| `CRON_JOB_<N>` | unset | `"<schedule>|<command>"` job loaded at startup; takes precedence over a saved duplicate |
+
+`cron-jobs.json` holds only the job configuration (schedule, command, enabled),
+is written atomically, and is safe to delete — it is recreated on the next
+`/cron add`. Startup order is `.env` jobs first, then the state file.
 
 ## Commands
 
@@ -566,7 +655,8 @@ Any unrecognized input is sent as a Minecraft chat message or command.
 | `/overview` | Query shards, coins, and balance for every bot |
 | `/inv` | List the active bot's inventory |
 | `/find <name>` | Search every bot's inventory and open window for an item by display, custom, or registry name |
-| `/cron` | List scheduled jobs; `/cron add <schedule> <cmd>`, `/cron rm <id>`, `/cron on|off <id>`, `/cron run <id>` |
+| `/cron` | List scheduled jobs; `/cron add <schedule> <cmd>`, `/cron rm <id>`, `/cron on|off <id>`, `/cron run <id>`. Jobs persist to `CRON_STATE_FILE` across restarts |
+| `/data [check|status]` | Compile and push the spawner snapshot; `check` verifies the Apps Script deployment, `status` shows the webhook config without touching the network |
 | `/players` | List players visible to the active bot |
 | `/uptime` | Show uptime for every bot |
 | `/proxy` | Show proxy and stall-watchdog configuration |
@@ -809,6 +899,7 @@ RTP log for webhook errors. Node.js 18+ is required for the built-in `fetch`.
 | `docker-entrypoint.sh` | Container startup entrypoint |
 | `run-docker.sh` | Local Docker run helper |
 | `patches/` | Mineflayer compatibility patches |
+| `google-apps-script/Code.gs` | Apps Script webhook behind `DATA_WEBHOOK_URL` (`/data` → Google Sheets) |
 | `api.md` | Mineflayer API reference used by the project |
 
 ## License

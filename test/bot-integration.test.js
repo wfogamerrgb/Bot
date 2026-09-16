@@ -21,8 +21,11 @@ function runtime(env = {}) {
   wss.handleUpgrade = (_req, socket, _head, cb) => cb(socket)
   const setTimer = (fn, delay) => { const t = { fn, delay, unref() {} }; timers.set(t, t); return t }
   const clearTimer = t => timers.delete(t)
+  // Its own cron state file per runtime: `/cron add` now persists jobs, and a
+  // shared path would leak jobs between tests (and write into the repo).
+  const cronStateFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'bot-cron-')), 'cron-jobs.json')
   const processMock = {
-    env: { BOT_NAMES: 'A,B,C', WEB_GUI: 'true', TUI_GUI: 'false', WEB_PASSWORD: 'test-only', WEB_TERMINAL_LOG: 'false', ...env },
+    env: { BOT_NAMES: 'A,B,C', WEB_GUI: 'true', TUI_GUI: 'false', WEB_PASSWORD: 'test-only', WEB_TERMINAL_LOG: 'false', CRON_STATE_FILE: cronStateFile, ...env },
     stdout: { isTTY: false, write() {} }, stderr: { write() {} },
     on() {}, exit() {}, memoryUsage: () => ({ rss: 0, heapUsed: 0 }), uptime: () => 1
   }
