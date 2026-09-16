@@ -498,6 +498,10 @@ broadcasts as chat to every spawned bot. Define them in `.env` as
 ```dotenv
 CRON_JOB_1=0 4 * * *|/crates-all
 CRON_JOB_2=@every 60|/status
+# Target one bot; @every remains the schedule.
+CRON_JOB_3=@every 3000|@Hypr_7_core /spawners
+# Target multiple bots with comma-separated names.
+CRON_JOB_4=@every 3000|@BotA,BotB /data
 ```
 
 The schedule is either a standard 5-field cron expression
@@ -517,6 +521,18 @@ day-of-month and day-of-week are restricted, cron fires when either matches
 (standard OR semantics). A job that is still running when its next trigger
 arrives is skipped (no overlapping runs), and dispatcher errors are logged to
 the system channel.
+
+To target specific bots, prefix the command with `@BotName` or a comma-separated
+list. The `@every` token still controls timing; `@BotName` controls delivery:
+
+```dotenv
+CRON_JOB_3=@every 3000|@Hypr_7_core /spawners
+CRON_JOB_4=@every 3000|@BotA,BotB /data
+```
+
+Without a target prefix, local commands retain their existing all-bots behavior.
+Unknown target names cause that job to be skipped and logged instead of being
+sent to the wrong bot.
 
 ## Commands
 

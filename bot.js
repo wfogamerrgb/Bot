@@ -479,7 +479,7 @@ return typeof pv.mineflayer === 'function' ? pv.mineflayer : (typeof pv === 'fun
 const manual = createManualControls({ bots, logFor, sanitize, notifyBotsChanged, SYSTEM_ID, WEB_BIND, loadViewerFactory })
 
 // ── Commands known to run locally on a bot rather than sent as raw in-game chat ─
-const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dump-spawners', '/dc', '/reconnect', '/crates', '/crates-loop', '/spawners', '/shardshop-loop', '/closeBot']
+const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dump-spawners', '/dc', '/reconnect', '/crates', '/crates-loop', '/spawners', '/data', '/shardshop-loop', '/closeBot']
 
 const logSubscribers = new Set()
 function subscribeLog(fn) { logSubscribers.add(fn); return () => logSubscribers.delete(fn) }
@@ -508,7 +508,7 @@ function logWarn(msg) { log(`{yellow-fg}⚠ ${msg}{/yellow-fg}`) }
 // loads them at startup. Schedules are 5-field cron ("0 4 * * *") or
 // "@every <seconds>" (min 5). Jobs dispatch with /all semantics: known local
 // commands run per bot, everything else is broadcast as chat to spawned bots.
-const { CronManager } = require('./cron')
+const { CronManager, parseBotTargetCommand } = require('./cron')
 // Per-bot dispatch with /all semantics: manual commands route through their own
 // router, known local commands run through handleCommand (arguments preserved),
 // everything else is sent as chat to that bot. Returns true when dispatched.
@@ -536,9 +536,24 @@ function dispatchCommandToAllBots (msg) {
 }
 const cronManager = new CronManager({
   dispatch: (command) => {
-    const trimmed = String(command || '').trim()
+    const parsed = parseBotTargetCommand(command)
+    const trimmed = parsed.command
+    const targetIds = parsed.botIds
+    if (targetIds) {
+      const unknown = targetIds.filter(id => !bots[id])
+      if (unknown.length) {
+        logFor(SYSTEM_ID, `{red-fg}✗ Cron target bot(s) not found: ${unknown.join(', ')} — job skipped.{/red-fg}`)
+        return 0
+      }
+      if (trimmed.startsWith('/data')) return compileAndPushData(() => {}, targetIds)
+      let sent = 0
+      for (const id of targetIds) {
+        try { if (dispatchCommandToBot(trimmed, id)) sent++ } catch (_) {}
+      }
+      return sent
+    }
     // Global commands should run through the main command router rather than per-bot
-    if (trimmed.startsWith('/crates-all') || trimmed.startsWith('/all') || trimmed.startsWith('/overview')) {
+    if (trimmed.startsWith('/crates-all') || trimmed.startsWith('/all') || trimmed.startsWith('/overview') || trimmed === '/data') {
       return handleCommand(trimmed)
     }
     return dispatchCommandToAllBots(trimmed)
@@ -3543,8 +3558,8 @@ function inventorySlotUsage (bot) {
   return { used, total: INVENTORY_STORAGE_SLOTS, free: INVENTORY_STORAGE_SLOTS - used }
 }
 
-async function compileAndPushData (log = () => {}) {
-  const names = Object.keys(bots)
+async function compileAndPushData (log = () => {}, onlyIds = null) {
+  const names = onlyIds ? onlyIds.filter(id => Object.hasOwn(bots, id)) : Object.keys(bots)
   for (const name of names) {
     const entry = bots[name]
     if (!entry?.bot?.entity) continue

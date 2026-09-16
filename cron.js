@@ -232,4 +232,15 @@ class CronManager {
   }
 }
 
-module.exports = { CronManager, parseSchedule, matches, nextCronRun }
+// A cron command may optionally target one or more bot names:
+//   @Hypr_7_core /spawners
+//   @BotA,BotB /spawners
+// Without this prefix, callers retain the existing all-bots behavior.
+function parseBotTargetCommand (command) {
+  const text = String(command || '').trim()
+  const match = text.match(/^@([A-Za-z0-9_-]+(?:,[A-Za-z0-9_-]+)*)\s+([\s\S]+)$/)
+  if (!match) return { botIds: null, command: text }
+  return { botIds: match[1].split(','), command: match[2].trim() }
+}
+
+module.exports = { CronManager, parseSchedule, matches, nextCronRun, parseBotTargetCommand }
