@@ -7,3 +7,4 @@ node_modules
 bannana
 node_modules/
 .env*
+data/*.json
