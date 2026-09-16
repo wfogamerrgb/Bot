@@ -1,7 +1,7 @@
 'use strict'
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const { CronManager, parseSchedule, matches, nextCronRun } = require('../cron')
+const { CronManager, parseSchedule, matches, nextCronRun, parseBotTargetCommand } = require('../cron')
 
 test('parseSchedule accepts 5-field cron and @every', () => {
   assert.equal(parseSchedule('0 4 * * *').type, 'cron')
@@ -201,4 +201,16 @@ test('CronManager and parseSchedule strip single and double quotes cleanly', () 
   assert.equal(m.list()[1].command, '/status')
   assert.equal(m.list()[2].schedule, '0 */2 * * *')
   assert.equal(m.list()[2].command, '/dump-spawners')
+})
+
+test('parseBotTargetCommand extracts one or multiple bot targets', () => {
+  assert.deepEqual(parseBotTargetCommand('@Hypr_7_core /spawners'), {
+    botIds: ['Hypr_7_core'], command: '/spawners'
+  })
+  assert.deepEqual(parseBotTargetCommand('@BotA,BotB /data'), {
+    botIds: ['BotA', 'BotB'], command: '/data'
+  })
+  assert.deepEqual(parseBotTargetCommand('/spawners'), {
+    botIds: null, command: '/spawners'
+  })
 })
