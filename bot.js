@@ -20,6 +20,7 @@ const crypto = require('crypto')
 const zlib = require('zlib')
 const { exec } = require('child_process')
 const { createTerminal, sshConfig } = require('./expose-terminal')
+const dataStore = require(path.join(__dirname, 'data-store'))
 const mineflayer = require('mineflayer')
 const armorManager = require('mineflayer-armor-manager')
 const { pathfinder, Movements, goals: { GoalNear } } = require('mineflayer-pathfinder')
@@ -41,6 +42,22 @@ const GUI_SLOT = parseInt(process.env.GUI_SLOT || '11', 10)
 const WARP_AFK = process.env.WARP_COMMAND || '/warp afk'
 const WARP_BEFORE_CRATE = (process.env.WARP_BEFORE_CRATE ?? process.env.WARPORNOT ?? 'true').toLowerCase() !== 'false'
 const SERVER_COMMAND = (process.env.SERVER_COMMAND ?? '').trim()
+
+// ── Persistent /data recorder ───────────────────────────────────────────────
+// JSON is the durable local source of truth. /data compiles it into one current
+// snapshot and optionally POSTs that snapshot to a Google Apps Script webhook.
+const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data', 'spawner-data.json')
+const DATA_WEBHOOK_URL = (process.env.DATA_WEBHOOK_URL || '').trim()
+const DATA_WEBHOOK_TIMEOUT_MS = parseInt(process.env.DATA_WEBHOOK_TIMEOUT_MS || '15000', 10)
+const dataState = dataStore.loadState(DATA_FILE)
+function persistData () {
+  dataState.updatedAt = new Date().toISOString()
+  dataStore.saveState(DATA_FILE, dataState)
+}
+function botLocation (bot) {
+  const p = bot?.entity?.position
+  return { x: p?.x ?? null, y: p?.y ?? null, z: p?.z ?? null, dimension: bot?.game?.dimension || null }
+}
 
 // ── Chat activity watchdog ───────────────────────────────────────────────────
 // If no player chat has been seen for CHAT_WATCHDOG_TIMEOUT_MS, the bot runs
@@ -2451,6 +2468,7 @@ const COMMANDS = {
 '/crates-all [n] [color]': `Run shardshop → crates → dump on bots 1 through n (default: all bots) targeting crate [color] (default: ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')}), ${(CRATES_ALL_STAGGER_MS / 1000).toFixed(0)}s apart so they don't hit the server at once`,
 '/crates-solo [bot] [color]': 'Run shardshop → crates → dump on just one bot (default: active bot) targeting crate [color] — not all bots',
 '/spawners': `Without moving, right-click every ${SPAWNER_BLOCK.replace(/_/g, ' ')} already within reach (${SPAWNER_REACH} blocks), clicking GUI slot ${SPAWNER_SLOT_FIRST} then slot ${SPAWNER_SLOT_SECOND} on each one`,
+'/data': 'Compile all saved bot/spawner data, save the local JSON snapshot, and push the current snapshot to the Google Sheets Apps Script webhook',
 '/list': 'Compact one-line-per-bot status list (online / offline / last kick)',
 '/chat <msg>': 'Send a chat message from the active bot (avoids triggering local commands); /-prefixed server commands open their GUI without auto-clicking',
 '/disconnect': 'Disconnect the active bot (stops auto-reconnect). Alias: /dc',
@@ -3065,10 +3083,11 @@ bot.on('windowOpen', onOpen)
 
 // Right-click one spawner, then click slot 13 → wait → slot 53 in its GUI.
 async function clickSpawnerOnce (bot, id, position) {
+const balanceBefore = await queryBalance(id, 'Balance', '/bal')
 const block = bot.blockAt(position)
 if (!block || block.name !== SPAWNER_BLOCK) {
 logFor(id, `{yellow-fg}⚠ Block at ${position.x}, ${position.y}, ${position.z} is no longer a ${SPAWNER_BLOCK.replace(/_/g, ' ')} — skipping.{/yellow-fg}`)
-return false
+return { ok: false, balanceBefore, balanceAfter: null }
 }
 
 try {
@@ -3076,13 +3095,13 @@ await bot.lookAt(block.position.offset(0.5, 0.5, 0.5), true)
 await bot.activateBlock(block)
 } catch (err) {
 logFor(id, `{red-fg}✗ Right-click failed at ${position.x}, ${position.y}, ${position.z}: ${sanitize(err.message || String(err))}{/red-fg}`)
-return false
+return { ok: false, balanceBefore, balanceAfter: null }
 }
 
 const window = await waitForWindowOpen(bot)
 if (!window) {
 logFor(id, `{yellow-fg}⚠ No GUI opened for the spawner at ${position.x}, ${position.y}, ${position.z} — skipping.{/yellow-fg}`)
-return false
+return { ok: false, balanceBefore, balanceAfter: null }
 }
 
 const clickSlot = async (slot) => {
@@ -3104,13 +3123,14 @@ return false
 let ok = await clickSlot(SPAWNER_SLOT_FIRST)
 if (ok) {
 await new Promise(r => setTimeout(r, SPAWNER_SLOT_DELAY_MS))
-if (!bot.entity) return false
+if (!bot.entity) return { ok: false, balanceBefore, balanceAfter: null }
 ok = await clickSlot(SPAWNER_SLOT_SECOND)
 }
 
 // Always leave the GUI closed so the next spawner opens a fresh window.
 if (bot.currentWindow) { try { bot.closeWindow(bot.currentWindow) } catch (_) {} }
-return ok
+const balanceAfter = ok ? await queryBalance(id, 'Balance', '/bal') : null
+return { ok, balanceBefore, balanceAfter }
 }
 
 async function runSpawnerRoutine (id) {
@@ -3156,16 +3176,48 @@ positions.sort((a, b) => bot.entity.position.distanceTo(a) - bot.entity.position
 logFor(id, `{cyan-fg}› Found ${positions.length} spawner(s) in reach — clicking slot ${SPAWNER_SLOT_FIRST} then ${SPAWNER_SLOT_SECOND} on each…{/cyan-fg}`)
 
 let done = 0
+const runStartedAt = Date.now()
 for (let idx = 0; idx < positions.length; idx++) {
 if (!bot.entity) { logFor(id, `{red-fg}✗ ${id} despawned during /spawners — stopping.{/red-fg}`); break }
 const pos = positions[idx]
 logFor(id, `{cyan-fg}› Spawner ${idx + 1}/${positions.length} at ${pos.x}, ${pos.y}, ${pos.z}…{/cyan-fg}`)
-const ok = await clickSpawnerOnce(bot, id, pos)
-if (ok) done++
+const result = await clickSpawnerOnce(bot, id, pos)
+if (result.ok) done++
+const spawnerNumber = idx + 1
+const key = `${id}:${spawnerNumber}`
+const previous = dataState.spawners[key]
+const balance = Number.isFinite(result.balanceAfter) ? result.balanceAfter : null
+const production = dataStore.calculateProduction(previous, balance, Date.now())
+dataStore.upsertSpawner(dataState, {
+  bot: id,
+  spawnerNumber,
+  location: { x: pos.x, y: pos.y, z: pos.z, dimension: bot.game?.dimension || null },
+  botPosition: botLocation(bot),
+  lastRunAt: new Date().toISOString(),
+  recordedAt: Date.now(),
+  balanceBefore: result.balanceBefore,
+  balance,
+  earned: production.earned,
+  lifetimeEarned: (Number.isFinite(previous?.lifetimeEarned) ? previous.lifetimeEarned : 0) + (Number.isFinite(production.earned) ? production.earned : 0),
+  ratePerHour: production.ratePerHour,
+  calculationStatus: production.status,
+  successful: result.ok
+})
+persistData()
 if (idx < positions.length - 1) await new Promise(r => setTimeout(r, SPAWNER_NEXT_DELAY_MS))
 }
 
 logFor(id, `{green-fg}✓ /spawners finished — ${done}/${positions.length} spawner(s) fully clicked.{/green-fg}`)
+dataStore.upsertBot(dataState, {
+  bot: id,
+  recordedAt: Date.now(),
+  balance: await queryBalance(id, 'Balance', '/bal'),
+  botPosition: botLocation(bot),
+  spawnerCount: positions.length,
+  successfulSpawners: done,
+  runStartedAt
+})
+persistData()
 return done > 0
 } catch (err) {
 logFor(id, `{red-fg}✗ /spawners failed: ${sanitize(err.message || String(err))}{/red-fg}`)
@@ -3491,6 +3543,38 @@ function inventorySlotUsage (bot) {
   return { used, total: INVENTORY_STORAGE_SLOTS, free: INVENTORY_STORAGE_SLOTS - used }
 }
 
+async function compileAndPushData (log = () => {}) {
+  const names = Object.keys(bots)
+  for (const name of names) {
+    const entry = bots[name]
+    if (!entry?.bot?.entity) continue
+    const [shards, coins, money, rank] = await Promise.all([
+      queryBalance(name, 'Shards', '/shards'),
+      queryBalance(name, 'Coins', '/coins'),
+      queryBalance(name, 'Balance', '/bal'),
+      queryRank(name)
+    ])
+    dataStore.upsertBot(dataState, {
+      bot: name,
+      recordedAt: Date.now(),
+      rank: rank || 'N/A',
+      shards, coins, balance: money,
+      botPosition: botLocation(entry.bot),
+      spawnerCount: Object.values(dataState.spawners).filter(row => row.bot === name).length
+    })
+  }
+  persistData()
+  const snapshot = dataStore.buildSnapshot(dataState)
+  try {
+    const result = await dataStore.pushWebhook(DATA_WEBHOOK_URL, snapshot)
+    log(result.pushed ? `Data snapshot pushed to Google Sheets webhook (${snapshot.bots.length} bot(s), ${snapshot.spawners.length} spawner(s)).` : `Data snapshot saved locally (${DATA_FILE}); no webhook configured.`)
+    return snapshot
+  } catch (err) {
+    log(`Data snapshot saved locally, but Google Sheets push failed: ${err.message}`)
+    return snapshot
+  }
+}
+
 // ── Command router (real tail + context routing prologue for the web GUI) ────
 function executeCommandChain(chain, ctx, overrides = {}) {
   return executeCommandChainBase(chain, ctx, {
@@ -3733,6 +3817,12 @@ return
 }
 
 // ── /overview ───────────────────────────────
+if (trimmed === '/data') {
+  logInfo('Compiling saved bot, spawner, production, location, and lifetime data…')
+  compileAndPushData(message => logInfo(message)).catch(err => logError(`Data compilation failed: ${sanitize(err.message)}`))
+  return
+}
+
 if (trimmed === '/overview') {
 const names = Object.keys(bots)
 logInfo('{bold}── Bot Overview Dashboard ──{/bold}')

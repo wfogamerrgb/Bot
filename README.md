@@ -70,6 +70,27 @@ BOT_NAMES=BotOne,BotTwo
 
 Never commit `.env`, passwords, proxy credentials, or Discord webhook URLs.
 
+### Persistent spawner data and `/data`
+
+Every successful `/spawners` run records one current row per bot/spawner number
+in `DATA_FILE` (default `data/spawner-data.json`). Each row retains the spawner
+number, spawner coordinates, bot position and dimension, balances immediately
+before and after the click sequence, raw money earned, and the calculated
+money-per-hour rate. The first observation is a baseline, so its rate is
+`null`; a later successful run calculates the rate from elapsed time since the
+previous observation. A missing `/bal` response is recorded as `N/A` and does
+not create a rate. `/data` queries current bot balances, coins, shards, and
+rank, compiles the saved spawner history into one latest snapshot, and saves it
+locally. It also POSTs the snapshot to `DATA_WEBHOOK_URL` when configured.
+
+To publish to Google Sheets without OAuth, deploy a Google Apps Script web app
+with a `doPost(e)` handler that parses `e.postData.contents`, replaces the
+latest snapshot tab, and optionally appends the spawner rows to a history tab.
+Set the resulting `/exec` URL as `DATA_WEBHOOK_URL`. Keep the URL private; the
+Apps Script endpoint should validate a shared secret if the sheet is exposed.
+The existing `/cron` command can run `/spawners` on a schedule; run `/data`
+afterward when you want to publish the current snapshot.
+
 ## Start
 
 ```bash
