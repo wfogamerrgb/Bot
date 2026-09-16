@@ -12,6 +12,14 @@ const {
 } = require('./bot-controls')
 const os = require('os')
 const { createMonitoring } = require('./monitoring')
+const {
+  createSpawnerDataStore,
+  buildSpawnerSnapshot,
+  pushSpawnerSnapshot,
+  formatMoney,
+  formatInterval,
+  round2
+} = require('./spawner-data')
 const net = require('net')
 const fs = require('fs')
 const path = require('path')
@@ -144,6 +152,23 @@ const SPAWNER_SLOT_SECOND = parseInt(process.env.SPAWNER_SLOT_SECOND || '53', 10
 const SPAWNER_WINDOW_WAIT_MS = parseInt(process.env.SPAWNER_WINDOW_WAIT_MS || '3000', 10)
 const SPAWNER_SLOT_DELAY_MS = parseInt(process.env.SPAWNER_SLOT_DELAY_MS || '1500', 10)
 const SPAWNER_NEXT_DELAY_MS = parseInt(process.env.SPAWNER_NEXT_DELAY_MS || '1500', 10)
+
+// ── /spawners production data + /data ───────────────────────────────────────
+// Every /spawners run is recorded locally (SQLite via node:sqlite, JSON file
+// fallback) as: the balance before/after the run, the time since that bot's
+// previous run, one row per spawner click (index, coordinates, $ delta), and
+// the bot's position. Production rate is $/hour = $ earned / (time since the
+// last /spawners run) — N/A on the first run, which only records the baseline.
+// /data compiles everything (plus live coins/rank/balance) and pushes one
+// current row per bot/spawner to a Google Sheets Apps Script webhook.
+const SPAWNER_DATA_ENABLED = !/^(0|false|no|off)$/i.test((process.env.SPAWNER_DATA_ENABLED ?? 'true').trim())
+const SPAWNER_DATA_DIR = process.env.SPAWNER_DATA_DIR || '' // '' → ./data next to bot.js
+const SPAWNER_DATA_BAL_PER_SPAWNER = !/^(0|false|no|off)$/i.test((process.env.SPAWNER_DATA_BAL_PER_SPAWNER ?? 'true').trim())
+const SPAWNER_DATA_BAL_DELAY_MS = parseInt(process.env.SPAWNER_DATA_BAL_DELAY_MS || '1200', 10)
+const SPAWNER_DATA_BAL_TIMEOUT_MS = parseInt(process.env.SPAWNER_DATA_BAL_TIMEOUT_MS || '2500', 10)
+const SPAWNER_DATA_SHEET_URL = (process.env.SPAWNER_DATA_SHEET_URL || '').trim()
+const SPAWNER_DATA_SHEET_TOKEN = (process.env.SPAWNER_DATA_SHEET_TOKEN || '').trim()
+const SPAWNER_DATA_PUSH_TIMEOUT_MS = parseInt(process.env.SPAWNER_DATA_PUSH_TIMEOUT_MS || '20000', 10)
 
 // ── Crate color customization ──────────────────────────────────────────────
 const SHULKER_COLORS = [
@@ -486,6 +511,23 @@ function logInfo(msg) { log(`{cyan-fg}› ${msg}{/cyan-fg}`) }
 let monitoring
 function logWarn(msg) { log(`{yellow-fg}⚠ ${msg}{/yellow-fg}`) }
 
+// ── Spawner production data store ───────────────────────────────────────────
+// Lazily initialized: nothing touches the disk until a /spawners run is recorded
+// or /data compiles a snapshot. `sanitize`/logFor are only called at runtime.
+const spawnerData = createSpawnerDataStore({
+  dir: SPAWNER_DATA_DIR || undefined,
+  kind: process.env.SPAWNER_DATA_STORE || undefined,
+  log: (msg) => { try { logFor(SYSTEM_ID, `{gray-fg}[data] ${sanitize(msg)}{/gray-fg}`) } catch (_) {} }
+})
+
+// Runs a store call without ever letting a data problem break a routine.
+function safeData (fn, fallback = null) {
+  try { return fn() } catch (err) {
+    try { logFor(SYSTEM_ID, `{red-fg}✗ [data] ${sanitize((err && err.message) || String(err))}{/red-fg}`) } catch (_) {}
+    return fallback
+  }
+}
+
 // ── Scheduled jobs (cron) ────────────────────────────────────────────────────
 // /cron manages jobs at runtime; CRON_JOB_<N>="<schedule>|<command>" in .env
 // loads them at startup. Schedules are 5-field cron ("0 4 * * *") or
@@ -521,7 +563,7 @@ const cronManager = new CronManager({
   dispatch: (command) => {
     const trimmed = String(command || '').trim()
     // Global commands should run through the main command router rather than per-bot
-    if (trimmed.startsWith('/crates-all') || trimmed.startsWith('/all') || trimmed.startsWith('/overview')) {
+    if (trimmed.startsWith('/crates-all') || trimmed.startsWith('/all') || trimmed.startsWith('/overview') || trimmed.startsWith('/data')) {
       return handleCommand(trimmed)
     }
     return dispatchCommandToAllBots(trimmed)
@@ -2444,6 +2486,7 @@ const COMMANDS = {
 '/all-slow <cmd>': `Like /all, but starts each bot ${ALL_SLOW_DELAY_MS / 1000}s apart (ALL_SLOW_DELAY_MS)`,
 '/all-slow-cancel [id]': 'Cancel a specific running /all-slow broadcast task by ID (e.g. /all-slow-cancel 1), or all tasks if no ID is specified',
 '/overview': 'Dashboard of every bot\'s health, food, ping, rank (via /fix + /rank), shards, coins, balance, and inventory slots',
+'/data': 'Compile every recorded /spawners run (coins, rank, balance, $ per spawner, $/hour, locations) and push the snapshot to Google Sheets; /data local writes only the local snapshot',
 '/stats': 'Runtime stats: memory, event-loop lag, log rate, web viewers, uptime',
 '/crates [color]': `Warp to crates, find + walk to the nearest shulker box of [color] (default: ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')}, within ${CRATE_SCAN_RADIUS} blocks) and right-click it; falls back to ${WARP_AFK} if not found or unreachable. [color] can be a name like "purple" or a full block id like "purple_shulker_box"`,
 '/crates-loop [n] [color]': 'Run /crates repeatedly (default: until failure). Specify n for a fixed count and/or a crate [color]',
@@ -3131,6 +3174,16 @@ entry.spawnerRoutineRunning = true
 entry.inSpawnerRoutine = true
 const { bot } = entry
 
+// Production-data tracking for this run. Everything below is best-effort: a
+// missing /bal reply or a broken store never fails the spawner routine itself.
+const trackData = SPAWNER_DATA_ENABLED
+const runStartedAt = Date.now()
+const previousFinishedAt = trackData ? safeData(() => spawnerData.finishedAtFor(id), null) : null
+const spawnerRecords = []
+let balanceStart = null
+let runningBalance = null
+let lastMeasuredBalance = null
+
 try {
 if (bot.currentWindow) { try { bot.closeWindow(bot.currentWindow) } catch (_) {} }
 
@@ -3155,6 +3208,15 @@ return false
 positions.sort((a, b) => bot.entity.position.distanceTo(a) - bot.entity.position.distanceTo(b))
 logFor(id, `{cyan-fg}› Found ${positions.length} spawner(s) in reach — clicking slot ${SPAWNER_SLOT_FIRST} then ${SPAWNER_SLOT_SECOND} on each…{/cyan-fg}`)
 
+// Baseline /bal so the money this run produces can be attributed. The FIRST
+// recorded run only stores this baseline — the rate needs a previous run to
+// measure against, so it stays N/A until the next /spawners run.
+if (trackData) {
+balanceStart = await queryBalance(id, 'Balance', '/bal', SPAWNER_DATA_BAL_TIMEOUT_MS)
+runningBalance = balanceStart
+logFor(id, `{gray-fg}[data] Baseline balance: ${formatMoney(balanceStart)}${previousFinishedAt ? '' : ' — first recorded run, rate starts next run'}{/gray-fg}`)
+}
+
 let done = 0
 for (let idx = 0; idx < positions.length; idx++) {
 if (!bot.entity) { logFor(id, `{red-fg}✗ ${id} despawned during /spawners — stopping.{/red-fg}`); break }
@@ -3162,10 +3224,64 @@ const pos = positions[idx]
 logFor(id, `{cyan-fg}› Spawner ${idx + 1}/${positions.length} at ${pos.x}, ${pos.y}, ${pos.z}…{/cyan-fg}`)
 const ok = await clickSpawnerOnce(bot, id, pos)
 if (ok) done++
+if (trackData && ok) {
+// /bal right after this spawner, so its own production can be attributed.
+// SPAWNER_DATA_BAL_DELAY_MS spaces the command out to reduce the risk of
+// tripping the server's command cooldown.
+let balanceAfter = null
+if (SPAWNER_DATA_BAL_PER_SPAWNER && bot.entity) {
+if (SPAWNER_DATA_BAL_DELAY_MS > 0) await new Promise(r => setTimeout(r, SPAWNER_DATA_BAL_DELAY_MS))
+balanceAfter = await queryBalance(id, 'Balance', '/bal', SPAWNER_DATA_BAL_TIMEOUT_MS)
+}
+const earned = (balanceAfter !== null && runningBalance !== null) ? round2(balanceAfter - runningBalance) : null
+const label = `Spawner ${spawnerRecords.length + 1}`
+spawnerRecords.push({
+index: spawnerRecords.length + 1,
+label,
+x: pos.x, y: pos.y, z: pos.z,
+block: SPAWNER_BLOCK,
+balanceBefore: runningBalance,
+balanceAfter,
+earned,
+status: balanceAfter === null ? 'balance N/A' : 'ok'
+})
+if (balanceAfter !== null) { lastMeasuredBalance = balanceAfter; runningBalance = balanceAfter }
+logFor(id, `{gray-fg}[data] ${label} @ ${pos.x}, ${pos.y}, ${pos.z} — ${earned === null ? '$ N/A' : formatMoney(earned)}${balanceAfter === null ? '' : ` (balance ${formatMoney(balanceAfter)})`}{/gray-fg}`)
+}
 if (idx < positions.length - 1) await new Promise(r => setTimeout(r, SPAWNER_NEXT_DELAY_MS))
 }
 
 logFor(id, `{green-fg}✓ /spawners finished — ${done}/${positions.length} spawner(s) fully clicked.{/green-fg}`)
+
+// Persist this run: the time since the previous /spawners run, the $ earned,
+// the $/hour rate, one row per spawner click, and both the bot position and
+// each spawner's coordinates.
+if (trackData && spawnerRecords.length) {
+const finishedAt = Date.now()
+const intervalMs = previousFinishedAt ? finishedAt - previousFinishedAt : null
+let balanceEnd = lastMeasuredBalance
+if (balanceEnd === null && !SPAWNER_DATA_BAL_PER_SPAWNER && bot.entity) {
+balanceEnd = await queryBalance(id, 'Balance', '/bal', SPAWNER_DATA_BAL_TIMEOUT_MS)
+}
+const earned = (balanceEnd !== null && balanceStart !== null) ? round2(balanceEnd - balanceStart) : null
+const botPos = bot.entity && bot.entity.position
+? { x: bot.entity.position.x, y: bot.entity.position.y, z: bot.entity.position.z, dimension: bot.game?.dimension || null }
+: null
+const record = safeData(() => spawnerData.insertRun({
+bot: id, startedAt: runStartedAt, finishedAt, intervalMs,
+balanceStart, balanceEnd, earned,
+botPosition: botPos, spawners: spawnerRecords
+}), null)
+if (record) {
+const rate = record.earnedPerHour === null
+? ' · rate N/A until the next run'
+: ` · ${formatMoney(record.earnedPerHour)}/hour over ${formatInterval(record.intervalMs)}`
+logFor(id, `{green-fg}[data] Run recorded{/green-fg} {gray-fg}— ${formatMoney(record.earned)} this run${rate} · ${record.spawnerCount} spawner row(s) → ${spawnerData.dir}{/gray-fg}`)
+} else {
+logFor(id, `{yellow-fg}⚠ [data] Run could not be stored (see the system log).{/yellow-fg}`)
+}
+}
+
 return done > 0
 } catch (err) {
 logFor(id, `{red-fg}✗ /spawners failed: ${sanitize(err.message || String(err))}{/red-fg}`)
@@ -3473,6 +3589,84 @@ async function queryRank (id) {
   return bot.entity ? 'Regent' : null
 }
 
+// ── /data: compile every recorded /spawners run ─────────────────────────────
+// Queries live coins/shards/balance/rank for every bot, merges them with the
+// stored production history (one current row per bot/spawner), prints the
+// summary plus lifetime totals, saves a local JSON backup, then pushes the
+// snapshot to the Google Sheets Apps Script webhook (SPAWNER_DATA_SHEET_URL).
+async function collectLiveStats () {
+const names = Object.keys(bots)
+return Promise.all(names.map(async (name) => {
+const entry = bots[name]
+const online = Boolean(entry?.bot?.entity)
+const stat = { bot: name, online, rank: 'N/A', coins: null, shards: null, balance: null, botPosition: null }
+if (!online) return stat
+try {
+const pos = entry.bot.entity.position
+stat.botPosition = { x: pos.x, y: pos.y, z: pos.z, dimension: entry.bot.game?.dimension || null }
+const [shards, coins, balance] = await Promise.all([
+queryBalance(name, 'Shards', '/shards'),
+queryBalance(name, 'Coins', '/coins'),
+queryBalance(name, 'Balance', '/bal', SPAWNER_DATA_BAL_TIMEOUT_MS)
+])
+stat.shards = shards
+stat.coins = coins
+stat.balance = balance
+stat.rank = (await queryRank(name)) || 'N/A'
+} catch (err) {
+logFor(SYSTEM_ID, `{yellow-fg}⚠ [data] ${name}: ${sanitize(err.message || String(err))}{/yellow-fg}`)
+}
+return stat
+}))
+}
+
+function describeRate (earned, earnedPerHour, intervalMs) {
+const money = formatMoney(earned)
+if (earnedPerHour === null) return `${money} (rate N/A)`
+return `${money} (${formatMoney(earnedPerHour)}/hour over ${formatInterval(intervalMs)})`
+}
+
+async function runDataCommand (raw) {
+const arg = String(raw || '').replace(/^\/data\b/i, '').trim().toLowerCase()
+const localOnly = arg === 'local' || arg === '--local'
+logInfo('{bold}── Spawner Production Data ──{/bold}')
+logInfo(`Store: ${spawnerData.dir} · ${safeData(() => spawnerData.backendKind(), 'unknown')} · ${SPAWNER_DATA_SHEET_URL ? 'sheet push enabled' : 'no sheet URL configured'}`)
+logInfo('Querying shards, coins, balance, and rank for every bot…')
+
+const liveStats = await collectLiveStats()
+const runs = safeData(() => spawnerData.latestRunPerBot(), [])
+const totals = safeData(() => spawnerData.totals(), { overall: { bots: 0, runs: 0, spawners: 0, earned: 0 }, byBot: {} })
+const payload = buildSpawnerSnapshot({ runs, liveStats, totals })
+
+payload.bots.forEach((b, idx) => {
+const last = b.lastRunAt ? new Date(b.lastRunAt).toLocaleString() : 'never'
+log(`[${idx + 1}] {cyan-fg}${b.bot}{/cyan-fg} : ${b.online ? '{green-fg}Online{/green-fg}' : '{gray-fg}Offline{/gray-fg}'} | Rank: ${b.rank} | Coins: ${b.coins === null ? 'N/A' : b.coins.toLocaleString()} | Shards: ${b.shards === null ? 'N/A' : b.shards.toLocaleString()} | Balance: ${formatMoney(b.balance)}`)
+log(`    Last run: ${last} | This run: ${describeRate(b.lastEarned, b.lastEarnedPerHour, b.lastIntervalMs)} | Lifetime: ${formatMoney(b.lifetimeEarned)} over ${b.lifetimeRuns ?? 0} run(s)`)
+if (b.botX !== null && b.botX !== undefined) log(`    Bot position: ${b.botX}, ${b.botY}, ${b.botZ}${b.dimension ? ` (${b.dimension})` : ''}`)
+for (const s of payload.spawners.filter(s => s.bot === b.bot)) {
+log(`    ${s.spawner} @ ${s.x}, ${s.y}, ${s.z} — ${describeRate(s.earned, s.earnedPerHour, b.lastIntervalMs)}${s.status === 'ok' ? '' : ` [${s.status}]`}`)
+}
+})
+
+logInfo(`{bold}Lifetime totals:{/bold} ${totals.overall.bots} bot(s) · ${totals.overall.runs} run(s) · ${totals.overall.spawners} spawner click(s) · ${formatMoney(totals.overall.earned)} earned`)
+
+const saved = safeData(() => spawnerData.writeSnapshotFile(payload), null)
+if (saved) logInfo(`Local snapshot saved: ${saved.path} (${saved.backend})`)
+
+if (localOnly) { logInfo('Local-only mode — Google Sheets push skipped.'); return }
+if (!SPAWNER_DATA_SHEET_URL) {
+logWarn('No SPAWNER_DATA_SHEET_URL configured — set it in .env to push to Google Sheets (the local snapshot above was still written).')
+return
+}
+logInfo(`Pushing snapshot to Google Sheets (${payload.spawners.length} spawner row(s), ${payload.bots.length} bot row(s))…`)
+const res = await pushSpawnerSnapshot(SPAWNER_DATA_SHEET_URL, payload, {
+token: SPAWNER_DATA_SHEET_TOKEN,
+timeoutMs: SPAWNER_DATA_PUSH_TIMEOUT_MS
+})
+if (res.ok) logSuccess(`Google Sheets snapshot replaced (HTTP ${res.status}).`)
+else logError(`Google Sheets push failed: ${res.error}`)
+}
+
 // -- Inventory slot usage ---------------------------------------------------
 // Player storage = 27 main inventory slots (9-35) + 9 hotbar slots (36-44)
 // = 36 slots. Armor (5-8), offhand (45), the crafting grid (1-4) and the
@@ -3769,6 +3963,13 @@ log(`[${idx + 1}] {cyan-fg}${name}{/cyan-fg} : {gray-fg}Offline / Connecting…{
 })
 }).catch(err => logError(`Overview failed: ${sanitize(err.message)}`))
 return
+}
+
+// ── /data ───────────────────────────────────────────────────────────────────
+// Global (fleet-wide) like /overview: compiles every recorded /spawners run
+// with live coins/rank/balance and pushes the snapshot to Google Sheets.
+if (trimmed === '/data' || /^\/data\s+/i.test(trimmed)) {
+return runDataCommand(trimmed).catch(err => logError(`/data failed: ${sanitize(err.message || String(err))}`))
 }
 
 // ── /list ───────────────────────────────────

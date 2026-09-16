@@ -49,6 +49,9 @@ function runtime(env = {}) {
       if (name === 'mineflayer-pathfinder') return { goals: {} }
       if (name === 'socks') return {}
       if (name === './cron') return require('../cron')
+      // Required through this mock's fall-through `require(name)`, which would
+      // resolve './spawner-data' against the test dir instead of the bot's.
+      if (name === './spawner-data') return require('../spawner-data')
       if (name === './web-client') return require('../web-client')
       return require(name)
     }
@@ -536,4 +539,47 @@ test('handleCommand routes chained commands with &&, ;, sleep, and escaping', as
     ['A', 'step2'],
     ['A', 'step3']
   ])
+})
+
+test('/data compiles the recorded spawner production and writes a local snapshot', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bot-data-'))
+  const r = runtime({ SPAWNER_DATA_DIR: dir, RANK_COOLDOWN_MS: '0' })
+  r.timers.clear()
+
+  // Every bot offline: /data must not query the game server (no /bal, /coins,
+  // /shards or rank probe) and must still compile what the store already holds.
+  r.run(`
+    for (const id of ['A', 'B', 'C']) bots[id].bot.entity = null
+    spawnerData.insertRun({
+      bot: 'B', startedAt: 1000, finishedAt: 1000 + 3600000, intervalMs: 3600000,
+      balanceStart: 10, balanceEnd: 22.5, earned: 12.5,
+      botPosition: { x: 5, y: 64, z: 5, dimension: 'overworld' },
+      spawners: [
+        { index: 1, label: 'Spawner 1', x: 5, y: 64, z: 6, balanceBefore: 10, balanceAfter: 16, earned: 6 },
+        { index: 2, label: 'Spawner 2', x: 7, y: 64, z: 6, balanceBefore: 16, balanceAfter: 22.5, earned: 6.5 }
+      ]
+    })
+  `)
+
+  await r.run(`handleCommand('/data local')`)
+
+  // Routed as a local command — never broadcast to the game server as chat.
+  assert.deepEqual(plain(r.context.chats), [])
+
+  const snapshot = JSON.parse(fs.readFileSync(path.join(dir, 'latest-snapshot.json'), 'utf8'))
+  assert.equal(snapshot.mode, 'replace', 'the sheet snapshot replaces one current row per bot/spawner')
+  assert.equal(snapshot.totals.earned, 12.5)
+  assert.deepEqual(snapshot.spawners.map(s => `${s.bot}:${s.spawner}`), ['B:Spawner 1', 'B:Spawner 2'])
+  assert.equal(snapshot.spawners[0].earned, 6)
+  assert.equal(snapshot.spawners[0].earnedPerHour, 6, 'per-spawner rate uses the run interval')
+  assert.equal(snapshot.spawners[0].botX, 5, 'the bot position is recorded alongside the spawner coords')
+  assert.equal(snapshot.bots.find(b => b.bot === 'B').lastEarnedPerHour, 12.5)
+  assert.deepEqual(snapshot.bots.map(b => b.bot), ['A', 'B', 'C'], 'offline bots still get a row')
+
+  const out = plain(r.run(`bots.A.logs.map(l => l.text).join("\\n")`))
+  assert.match(out, /Spawner Production Data/)
+  assert.match(out, /Spawner 1 @ 5, 64, 6/)
+  assert.match(out, /Lifetime totals/)
+  assert.match(out, /Local snapshot saved/)
+  assert.match(out, /Local-only mode — Google Sheets push skipped/)
 })

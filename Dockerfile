@@ -70,6 +70,7 @@ RUN npm install --omit=dev --no-audit --no-fund
 COPY expose-terminal.js ./expose-terminal.js
 COPY bot-controls.js ./bot-controls.js
 COPY monitoring.js ./monitoring.js
+COPY spawner-data.js ./spawner-data.js
 COPY bot-manual.js ./bot-manual.js
 COPY cron.js ./cron.js
 COPY web-client.js ./web-client.js
