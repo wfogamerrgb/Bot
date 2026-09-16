@@ -70,6 +70,24 @@ BOT_NAMES=BotOne,BotTwo
 
 Never commit `.env`, passwords, proxy credentials, or Discord webhook URLs.
 
+### TPA and dump automation
+
+Set `TPA_MAIN_PLAYER` to the configured main player's exact username and
+`TPA_TRUSTED_BOTS` to the comma-separated bot names allowed to request
+teleports. `/tpauto on` and `/tpauto off` control automatic `/tpaccept` for
+the selected bot; requests from other names are logged and ignored. The
+setting defaults from `TPA_AUTO_DEFAULT` after a restart.
+
+`/dump` sends the selected bot to `TPA_MAIN_PLAYER`, deposits its inventory in
+nearby chests, and returns it to `DUMP_WARP_COMMAND` (default `/warp afk`).
+`/dump home` uses `DUMP_HOME_COMMAND` (default `/home stash`) instead.
+Both modes do nothing when the inventory is empty. `/dump hidden` creates a
+randomized multi-bot TPA chain and spreads its actions across a random 8–12
+minute run, with at least three minutes between TPA actions. Because that
+minimum gap limits how many actions fit in 8–12 minutes, extra bots in a
+larger roster are logged as skipped for that run. `/dump cancel` cancels
+pending dump timers; disconnecting a bot cancels its own pending work.
+
 ### Persistent spawner data and `/data`
 
 Every successful `/spawners` run records one current row per bot/spawner number

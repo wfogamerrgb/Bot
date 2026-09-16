@@ -482,7 +482,7 @@ test('multiple concurrent /all-slow tasks and cancellation', () => {
   assert.equal(r.run('slowBroadcast.list().length'), 0)
 })
 
-test('tpaAndDump waits 2.5s and warps back to AFK even if no chests found', async () => {
+test('tpaAndDump does nothing when the inventory is empty', async () => {
   const r = runtime({ WARP_COMMAND: '/warp afk' })
   r.timers.clear()
   r.run(`
@@ -494,23 +494,9 @@ test('tpaAndDump waits 2.5s and warps back to AFK even if no chests found', asyn
     bots.A.bot.inventory = { items: () => [] }
     dumpPromise = tpaAndDump(bots.A.bot, 'A')
   `)
-  // Fire teleport timeout timer (45s), then wait microtask, then fire warp delay timer (2.5s)
-  const advanceTimer = async () => {
-    const t = [...r.timers.keys()][0]
-    if (t) {
-      r.timers.delete(t)
-      t.fn()
-    }
-    await new Promise(resolve => setImmediate(resolve))
-  }
-  await advanceTimer()
-  await advanceTimer()
   await r.run('dumpPromise')
   assert.equal(r.run('bots.A.inDumpRoutine'), false)
-  assert.deepEqual(plain(r.context.chats), [
-    ['A', '/tpa DefaultPlayerName'],
-    ['A', '/warp afk']
-  ])
+  assert.deepEqual(plain(r.context.chats), [])
 })
 
 test('handleCommand routes chained commands with &&, ;, sleep, and escaping', async () => {

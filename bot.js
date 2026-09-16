@@ -8,7 +8,11 @@ const {
   resolveBotProxy,
   parseSleepDuration,
   parseCommandChain,
-  executeCommandChain: executeCommandChainBase
+  executeCommandChain: executeCommandChainBase,
+  parseNameList,
+  hasInventoryItems,
+  randomInt,
+  buildHiddenDumpPlan
 } = require('./bot-controls')
 const os = require('os')
 const { createMonitoring } = require('./monitoring')
@@ -42,6 +46,14 @@ const GUI_SLOT = parseInt(process.env.GUI_SLOT || '11', 10)
 const WARP_AFK = process.env.WARP_COMMAND || '/warp afk'
 const WARP_BEFORE_CRATE = (process.env.WARP_BEFORE_CRATE ?? process.env.WARPORNOT ?? 'true').toLowerCase() !== 'false'
 const SERVER_COMMAND = (process.env.SERVER_COMMAND ?? '').trim()
+const TPA_MAIN_PLAYER = (process.env.TPA_MAIN_PLAYER || process.env.TPA_TARGET_PLAYER || '').trim()
+const TPA_TRUSTED_BOTS = parseNameList(process.env.TPA_TRUSTED_BOTS || BOT_NAMES.join(','))
+const TPA_AUTO_DEFAULT = /^(1|true|yes|on)$/i.test(process.env.TPA_AUTO_DEFAULT || 'false')
+const DUMP_HOME_COMMAND = (process.env.DUMP_HOME_COMMAND || '/home stash').trim()
+const DUMP_MIN_TPA_GAP_MS = Math.max(180000, parseInt(process.env.DUMP_MIN_TPA_GAP_MS || '180000', 10))
+const DUMP_HIDDEN_MIN_MS = Math.max(60000, parseInt(process.env.DUMP_HIDDEN_MIN_MS || '480000', 10))
+const DUMP_HIDDEN_MAX_MS = Math.max(DUMP_HIDDEN_MIN_MS, parseInt(process.env.DUMP_HIDDEN_MAX_MS || '720000', 10))
+let hiddenDumpRun = null
 
 // ── Persistent /data recorder ───────────────────────────────────────────────
 // JSON is the durable local source of truth. /data compiles it into one current
@@ -1904,6 +1916,24 @@ function detectPlayerChat (text) {
   return m ? { name: m[1], message: m[2] } : null
 }
 
+function detectTpaRequester (text) {
+  const clean = String(text || '').replace(/\u00a7./g, '').replace(/[^\x20-\x7e]/g, ' ').replace(/\s+/g, ' ').trim()
+  const patterns = [
+    /^(?:teleport request from|tp request from)\s+([A-Za-z0-9_]{1,16})\b/i,
+    /^([A-Za-z0-9_]{1,16})\s+(?:has )?(?:requested|sent)\s+(?:a )?teleport/i,
+    /^([A-Za-z0-9_]{1,16}).*\b(?:wants to teleport|would like to teleport)\b/i
+  ]
+  for (const pattern of patterns) {
+    const match = clean.match(pattern)
+    if (match) return match[1]
+  }
+  return null
+}
+
+function isTrustedTpaName (name) {
+  return TPA_TRUSTED_BOTS.some(trusted => trusted.toLowerCase() === String(name || '').toLowerCase())
+}
+
 function createBotInstance(username, host = HOST, port = PORT, version = VERSION) {
 const id = username
 let connected = false
@@ -1950,7 +1980,11 @@ lastDisconnectReason: null, // stores raw error text for transfer-crash classifi
 crateRoutineRunning: false, // prevents concurrent /crates runs
 crateLoopRunning: false, // prevents concurrent /crates-loop runs
 inCrateRoutine: false, // suppresses windowOpen handler during /crates
-inDumpRoutine: false, // suppresses windowOpen handler during /dump (chests must not be auto-clicked/warped)
+  inDumpRoutine: false, // suppresses windowOpen handler during /dump (chests must not be auto-clicked/warped)
+  dumpOperationActive: false,
+  tpautoEnabled: TPA_AUTO_DEFAULT,
+  dumpTimers: [],
+  dumpCancelRequested: false,
 inSpawnerRoutine: false, // suppresses windowOpen handler during /spawners (slots 13/53 are clicked by the routine)
 shardshopLoopRunning: false, // prevents concurrent /shardshop-loop runs
 lastActivity: Date.now(), // updated on every inbound packet — used by the proxy stall watchdog
@@ -2134,6 +2168,16 @@ i('Connected to server socket. Awaiting chat auth prompts…')
 bot.on('messagestr', (message) => {
 const text = message.toLowerCase()
 monitoring?.inspectServerMessage(id, message)
+
+const requester = detectTpaRequester(message)
+if (requester && bots[id]?.tpautoEnabled) {
+  if (isTrustedTpaName(requester)) {
+    i(`TPA auto: accepting trusted request from ${requester}.`)
+    try { bot.chat('/tpaccept') } catch (err) { e(`TPA auto accept failed: ${sanitize(err.message)}`) }
+  } else {
+    w(`TPA auto: ignored request from untrusted player ${requester}.`)
+  }
+}
 
 // Grep for register prompts (e.g., "Please register using /register <password> <password>")
 if (text.includes('register') && text.includes('/register')) {
@@ -2356,6 +2400,12 @@ e(`Client error: ${sanitize(err.message || String(err))}`)
 bot.on('end', (reason) => {
 connected = false
 
+if (bots[id]?.dumpTimers?.length) {
+  bots[id].dumpTimers.splice(0).forEach(clearTimeout)
+  bots[id].dumpCancelRequested = true
+  logFor(id, `{yellow-fg}⚠ Dump routine cancelled because the bot disconnected.{/yellow-fg}`)
+}
+
 try {
 // Release held controls, close the viewer, restore automatic behavior.
 if (bots[id]?.bot === bot) manual.stopManualMode(id)
@@ -2401,6 +2451,8 @@ bots[id].spawnTime = null // stop looking "spawned" to the watchdog now that we'
 }
 clearReconnectTimer(id)
 clearAll()
+if (bots[id]?.dumpTimers?.length) bots[id].dumpTimers.splice(0).forEach(clearTimeout)
+if (bots[id]) bots[id].dumpCancelRequested = true
 try { bot.quit() } catch (_) {}
 notifyBotsChanged()
 }
@@ -2492,6 +2544,7 @@ const COMMANDS = {
 '/help': 'List all available commands',
 '/status': 'Show active bot\'s connection, position, health, ping, uptime',
 '/inv': 'List active bot\'s inventory',
+'/tpauto on|off': 'Toggle automatic /tpaccept for trusted bot names only',
 '/find <name>': 'Search EVERY bot\'s inventory and open window for an item by display, custom, or registry name',
 '/cron': 'List scheduled jobs; /cron add <schedule> <cmd> | rm <id> | on|off <id> | run <id> — schedules are 5-field cron or "@every <secs>"; env CRON_JOB_<N>="<schedule>|<command>"',
 
@@ -2530,7 +2583,7 @@ const COMMANDS = {
 '/take-gui': 'Shift-click every item out of the open GUI into the inventory',
 '/dump-gui': 'Shift-click the whole inventory into the open GUI window',
 'anything else': 'Sent directly as a chat message/command from the active bot',
-'/dump': 'dump gear to chest',
+'/dump [home|hidden|cancel]': 'Dump inventory: TPA to the configured main player, use /home stash, run the hidden chain, or cancel',
 '/dump-spawners': 'Same as /dump, but only transfers SPAWNERS into the chests (everything else stays in the inventory)'
 }
 
@@ -2598,12 +2651,26 @@ function isSpawnerItem (item) {
 */
 async function tpaAndDump(bot, id, options = {}) {
 const spawnersOnly = Boolean(options.spawnersOnly)
+const useHome = Boolean(options.home)
+const skipWarp = Boolean(options.skipWarp)
 const label = spawnersOnly ? '/dump-spawners' : '/dump'
+if (bots[id]) bots[id].dumpCancelRequested = false
+if (bots[id]?.dumpOperationActive) {
+  logFor(id, `{yellow-fg}⚠ ${label}: a dump is already running for this bot.{/yellow-fg}`)
+  return
+}
 // Suppress the generic windowOpen handler (GUI item search, slot auto-click,
 // and the delayed AFK warp) while dumping — /dump opens chests only to
 // deposit into them, and none of that automation may run on them.
 if (bots[id]) bots[id].inDumpRoutine = true
 try {
+
+if (bots[id]) bots[id].dumpOperationActive = true
+
+if (!hasInventoryItems(bot.inventory)) {
+  logFor(id, `{yellow-fg}⚠ ${label}: inventory is empty — nothing to dump.{/yellow-fg}`)
+  return
+}
 
 if (spawnersOnly) {
   const spawnerCount = bot.inventory.items().filter(isSpawnerItem).reduce((sum, it) => sum + (it.count || 1), 0)
@@ -2614,11 +2681,20 @@ if (spawnersOnly) {
   }
 }
 
-const tpaTarget = process.env.TPA_TARGET_PLAYER || 'DefaultPlayerName'
+const tpaTarget = options.target || TPA_MAIN_PLAYER
 const scanRadius = parseInt(process.env.CHEST_SCAN_RADIUS || '30', 10)
 
-bot.chat(`/tpa ${tpaTarget}`)
-logFor(id, `{cyan-fg}› Sent /tpa to ${tpaTarget}. Waiting for teleport...{/cyan-fg}`)
+if (useHome) {
+  bot.chat(DUMP_HOME_COMMAND)
+  logFor(id, `{cyan-fg}› Sent ${DUMP_HOME_COMMAND}. Waiting for teleport...{/cyan-fg}`)
+} else {
+  if (!tpaTarget) {
+    logFor(id, `{yellow-fg}⚠ ${label}: TPA_MAIN_PLAYER is not configured.{/yellow-fg}`)
+    return
+  }
+  bot.chat(`/tpa ${tpaTarget}`)
+  logFor(id, `{cyan-fg}› Sent /tpa to ${tpaTarget}. Waiting for teleport...{/cyan-fg}`)
+}
 
 try {
 await new Promise((resolve, reject) => {
@@ -2641,6 +2717,11 @@ logFor(id, `{cyan-fg}› Teleport detected! Looking for chests...{/cyan-fg}`)
 await new Promise(r => setTimeout(r, 2500))
 } catch (err) {
 logFor(id, `{yellow-fg}⚠ ${err.message}. Looking for chests nearby anyway...{/yellow-fg}`)
+}
+
+if (!bot.entity || bots[id]?.dumpCancelRequested) {
+  logFor(id, `{yellow-fg}⚠ ${label}: dump stopped because the bot disconnected or was cancelled.{/yellow-fg}`)
+  return
 }
 
 const chestIds = [
@@ -2728,12 +2809,82 @@ if (remaining.length === 0) {
 }
 
 await new Promise(r => setTimeout(r, 2500))
-logFor(id, `{cyan-fg}› Warping back to AFK…{/cyan-fg}`)
-try { bot.chat(WARP_AFK) } catch (_) {}
+if (!bot.entity || bots[id]?.dumpCancelRequested) return
+if (!skipWarp) {
+  logFor(id, `{cyan-fg}› Warping back to AFK…{/cyan-fg}`)
+  try { bot.chat(WARP_AFK) } catch (_) {}
+}
 
 } finally {
-if (bots[id]) bots[id].inDumpRoutine = false
+if (bots[id]) {
+  bots[id].inDumpRoutine = false
+  bots[id].dumpOperationActive = false
 }
+}
+}
+
+function cancelDumpForBot (id, reason = 'cancelled') {
+  const entry = bots[id]
+  if (!entry) return false
+  const hadTimers = entry.dumpTimers?.length > 0
+  if (hadTimers) entry.dumpTimers.splice(0).forEach(clearTimeout)
+  entry.dumpCancelRequested = true
+  if (entry.inDumpRoutine) logFor(id, `{yellow-fg}⚠ Dump routine ${reason}.{/yellow-fg}`)
+  return hadTimers || entry.inDumpRoutine
+}
+
+function cancelHiddenDump () {
+  if (!hiddenDumpRun) return false
+  hiddenDumpRun.cancelled = true
+  hiddenDumpRun.timers.splice(0).forEach(clearTimeout)
+  Object.keys(bots).forEach(id => cancelDumpForBot(id, 'cancelled'))
+  logFor(SYSTEM_ID, `{yellow-fg}⚠ Hidden dump cancelled.{/yellow-fg}`)
+  hiddenDumpRun = null
+  return true
+}
+
+function startHiddenDump () {
+  if (hiddenDumpRun) {
+    logFor(SYSTEM_ID, `{yellow-fg}⚠ A hidden dump is already running.{/yellow-fg}`)
+    return true
+  }
+  if (!TPA_MAIN_PLAYER) {
+    logFor(SYSTEM_ID, '{yellow-fg}⚠ Hidden dump requires TPA_MAIN_PLAYER in .env.{/yellow-fg}')
+    return true
+  }
+  const duration = randomInt(DUMP_HIDDEN_MIN_MS, DUMP_HIDDEN_MAX_MS)
+  const allBots = Object.keys(bots).filter(id => id !== TPA_MAIN_PLAYER)
+  const plan = buildHiddenDumpPlan(allBots, TPA_MAIN_PLAYER)
+  const maxActions = Math.min(plan.length, Math.max(1, Math.floor(duration / DUMP_MIN_TPA_GAP_MS) + 1))
+  const selected = plan.slice(0, maxActions)
+  hiddenDumpRun = { duration, timers: [], cancelled: false }
+  logFor(SYSTEM_ID, `{cyan-fg}› Hidden dump started: ${selected.length}/${plan.length} TPA actions over ${(duration / 60000).toFixed(1)} minutes; minimum gap ${(DUMP_MIN_TPA_GAP_MS / 60000).toFixed(1)} minutes.{/cyan-fg}`)
+  if (selected.length < plan.length) logFor(SYSTEM_ID, `{yellow-fg}⚠ Hidden dump limited by the 3-minute TPA gap; ${plan.length - selected.length} bot(s) were skipped this run.{/yellow-fg}`)
+
+  selected.forEach((step, index) => {
+    const delay = index === 0 ? 0 : index * DUMP_MIN_TPA_GAP_MS + Math.floor(Math.random() * 15000)
+    const timer = setTimeout(() => {
+      if (!hiddenDumpRun || hiddenDumpRun.cancelled) return
+      const entry = bots[step.bot]
+      if (!entry?.bot?.entity) {
+        logFor(step.bot, `{yellow-fg}⚠ Hidden dump skipped: bot is disconnected.{/yellow-fg}`)
+        return
+      }
+      entry.dumpCancelRequested = false
+      logFor(step.bot, `{cyan-fg}› Hidden dump action ${index + 1}/${selected.length}: TPA to ${step.target}.{/cyan-fg}`)
+      tpaAndDump(entry.bot, step.bot, { skipWarp: true, target: step.target }).catch(err => logFor(step.bot, `{red-fg}✗ Hidden dump failed: ${sanitize(err.message)}{/red-fg}`))
+    }, delay)
+    hiddenDumpRun.timers.push(timer)
+    const entry = bots[step.bot]
+    if (entry) entry.dumpTimers.push(timer)
+  })
+  const finishTimer = setTimeout(() => {
+    if (!hiddenDumpRun || hiddenDumpRun.cancelled) return
+    logFor(SYSTEM_ID, `{green-fg}✓ Hidden dump finished after ${(duration / 60000).toFixed(1)} minutes.{/green-fg}`)
+    hiddenDumpRun = null
+  }, duration)
+  hiddenDumpRun.timers.push(finishTimer)
+  return true
 }
 
 function runLocalCommandForBot(id, cmd) {
@@ -2745,6 +2896,16 @@ const parts = String(cmd || '').trim().split(/\s+/)
 const baseCmd = parts[0]
 
 switch (baseCmd) {
+case '/tpauto': {
+  const mode = (parts[1] || '').toLowerCase()
+  if (mode !== 'on' && mode !== 'off') {
+    logFor(id, `{yellow-fg}⚠ Usage: /tpauto on|off (currently ${entry.tpautoEnabled ? 'on' : 'off'}).{/yellow-fg}`)
+    return true
+  }
+  entry.tpautoEnabled = mode === 'on'
+  logFor(id, `{green-fg}✓ TPA auto ${entry.tpautoEnabled ? 'enabled' : 'disabled'}; trusted names only.{/green-fg}`)
+  return true
+}
 case '/status': {
 if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
 const pos = bot.entity.position
@@ -2776,7 +2937,11 @@ if (alt) logFor(id, `    ↳ ${sanitize(alt)}`)
 return true
 }
 case '/dump': {
+const mode = (parts[1] || '').toLowerCase()
+if (mode === 'cancel') { cancelHiddenDump(); cancelDumpForBot(id); return true }
+if (mode === 'hidden') return startHiddenDump()
 if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
+if (mode === 'home') return tpaAndDump(bot, id, { home: true })
 return tpaAndDump(bot, id)
 }
 case '/dump-spawners': {

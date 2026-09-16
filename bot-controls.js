@@ -16,6 +16,39 @@ function shuffledCopy(values, random = Math.random) {
   return result
 }
 
+function parseNameList(value) {
+  return Array.from(new Set(String(value || '').split(',').map(name => name.trim()).filter(Boolean)))
+}
+
+function hasInventoryItems(inventory) {
+  return Boolean(inventory && typeof inventory.items === 'function' && inventory.items().length > 0)
+}
+
+function randomInt(min, max, random = Math.random) {
+  return min + Math.floor(random() * (max - min + 1))
+}
+
+// Builds the breadth-first hidden TPA chain. The first layer has 1–3 bots;
+// subsequent layers contain up to two bots, each assigned to a prior target.
+function buildHiddenDumpPlan(botNames, mainPlayer, random = Math.random) {
+  const names = shuffledCopy(botNames.filter(Boolean), random)
+  if (!names.length) return []
+  const firstCount = Math.min(names.length, randomInt(1, 3, random))
+  const plan = []
+  const frontier = [mainPlayer]
+  let cursor = 0
+  const first = names.splice(0, firstCount)
+  first.forEach(name => plan.push({ bot: name, target: mainPlayer, layer: 0 }))
+  frontier.push(...first)
+  while (names.length) {
+    const target = frontier[cursor++ % frontier.length]
+    const batch = names.splice(0, Math.min(2, names.length))
+    batch.forEach(name => plan.push({ bot: name, target, layer: 1 + Math.floor(plan.length / 2) }))
+    frontier.push(...batch)
+  }
+  return plan
+}
+
 // One pending timer, regardless of fleet size. Starts are spaced, not completions:
 // existing local routines manage their own async lifecycles and report their errors.
 function createSlowBroadcast({ setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
@@ -293,6 +326,10 @@ function resolveBotProxy(username, groups, fallback = null) {
 module.exports = {
   readDelayMs,
   shuffledCopy,
+  parseNameList,
+  hasInventoryItems,
+  randomInt,
+  buildHiddenDumpPlan,
   createSlowBroadcast,
   createSlowBroadcastManager,
   parseProxyGroups,
