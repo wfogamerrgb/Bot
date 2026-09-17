@@ -13,6 +13,7 @@ const plain = value => JSON.parse(JSON.stringify(value))
 // connections, disk history writes, or process-wide handlers are started.
 function runtime(env = {}) {
   const timers = new Map()
+  const authAlerts = []
   let requestHandler
   const wss = new EventEmitter()
   const server = new EventEmitter()
@@ -51,14 +52,18 @@ function runtime(env = {}) {
         // harness bot.js reads processMock.env — so the group vars have to be
         // parsed from the same object bot.js sees, exactly as they would be in
         // production where there is only one process.env.
-        parseProxyGroups: (env = processMock.env) => controls.parseProxyGroups(env)
+        parseProxyGroups: (env = processMock.env) => controls.parseProxyGroups(env),
+        // Same reason: BOT_PASSWORDS is read out of bot.js's own env at startup.
+        parseBotPasswords: (env = processMock.env) => controls.parseBotPasswords(env)
       }
       if (name === './expose-terminal') return { sshConfig: () => ({ enabled: false }) }
       if (name === './monitoring') return {
         // A ban verdict that matches nothing, so the kick path stays exercised
         // without a live connection.
         classifyKick: message => ({ banned: false, permanent: false, kind: '', duration: '', durationMs: 0, expiresAt: 0, reason: String(message ?? ''), caseId: '', text: String(message ?? '') }),
-        createMonitoring: () => ({ getMemorySnapshot: () => null, onDisconnect() {}, onKick() {}, onBan() {}, onProxyStall() {}, onReconnectExhausted() {}, onFatal() {}, onSecurityLockout() {}, inspectServerMessage() {}, onRecovered() {} })
+        // Alerts are recorded rather than dropped: "alert once" is a property of
+        // the auth guard, so it has to be observable from a test.
+        createMonitoring: () => ({ getMemorySnapshot: () => null, onDisconnect() {}, onKick() {}, onBan() {}, onAuthFailure(botId, failure) { authAlerts.push({ botId, failure }) }, onProxyStall() {}, onReconnectExhausted() {}, onFatal() {}, onSecurityLockout() {}, inspectServerMessage() {}, onRecovered() {} })
       }
       // Resolved against this test file, not against bot.js, so it needs an entry.
       if (name === './removed-bots') return require('../removed-bots')
@@ -107,7 +112,7 @@ function runtime(env = {}) {
     ws.command = msg => ws.emit('message', JSON.stringify(msg))
     return ws
   }
-  return { context, run, timers, initialOrder, request, login, socket }
+  return { context, run, timers, initialOrder, request, login, socket, authAlerts }
 }
 
 test('startup randomization defaults on and false/off/0/no preserve configured order', () => {
@@ -811,6 +816,137 @@ test('/status reports which variable supplies the login password, per bot', () =
   assert.match(out, /Login password: from LOGIN_PASSWORD/)
   assert.ok(!out.includes('group-pw'))
   assert.ok(!out.includes('global-pw'))
+})
+
+// planAuthAction holds the whole login/register guard and is a plain function on
+// the module, so it can be driven directly rather than through a live mineflayer
+// connection (which the harness deliberately never creates).
+function plan(r, id, message, now) {
+  const arg = now === undefined ? '' : `, ${now}`
+  return plain(r.run(`planAuthAction(${JSON.stringify(id)}, ${JSON.stringify(message)}${arg})`))
+}
+const LOGIN_PROMPT = 'Please login using /login <password>'
+const REGISTER_PROMPT = 'Please register using /register <password> <password>'
+
+test('an auth prompt is answered with that bot\'s own password', () => {
+  const r = runtime({
+    LOGIN_PASSWORD: 'global-pw',
+    BOT_PASSWORDS: 'B:own-pw',
+    PROXY_GROUP_1_BOTS: 'A', PROXY_GROUP_1_HOST: 'h', PROXY_GROUP_1_LOGIN_PASSWORD: 'group-pw'
+  })
+  // Three sources, three answers, resolved per bot in the real module.
+  assert.deepEqual(plan(r, 'A', LOGIN_PROMPT, 1000), { command: '/login group-pw', source: 'PROXY_GROUP_1_LOGIN_PASSWORD', kind: 'login' })
+  assert.deepEqual(plan(r, 'B', LOGIN_PROMPT, 1000), { command: '/login own-pw', source: 'BOT_PASSWORDS', kind: 'login' })
+  assert.deepEqual(plan(r, 'C', LOGIN_PROMPT, 1000), { command: '/login global-pw', source: 'LOGIN_PASSWORD', kind: 'login' })
+  // /register sends it twice, the way AuthMe expects.
+  assert.deepEqual(plan(r, 'C', REGISTER_PROMPT, 1000), { command: '/register global-pw global-pw', source: 'LOGIN_PASSWORD', kind: 'register' })
+  // Ordinary server chatter is not an auth prompt.
+  assert.deepEqual(plan(r, 'C', 'Welcome to FATALMC!', 1000), {})
+})
+
+test('a rejected login stops the bot answering prompts and alerts once', () => {
+  const r = runtime({ LOGIN_PASSWORD: 'wrong-pw' })
+  assert.equal(plan(r, 'A', LOGIN_PROMPT, 1000).command, '/login wrong-pw')
+
+  const failed = plan(r, 'A', 'Wrong password!', 1100)
+  assert.equal(failed.record.kind, 'bad-password')
+  assert.equal(failed.record.until, null, 'a wrong password is sticky, not a timed wait')
+  assert.equal(failed.alert, true)
+  assert.equal(r.run('authState.get("A").failure.kind'), 'bad-password')
+
+  // From here the bot refuses to answer, so the account is never hammered.
+  const skipped = plan(r, 'A', LOGIN_PROMPT, 1200)
+  assert.equal(skipped.command, undefined)
+  assert.equal(skipped.skip.kind, 'bad-password')
+  assert.equal(skipped.skip.reason, 'Wrong password')
+
+  // A failure is not re-notified on every prompt it suppresses.
+  assert.equal(r.authAlerts.length, 0, 'the guard itself does not alert; the chat handler does')
+})
+
+test('a player typing a failure phrase, or a late one, cannot disable a bot', () => {
+  const r = runtime({ LOGIN_PASSWORD: 'pw' })
+  plan(r, 'A', LOGIN_PROMPT, 1000)
+
+  // Looks like player chat (Name: message) rather than a server reply.
+  assert.deepEqual(plan(r, 'A', 'Steve: wrong password lol', 1100), {})
+  // Outside the reply window: nobody just sent an auth command for this to answer.
+  const late = 1000 + r.run('AUTH_REPLY_WINDOW_MS') + 1
+  assert.deepEqual(plan(r, 'A', 'Wrong password!', late), {})
+  // Either way the bot is still able to log in.
+  assert.equal(plan(r, 'A', LOGIN_PROMPT, 2000).command, '/login pw')
+  assert.equal(r.run('authState.get("A").failure === undefined'), true, 'nothing was recorded')
+})
+
+test('repeated throttling is waited out, then escalates to a wrong password', () => {
+  const r = runtime({ LOGIN_PASSWORD: 'pw', AUTH_RETRY_MS: '1000', AUTH_MAX_THROTTLED_RETRIES: '2' })
+  const throttled = 'Too many failed attempts, please wait 10 seconds before trying again'
+
+  plan(r, 'A', LOGIN_PROMPT, 1000)
+  const first = plan(r, 'A', throttled, 1100)
+  assert.equal(first.record.kind, 'throttled')
+  assert.equal(first.record.until, 2100)
+  assert.equal(first.alert, true)
+
+  // While the wait is running the prompt is refused…
+  assert.equal(plan(r, 'A', LOGIN_PROMPT, 1200).skip.kind, 'throttled')
+  // …and once it expires the bot tries again by itself.
+  assert.equal(plan(r, 'A', LOGIN_PROMPT, 2101).command, '/login pw')
+
+  const second = plan(r, 'A', throttled, 2102)
+  assert.equal(second.record.kind, 'throttled')
+  assert.equal(second.alert, false, 'the same kind of failure is only alerted once')
+
+  // A third one is the end of the road: this is a wrong password wearing a hat.
+  assert.equal(plan(r, 'A', LOGIN_PROMPT, 3103).command, '/login pw')
+  const third = plan(r, 'A', throttled, 3104)
+  assert.equal(third.record.kind, 'bad-password')
+  assert.equal(third.record.until, null)
+  assert.equal(third.alert, true, 'escalating to a real failure is worth an alert')
+  assert.match(third.record.reason, /repeated 3 times/)
+  assert.equal(plan(r, 'A', LOGIN_PROMPT, 9000).skip.kind, 'bad-password')
+})
+
+test('an "already logged in" reply is a short pause, never a credential verdict', () => {
+  const r = runtime({ LOGIN_PASSWORD: 'pw', AUTH_ALREADY_MS: '5000' })
+  plan(r, 'A', LOGIN_PROMPT, 1000)
+  const already = plan(r, 'A', 'You are already logged in!', 1100)
+  assert.equal(already.record.kind, 'already')
+  assert.equal(already.record.until, 6100)
+  // The previous connection's session has not expired yet — normal on a fast
+  // reconnect — so this must not be treated as a wrong password.
+  assert.equal(plan(r, 'A', LOGIN_PROMPT, 1200).skip.kind, 'already')
+  assert.equal(plan(r, 'A', LOGIN_PROMPT, 6100).command, '/login pw')
+})
+
+test('/auth-retry clears a recorded failure so the bot can log in again', () => {
+  const r = runtime({ LOGIN_PASSWORD: 'pw' })
+  plan(r, 'A', LOGIN_PROMPT, 1000)
+  plan(r, 'A', 'Wrong password!', 1100)
+  assert.equal(r.run('authState.has("A")'), true)
+  assert.ok(plan(r, 'A', LOGIN_PROMPT, 1200).skip)
+
+  r.context.__lines = []
+  r.run('subscribeLog((id, line) => __lines.push(String(line)))')
+  r.timers.clear()
+  r.run(`handleCommand('/auth-retry A')`)
+  const out = r.context.__lines.join('\n')
+  assert.match(out, /cleared bad-password/)
+  assert.match(out, /Wrong password/)
+  assert.equal(r.run('authState.has("A")'), false, 'the hold is cleared')
+  // And the very next prompt is answered again.
+  assert.equal(plan(r, 'A', LOGIN_PROMPT, 1300).command, '/login pw')
+})
+
+test('/auth-retry reports a bot with nothing recorded, and refuses a stranger', () => {
+  const r = runtime({ LOGIN_PASSWORD: 'pw' })
+  r.context.__lines = []
+  r.run('subscribeLog((id, line) => __lines.push(String(line)))')
+  r.run(`handleCommand('/auth-retry A')`)
+  assert.match(r.context.__lines.join('\n'), /no recorded auth failure/)
+  r.context.__lines = []
+  r.run(`handleCommand('/auth-retry ghost')`)
+  assert.match(r.context.__lines.join('\n'), /No bot named "ghost"/)
 })
 
 test('/play embeds the client once a build exists', async () => {

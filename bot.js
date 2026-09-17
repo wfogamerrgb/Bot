@@ -14,6 +14,10 @@ const {
   buildHttpConnectRequest,
   describeProxy,
   resolveLoginPassword,
+  parseBotPasswords,
+  classifyAuthReply,
+  nextAuthFailure,
+  isAuthBlocked,
   parseSleepDuration,
   parseCommandChain,
   executeCommandChain: executeCommandChainBase,
@@ -45,9 +49,72 @@ try { ({ SocksClient } = require('socks')) } catch (_) { /* only needed if PROXY
 const HOST = process.env.HOST || 'play.fatalmc.org'
 const PORT = parseInt(process.env.PORT || '25565', 10)
 const VERSION = process.env.VERSION || '1.21.2'
-// The /register + /login password is resolved PER BOT (resolveLoginPassword),
-// so each proxy group of accounts can use its own; LOGIN_PASSWORD stays the
-// fallback for every bot not covered by a group. See bot-controls.js.
+// The /register + /login password is resolved PER BOT (resolveLoginPassword), so
+// each proxy group of accounts can use its own and a single bot can override
+// both; LOGIN_PASSWORD stays the fallback for every bot not covered. See
+// bot-controls.js for the precedence and the two BOT_PASSWORD spellings.
+const BOT_PASSWORDS = parseBotPasswords()
+
+// ── Login / register failure guard ───────────────────────────────────────────
+// A rejected /login is treated as a configuration mistake, not a network blip:
+// the bot answers every prompt it sees, so a wrong password gets the account
+// rate-limited and then kicked, which is how a typo in .env turns into a ban.
+// Once a failure is recorded the bot stops sending auth commands, says which
+// variable to fix, and alerts Discord once. A restart (or /auth-retry) clears it,
+// deliberately: the fix is an edit to .env, and a restart is how that lands.
+const AUTH_REPLY_WINDOW_MS = parseInt(process.env.AUTH_REPLY_WINDOW_MS || '30000', 10)
+const AUTH_THROTTLE_MS = parseInt(process.env.AUTH_RETRY_MS || '300000', 10)
+const AUTH_ALREADY_MS = parseInt(process.env.AUTH_ALREADY_MS || '60000', 10)
+const AUTH_MAX_THROTTLED = Math.max(1, parseInt(process.env.AUTH_MAX_THROTTLED_RETRIES || '2', 10))
+// id -> { sentAt, kind, failure }. Survives reconnects on purpose: the failure is
+// a property of the credentials, not of this one connection, so reconnecting
+// must not talk the bot back into retrying them.
+const authState = new Map()
+
+// Decides what one server message means for one bot, and records the outcome.
+// Pulled out of the chat handler so the whole guard can be exercised without a
+// live connection. Returns one of:
+//   { record, alert }             a failure was recognised (alert only when it is
+//                                 new or changed kind, so Discord is told once)
+//   { skip }                      an auth prompt we refuse to answer
+//   { command, source, kind }     an auth prompt to answer
+function planAuthAction(id, message, now = Date.now()) {
+  const text = String(message || '').toLowerCase()
+  const state = authState.get(id) || {}
+  const failure = state.failure || null
+
+  // A failure reply only counts as one if it answers something we just sent.
+  // Without that window, a player typing "wrong password" into chat would stop a
+  // bot from ever logging in again.
+  if (state.sentAt && now - state.sentAt <= AUTH_REPLY_WINDOW_MS && !detectPlayerChat(message)) {
+    const verdict = classifyAuthReply(message)
+    if (verdict) {
+      const next = nextAuthFailure(failure, verdict, now, {
+        throttleMs: AUTH_THROTTLE_MS, alreadyMs: AUTH_ALREADY_MS, maxThrottled: AUTH_MAX_THROTTLED
+      })
+      // Clear sentAt so the same reply cannot be counted twice.
+      authState.set(id, { ...state, failure: next, sentAt: 0 })
+      return { record: next, alert: !failure || failure.kind !== next.kind }
+    }
+  }
+
+  const wantsRegister = text.includes('register') && text.includes('/register')
+  const wantsLogin = text.includes('login') && text.includes('/login')
+  if (!wantsRegister && !wantsLogin) return {}
+
+  // A throttled failure expires, so this lets it through once its wait is over.
+  if (isAuthBlocked(failure, now)) return { skip: failure }
+
+  const auth = resolveLoginPassword(id, PROXY_GROUPS, process.env, BOT_PASSWORDS)
+  const kind = wantsRegister ? 'register' : 'login'
+  authState.set(id, { ...state, sentAt: now, kind })
+  return {
+    command: wantsRegister ? `/register ${auth.password} ${auth.password}` : `/login ${auth.password}`,
+    source: auth.source,
+    kind
+  }
+}
+
 const BOT_NAMES = (process.env.BOT_NAMES || '').split(',').map(n => n.trim()).filter(Boolean)
 const CONNECT_DELAY_MS = parseInt(process.env.CONNECT_DELAY_MS || '39500', 10)
 const CONNECT_DELAY_RANDOM_MS = parseInt(process.env.CONNECT_DELAY_RANDOM_MS || '0', 10)
@@ -812,6 +879,11 @@ attempts: e.reconnectAttempts || 0,
 kick: e.lastKickReason ? escHtml(sanitize(e.lastKickReason).slice(0, 140)) : null,
 banned: Boolean(dataState.bots[id]?.banned),
 banKind: dataState.bots[id]?.banKind || null,
+// In-memory on purpose: a rejected password is fixed by editing .env, and a
+// restart is how that edit takes effect, so this must not outlive the process.
+authFailed: Boolean(authState.get(id)?.failure),
+authKind: authState.get(id)?.failure ? escHtml(sanitize(authState.get(id).failure.kind)) : null,
+authReason: authState.get(id)?.failure ? escHtml(sanitize(authState.get(id).failure.reason)) : null,
 pingHist: histArr,
 manual: manual.snapshotFor(e)
 }
@@ -1431,12 +1503,14 @@ var up=b.uptimeSec==null?'':fmtUp(b.uptimeSec)
 var manualHtml=b.manual&&b.manual.mode?'<span class="manual-badge">manual</span>':''
 var guiHtml=b.manual&&(b.manual.guiTui||b.manual.session)?'<span class="manual-badge" style="color:var(--cyan);border-color:rgba(103,232,249,.4)">gui</span>':''
 var bannedHtml=b.banned?'<span class="manual-badge" style="color:var(--red);border-color:rgba(248,113,113,.45)">⛔ banned</span>':''
+var authHtml=b.authFailed?'<span class="manual-badge" style="color:var(--red);border-color:rgba(248,113,113,.45)">🔑 '+b.authKind+'</span>':''
 var viewerHtml=b.manual&&b.manual.viewerPort?'<button class="manual-viewer" type="button" data-port="'+String(b.manual.viewerPort)+'">🌐 viewer</button>':''
-d.innerHTML='<div class="bhead"><div class="dot"></div><div class="bname"></div>'+bannedHtml+manualHtml+guiHtml+viewerHtml+(b.attempts?'<div class="batt">↻'+b.attempts+'</div>':'')+'</div>'
+d.innerHTML='<div class="bhead"><div class="dot"></div><div class="bname"></div>'+bannedHtml+authHtml+manualHtml+guiHtml+viewerHtml+(b.attempts?'<div class="batt">↻'+b.attempts+'</div>':'')+'</div>'
 +'<div class="bmeta"><span>'+(b.ping==null?'—':b.ping)+'ms</span><span>'+(b.health==null?'—':b.health)+'❤</span><span>'+(b.food==null?'—':b.food)+'🍗</span>'+(up?'<span>'+up+'</span>':'')+'</div>'
 +'<canvas width="220" height="16"></canvas>'
 d.querySelector('.bname').textContent=b.id
 if(b.banned)d.title='Banned'+(b.banKind?' ('+b.banKind+')':'')+(b.kick?' — '+b.kick:'')
+else if(b.authFailed)d.title='Login rejected: '+b.authReason+' — fix the password and run /auth-retry '+b.id
 else if(b.kick)d.title=b.kick
 d.onclick=(function(id){return function(){setView(id)}})(b.id)
 var viewerButton=d.querySelector('.manual-viewer')
@@ -2483,18 +2557,26 @@ if (requester && bots[id]?.tpautoEnabled) {
   }
 }
 
-// Grep for register prompts (e.g., "Please register using /register <password> <password>")
-if (text.includes('register') && text.includes('/register')) {
-const auth = resolveLoginPassword(id, PROXY_GROUPS, process.env)
-i(`Auth prompt detected: sending /register (password from ${auth.source})`)
-pushT(() => bot.chat(`/register ${auth.password} ${auth.password}`), 220 + Math.random() * 400)
+// Auth prompts ("Please login using /login <password>") and the server's replies
+// to them. planAuthAction decides both: it recognises a rejection and remembers
+// it, so a wrong password is reported once instead of being retried into a ban.
+const authAction = planAuthAction(id, message)
+if (authAction.record) {
+const f = authAction.record
+e(`${id}: auth ${f.kind} — ${sanitize(f.reason)}${f.until ? ` (retrying after ${new Date(f.until).toLocaleTimeString()})` : ' — stopped sending auth commands'}`)
+if (authAction.alert) {
+if (f.until == null) e(`${id}: fix the password (LOGIN_PASSWORD, PROXY_GROUP_<N>_LOGIN_PASSWORD, or BOT_PASSWORDS), then run /auth-retry ${id}`)
+else w(`${id}: repeated throttling escalates to a wrong-password failure after ${AUTH_MAX_THROTTLED} tries.`)
+monitoring?.onAuthFailure(id, f)
+notifyBotsChanged()
 }
-
-// Grep for login prompts (e.g., "Please login using /login <password>")
-else if (text.includes('login') && text.includes('/login')) {
-const auth = resolveLoginPassword(id, PROXY_GROUPS, process.env)
-i(`Auth prompt detected: sending /login (password from ${auth.source})`)
-pushT(() => bot.chat(`/login ${auth.password}`), 220 + Math.random() * 400)
+}
+if (authAction.skip) {
+i(`Auth prompt ignored for ${id} — ${authAction.skip.kind}: ${sanitize(authAction.skip.reason)} (fix it, then /auth-retry ${id})`)
+} else if (authAction.command) {
+i(`Auth prompt detected: sending /${authAction.kind} (password from ${authAction.source})`)
+const payload = authAction.command
+pushT(() => bot.chat(payload), 220 + Math.random() * 400)
 }
 })
 
@@ -2919,6 +3001,7 @@ const COMMANDS = {
 '/spawners': `Without moving, right-click every ${SPAWNER_BLOCK.replace(/_/g, ' ')} already within reach (${SPAWNER_REACH} blocks), clicking GUI slot ${SPAWNER_SLOT_FIRST} then slot ${SPAWNER_SLOT_SECOND} on each one`,
 '/data': 'Compile all saved bot/spawner data, save the local JSON snapshot, and push the current snapshot to the Google Sheets Apps Script webhook. Subcommands: /data check (verify the webhook deployment end-to-end), /data status (show webhook config + tracked counts)',
 '/list': 'Compact one-line-per-bot status list (online / offline / last kick)',
+'/auth-retry <bot>': 'Clear a recorded login/register failure for a bot and reconnect it so it can authenticate again (the failure is otherwise only cleared by a restart)',
 '/removed': 'List the removed / permanently-banned bots (the removed-bots.json roster)',
 '/unban <bot>': 'Take a bot off the removed list and reconnect it',
 '/chat <msg>': 'Send a chat message from the active bot (avoids triggering local commands); /-prefixed server commands open their GUI without auto-clicking',
@@ -3329,7 +3412,14 @@ logFor(id, ` Server: ${entry.host}:${entry.port} (v${entry.version})`)
 // whole question when a bot cannot get past /login, and the value itself has no
 // business in the dashboard, the log file, or Discord.
 logFor(id, ` Proxy: ${describeProxy(resolveBotProxy(id, PROXY_GROUPS, PROXY_DEFAULT))}`)
-logFor(id, ` Login password: from ${resolveLoginPassword(id, PROXY_GROUPS, process.env).source}`)
+const loginPw = resolveLoginPassword(id, PROXY_GROUPS, process.env, BOT_PASSWORDS)
+// Passwords are never trimmed (a space can be part of one), which means a stray
+// space pasted into .env is invisible and shows up only as a server rejection.
+// Say so here — the fact, never the value.
+const pwSpace = /^\s|\s$/.test(loginPw.password) ? ' {yellow-fg}⚠ has leading/trailing whitespace, which counts as part of the password{/yellow-fg}' : ''
+logFor(id, ` Login password: from ${loginPw.source}${pwSpace}`)
+const authFailure = authState.get(id)?.failure
+if (authFailure) logFor(id, ` Auth: {red-fg}✗ ${sanitize(authFailure.kind)}{/red-fg} — ${sanitize(authFailure.reason)}${authFailure.until == null ? ' (stopped sending auth commands; /auth-retry to clear)' : ` (waiting until ${new Date(authFailure.until).toLocaleTimeString()})`}`)
 logFor(id, ` Position: ${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)}`)
 logFor(id, ` Health: ${bot.health ?? 'N/A'} Food: ${bot.food ?? 'N/A'}`)
 logFor(id, ` Ping: ${bot.player?.ping ?? 'N/A'}ms`)
@@ -4618,6 +4708,22 @@ log(`[${idx + 1}] {cyan-fg}${name}{/cyan-fg} : {gray-fg}Offline / Connecting…{
 return
 }
 
+// ── /auth-retry ─────────────────────────────
+if (trimmed === '/auth-retry' || trimmed.startsWith('/auth-retry ')) {
+const target = trimmed.slice('/auth-retry'.length).trim() || activeId
+if (!target) { logWarn('Usage: /auth-retry <bot name> — or select a bot first'); return }
+if (!bots[target]) { logWarn(`No bot named "${sanitize(target)}".`); return }
+const had = authState.get(target)?.failure
+if (had) logSuccess(`${target}: cleared ${had.kind} (${sanitize(had.reason)}) — reconnecting so it can log in again. If it fails again the password is still wrong.`)
+else logInfo(`${target} has no recorded auth failure — reconnecting anyway.`)
+authState.delete(target)
+const { host, port, version } = bots[target]
+try { bots[target].disconnectManually() } catch (_) {}
+setTimeout(() => createBotInstance(target, host, port, version), 1000)
+notifyBotsChanged()
+return
+}
+
 // ── /removed and /unban ─────────────────────
 if (trimmed === '/removed') {
 const entries = removedBots.bots || []
@@ -4656,8 +4762,9 @@ const up = formatUptime(b.spawnTime ? Date.now() - b.spawnTime : 0)
 log(` [${idx + 1}] {cyan-fg}${name}{/cyan-fg} {green-fg}● Online{/green-fg} (${up})`)
 } else {
 const ban = dataState.bots[name]?.banned ? ` {red-fg}⛔ banned${dataState.bots[name].banKind ? ' (' + sanitize(dataState.bots[name].banKind) + ')' : ''}{/red-fg}` : ''
+const authFail = authState.get(name)?.failure ? ` {red-fg}🔑 auth ${sanitize(authState.get(name).failure.kind)}{/red-fg}` : ''
 const kick = b?.lastKickReason ? ` — last kick: ${sanitize(b.lastKickReason).slice(0, 60)}` : ''
-log(` [${idx + 1}] {cyan-fg}${name}{/cyan-fg} {red-fg}○ Offline{/red-fg}${ban}${kick}`)
+log(` [${idx + 1}] {cyan-fg}${name}{/cyan-fg} {red-fg}○ Offline{/red-fg}${ban}${authFail}${kick}`)
 }
 })
 return

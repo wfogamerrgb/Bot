@@ -382,15 +382,56 @@ function resolveBotProxy(username, groups, fallback = null) {
   return fallback
 }
 
-// The password a bot sends to /register and /login prompts. Resolved per bot so
-// a group of accounts can each use their own, with the global LOGIN_PASSWORD as
-// the fallback every existing setup already relies on.
+// Per-bot login passwords, in two spellings. The comma list is convenient for a
+// whole roster; the per-name variable is the only unambiguous one when the
+// password itself contains a comma or a colon:
+//
+//   BOT_PASSWORDS=BotOne:secret-one,BotTwo:secret-two
+//   BOT_PASSWORD_BotOne=secret-one
+//
+// The per-name variable wins when both describe the same bot. Lookups are
+// case-insensitive, because BOT_PASSWORD_botone silently missing would fall
+// through to a different password and surface as "wrong password" instead of
+// as the typo it is.
+function parseBotPasswords(env = process.env) {
+  const map = new Map()
+  const list = env && env.BOT_PASSWORDS
+  if (list) {
+    for (const entry of String(list).split(',')) {
+      // The entry itself is NOT trimmed: only the bot name is, so that
+      // "Bot1:pw1, Bot2:pw2" survives the leading space without quietly editing a
+      // password that ends in one. A space is a legal password character, and
+      // rewriting it is how a correct credential turns into "wrong password".
+      if (!entry || !entry.trim()) continue
+      const at = entry.indexOf(':') // first colon only: the password may contain more
+      if (at <= 0) continue
+      const bot = entry.slice(0, at).trim()
+      if (!bot) continue
+      map.set(bot.toLowerCase(), { bot, password: entry.slice(at + 1), source: 'BOT_PASSWORDS' })
+    }
+  }
+  for (const key of Object.keys(env || {})) {
+    if (!key.startsWith('BOT_PASSWORD_')) continue
+    const bot = key.slice('BOT_PASSWORD_'.length)
+    if (!bot || env[key] == null) continue
+    map.set(bot.toLowerCase(), { bot, password: String(env[key]), source: key })
+  }
+  return map
+}
+
+// The password a bot sends to /register and /login prompts. Resolved per bot: a
+// per-bot entry beats the group, which beats the global LOGIN_PASSWORD, which
+// beats the built-in default every existing setup already relies on.
 //
 // The proxy group is used here purely as "these bots belong together" — this is
 // the Minecraft account password, never the proxy's. Returns the source label as
 // well, so a failed /login can be traced to the variable that supplied it
 // without the password itself ever reaching a log line.
-function resolveLoginPassword(username, groups, env = process.env) {
+function resolveLoginPassword(username, groups, env = process.env, botPasswords = null) {
+  // Most specific answer first: this bot by name.
+  const perBot = botPasswords || parseBotPasswords(env)
+  const hit = perBot.get(String(username || '').toLowerCase())
+  if (hit) return { password: hit.password, source: hit.source }
   if (Array.isArray(groups)) {
     for (const group of groups) {
       if (group.bots.includes(username) && group.loginPassword) {
@@ -400,6 +441,78 @@ function resolveLoginPassword(username, groups, env = process.env) {
   }
   if (env && env.LOGIN_PASSWORD) return { password: String(env.LOGIN_PASSWORD), source: 'LOGIN_PASSWORD' }
   return { password: '123456', source: 'built-in default' }
+}
+
+// ── Login / register failure guard ───────────────────────────────────────────
+// A rejected /login is not a network blip: the bot replies to every prompt it
+// sees, so a wrong password gets the account rate-limited and then kicked, which
+// is how a one-character typo in .env becomes a ban. The wording is the only
+// evidence available — the server sends it as ordinary chat, there is no
+// distinct packet — so it has to be matched conservatively. bot.js only consults
+// this within a short window of sending an auth command, and ignores anything
+// that looks like player chat, so a player typing "wrong password" cannot
+// disable a bot.
+//
+// Three kinds, because they need different responses:
+//   bad-password  the password is wrong; retrying can only make things worse,
+//                 so stop until the config is fixed.
+//   throttled     the server is rate-limiting; waiting is correct, but only a
+//                 bounded number of times — an endlessly repeated "try again
+//                 later" is a wrong password wearing a hat.
+//   already       an existing session or a registered account. Usually the
+//                 previous connection's session has not expired yet, so this is
+//                 a short pause, never a credential verdict.
+const AUTH_REPLY_PATTERNS = [
+  { kind: 'bad-password', re: /(?:wrong|incorrect|invalid|bad) password/i },
+  { kind: 'bad-password', re: /password (?:is )?not correct/i },
+  { kind: 'bad-password', re: /passwords? (?:do not|don't|does not|doesn't) match/i },
+  { kind: 'bad-password', re: /(?:authentication|login|register(?:ation)?) failed/i },
+  { kind: 'bad-password', re: /password is too (?:short|long)/i },
+  { kind: 'throttled', re: /too many (?:failed |wrong )?(?:attempts|tries|logins)/i },
+  { kind: 'throttled', re: /please wait .{0,40}(?:before|then) (?:trying|try)/i },
+  { kind: 'throttled', re: /temporarily (?:blocked|locked) (?:from|out of) (?:logging in|login)/i },
+  { kind: 'throttled', re: /try again (?:in|after|later)/i },
+  { kind: 'already', re: /already (?:logged in|authenticated|registered)/i }
+]
+
+// Returns { kind, reason } for a recognised failure reply, or null for ordinary
+// chat. First match wins, so the specific patterns come before the broad ones.
+function classifyAuthReply(message) {
+  const text = String(message || '')
+  for (const { kind, re } of AUTH_REPLY_PATTERNS) {
+    const match = text.match(re)
+    if (match) return { kind, reason: match[0].trim() }
+  }
+  return null
+}
+
+// Folds a verdict into the bot's auth state. `previous` is the state so far (or
+// null). A throttled failure is tolerated `maxThrottled` times and then treated
+// as a wrong password, so no amount of "try again later" can become an infinite
+// retry loop. `until === null` means sticky: only /auth-retry or a restart
+// clears it, because only a config change can fix it.
+function nextAuthFailure(previous, verdict, now, { throttleMs = 300000, alreadyMs = 60000, maxThrottled = 2 } = {}) {
+  if (!verdict) return previous || null
+  const count = (previous && previous.count ? previous.count : 0) + 1
+  if (verdict.kind === 'throttled') {
+    if (count <= maxThrottled) {
+      return { kind: 'throttled', reason: verdict.reason, at: now, until: now + throttleMs, count }
+    }
+    return {
+      kind: 'bad-password',
+      reason: `${verdict.reason} (repeated ${count} times — treating it as a wrong password)`,
+      at: now, until: null, count
+    }
+  }
+  if (verdict.kind === 'already') {
+    return { kind: 'already', reason: verdict.reason, at: now, until: now + alreadyMs, count }
+  }
+  return { kind: verdict.kind, reason: verdict.reason, at: now, until: null, count }
+}
+
+function isAuthBlocked(failure, now = Date.now()) {
+  if (!failure) return false
+  return failure.until == null || now < failure.until
 }
 
 // True when a resolved proxy carries credentials worth sending.
@@ -461,6 +574,10 @@ module.exports = {
   buildHttpConnectRequest,
   describeProxy,
   resolveLoginPassword,
+  parseBotPasswords,
+  classifyAuthReply,
+  nextAuthFailure,
+  isAuthBlocked,
   parseSleepDuration,
   parseCommandChain,
   executeCommandChain

@@ -1,7 +1,7 @@
 'use strict'
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const { readDelayMs, readInt, readNumber, parseDumpMode, parseDataArgs, shuffledCopy, createSlowBroadcast, createSlowBroadcastManager, parseProxyGroups, resolveBotProxy, hasProxyAuth, proxyAuthHeader, buildHttpConnectRequest, describeProxy, resolveLoginPassword } = require('../bot-controls')
+const { readDelayMs, readInt, readNumber, parseDumpMode, parseDataArgs, shuffledCopy, createSlowBroadcast, createSlowBroadcastManager, parseProxyGroups, resolveBotProxy, hasProxyAuth, proxyAuthHeader, buildHttpConnectRequest, describeProxy, resolveLoginPassword, parseBotPasswords, classifyAuthReply, nextAuthFailure, isAuthBlocked } = require('../bot-controls')
 
 function clock() {
   let time = 0, sequence = 0
@@ -273,6 +273,108 @@ test('resolveLoginPassword never returns the proxy password as an account passwo
   const result = resolveLoginPassword('Alice', groups, { LOGIN_PASSWORD: 'global-pw' })
   assert.equal(result.password, 'global-pw')
   assert.notEqual(result.password, 'proxy-secret')
+})
+
+test('parseBotPasswords reads both spellings, first colon splits, no trimming', () => {
+  const map = parseBotPasswords({
+    BOT_PASSWORDS: 'BotOne:secret-one , BotTwo:has:colons,BotThree:spaces kept ,broken,',
+    BOT_PASSWORD_BotFour: 'has,comma'
+  })
+  // The password after the colon survives byte for byte, including a trailing
+  // space: silently trimming it would turn a correct credential into a server
+  // "wrong password" that cannot be reproduced by typing it.
+  assert.deepEqual(map.get('botone'), { bot: 'BotOne', password: 'secret-one ', source: 'BOT_PASSWORDS' })
+  // Only the first colon separates: a password may contain colons.
+  assert.equal(map.get('bottwo').password, 'has:colons')
+  // The space BEFORE a name is separator formatting and is dropped; the one
+  // inside the password is not.
+  assert.equal(map.get('botthree').password, 'spaces kept ')
+  // An entry with no ':' and an empty entry are both skipped, not fatal.
+  assert.equal(map.size, 4)
+  assert.equal(map.get('botfour').password, 'has,comma')
+  assert.equal(map.get('botfour').source, 'BOT_PASSWORD_BotFour')
+})
+
+test('the per-name variable wins over the BOT_PASSWORDS list, and lookup is case-insensitive', () => {
+  const map = parseBotPasswords({ BOT_PASSWORDS: 'BotOne:from-list', BOT_PASSWORD_BotOne: 'from-name' })
+  assert.equal(map.get('botone').password, 'from-name')
+  assert.equal(map.get('botone').source, 'BOT_PASSWORD_BotOne')
+  // Whatever the casing in .env or in BOT_NAMES, one entry is found: the map is
+  // keyed lowercase and resolveLoginPassword lowercases the bot name to look it
+  // up, so BOT_PASSWORD_botone serves bot BotOne instead of silently missing and
+  // falling through to a different password (which reads as "wrong password").
+  assert.equal(parseBotPasswords({ BOT_PASSWORD_botone: 'x' }).get('botone').password, 'x')
+  assert.equal(parseBotPasswords({ BOT_PASSWORDS: 'BOTONE:x' }).get('botone').password, 'x')
+  assert.equal(parseBotPasswords({}).size, 0)
+  assert.equal(parseBotPasswords({ BOT_PASSWORDS: '' }).size, 0)
+})
+
+test('resolveLoginPassword puts a per-bot password above the group and the global', () => {
+  const env = { LOGIN_PASSWORD: 'global-pw', BOT_PASSWORDS: 'BotTwo:own-pw,BotFour:also-own' }
+  const groups = parseProxyGroups({
+    PROXY_GROUP_1_BOTS: 'BotOne,BotTwo,BotThree', PROXY_GROUP_1_HOST: 'h', PROXY_GROUP_1_LOGIN_PASSWORD: 'group-pw'
+  })
+  assert.deepEqual(resolveLoginPassword('BotTwo', groups, env), { password: 'own-pw', source: 'BOT_PASSWORDS' })
+  assert.deepEqual(resolveLoginPassword('BotOne', groups, env), { password: 'group-pw', source: 'PROXY_GROUP_1_LOGIN_PASSWORD' })
+  assert.deepEqual(resolveLoginPassword('BotThree', groups, env), { password: 'group-pw', source: 'PROXY_GROUP_1_LOGIN_PASSWORD' })
+  assert.deepEqual(resolveLoginPassword('BotFour', groups, env), { password: 'also-own', source: 'BOT_PASSWORDS' })
+  assert.deepEqual(resolveLoginPassword('Stranger', groups, env), { password: 'global-pw', source: 'LOGIN_PASSWORD' })
+})
+
+test('classifyAuthReply recognises the real failure wordings and nothing else', () => {
+  const bad = ['Wrong password!', 'Incorrect password', 'Invalid password', 'Password does not match', 'Passwords do not match', 'Authentication failed', 'Login failed', 'That password is not correct', 'Your password is too short']
+  for (const text of bad) assert.equal(classifyAuthReply(text).kind, 'bad-password', text)
+
+  assert.equal(classifyAuthReply('Too many failed attempts, please wait').kind, 'throttled')
+  assert.equal(classifyAuthReply('Please wait 30 seconds before trying again').kind, 'throttled')
+  assert.equal(classifyAuthReply('You have been temporarily blocked from logging in').kind, 'throttled')
+  assert.equal(classifyAuthReply('Try again later').kind, 'throttled')
+
+  // An existing session is not a credential verdict: the previous connection may
+  // simply not have expired yet, which is normal on a fast reconnect.
+  assert.equal(classifyAuthReply('You are already logged in!').kind, 'already')
+  assert.equal(classifyAuthReply('This name is already registered').kind, 'already')
+
+  for (const text of ['Welcome to the server', 'Please login using /login <password>', 'Type /register to create an account', '', 'Built by Notch']) {
+    assert.equal(classifyAuthReply(text), null, text)
+  }
+})
+
+test('classifyAuthReply reports the matched phrase, and prefers the specific pattern', () => {
+  assert.equal(classifyAuthReply('Wrong password! Try again later.').reason, 'Wrong password')
+  assert.equal(classifyAuthReply('Too many failed attempts, please wait 10 seconds before trying again').kind, 'throttled')
+})
+
+test('nextAuthFailure makes a wrong password sticky and escalates repeated throttling', () => {
+  const bad = nextAuthFailure(null, { kind: 'bad-password', reason: 'Wrong password' }, 1000)
+  assert.deepEqual(bad, { kind: 'bad-password', reason: 'Wrong password', at: 1000, until: null, count: 1 })
+
+  // Throttled is tolerated twice, then treated as a wrong password so that no
+  // amount of "try again later" becomes an endless retry loop.
+  const first = nextAuthFailure(null, { kind: 'throttled', reason: 'Too many attempts' }, 1000, { throttleMs: 5000, maxThrottled: 2 })
+  assert.equal(first.kind, 'throttled')
+  assert.equal(first.until, 6000)
+  const second = nextAuthFailure(first, { kind: 'throttled', reason: 'Too many attempts' }, 7000, { throttleMs: 5000, maxThrottled: 2 })
+  assert.equal(second.kind, 'throttled')
+  assert.equal(second.until, 12000)
+  const third = nextAuthFailure(second, { kind: 'throttled', reason: 'Too many attempts' }, 13000, { throttleMs: 5000, maxThrottled: 2 })
+  assert.equal(third.kind, 'bad-password')
+  assert.equal(third.until, null)
+  assert.match(third.reason, /repeated 3 times/)
+})
+
+test('nextAuthFailure only pauses on "already", and isAuthBlocked honours the deadline', () => {
+  const already = nextAuthFailure(null, { kind: 'already', reason: 'already logged in' }, 1000, { alreadyMs: 60000 })
+  assert.equal(already.kind, 'already')
+  assert.equal(already.until, 61000)
+  assert.equal(isAuthBlocked(already, 1000), true)
+  assert.equal(isAuthBlocked(already, 60999), true)
+  assert.equal(isAuthBlocked(already, 61000), false)
+
+  const sticky = { kind: 'bad-password', until: null }
+  assert.equal(isAuthBlocked(sticky, 1), true)
+  assert.equal(isAuthBlocked(sticky, Number.MAX_SAFE_INTEGER), true)
+  assert.equal(isAuthBlocked(null, 1), false)
 })
 
 test('multi-task createSlowBroadcastManager: concurrent tasks, independent timers, selective cancellation, and cancelAll', () => {

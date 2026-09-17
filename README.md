@@ -499,7 +499,13 @@ check logs before retrying to avoid accidentally executing a command twice.
 | `HOST` | `play.fatalmc.org` | Minecraft server host |
 | `PORT` | `25565` | Minecraft server port |
 | `VERSION` | `1.21.2` | Minecraft protocol version, passed to mineflayer unchanged |
-| `LOGIN_PASSWORD` | `123456` | Password sent to register/login prompts. Fallback for bots not covered by a `PROXY_GROUP_<N>_LOGIN_PASSWORD` |
+| `LOGIN_PASSWORD` | `123456` | Password sent to register/login prompts. Fallback for bots not covered by a group or per-bot password |
+| `BOT_PASSWORDS` | empty | Per-bot passwords: `Bot7:pw,Bot9:pw2`. Beats the group and `LOGIN_PASSWORD` |
+| `BOT_PASSWORD_<BOT>` | empty | One variable per bot; beats `BOT_PASSWORDS` for the same bot. Use when the password contains a comma |
+| `AUTH_REPLY_WINDOW_MS` | `30000` | How long after sending an auth command a reply is treated as its answer |
+| `AUTH_RETRY_MS` | `300000` | How long a throttled login waits before trying again |
+| `AUTH_ALREADY_MS` | `60000` | Pause after "already logged in"/"already registered" |
+| `AUTH_MAX_THROTTLED_RETRIES` | `2` | Throttled replies tolerated before it is treated as a wrong password |
 | `BOT_NAMES` | required | Comma-separated bot usernames |
 | `CONNECT_DELAY_MS` | `39500` | Delay between initial bot connections |
 | `CONNECT_DELAY_RANDOM_MS` | `0` | Additional random delay range |
@@ -597,9 +603,28 @@ PROXY_GROUP_2_HOST=5.6.7.8
 PROXY_GROUP_2_LOGIN_PASSWORD=their-own-password
 ```
 
-Precedence is `PROXY_GROUP_<N>_LOGIN_PASSWORD` → `LOGIN_PASSWORD` → the built-in `123456`,
-so a group that sets nothing is unchanged by this feature. `LOGIN_PASSWORD` is *not*
-required when every bot is in a group.
+A single bot can override both, which is the form that survives being moved to another
+group:
+
+```ini
+BOT_PASSWORDS=Bot7:its-own-password,Bot9:another      # Bot7:...,Bot9:... , first colon splits
+BOT_PASSWORD_Bot7=its-own-password                   # same thing, one variable per bot
+```
+
+Precedence, most specific first: **`BOT_PASSWORD_<BOT>` → `BOT_PASSWORDS` → `PROXY_GROUP_<N>_LOGIN_PASSWORD` → `LOGIN_PASSWORD` → the built-in `123456`**. A group
+that sets nothing, and a bot that sets nothing, are both unchanged by this feature.
+`LOGIN_PASSWORD` is *not* required when every bot is covered some other way.
+
+Passwords are used **exactly as written** — never trimmed. A password may legitimately
+begin or end with a space, and silently editing it would turn a correct credential into a
+server-side "wrong password" you cannot reproduce by typing it. A space *before* a bot
+name in `BOT_PASSWORDS` is separator formatting and is dropped; nothing else is. If the
+resolved password has leading or trailing whitespace, `/status` says so, because that is
+otherwise invisible.
+
+`BOT_PASSWORD_<BOT>` is the escape hatch when a password itself contains a comma (which
+the comma-separated list cannot express) and is matched case-insensitively, so
+`BOT_PASSWORD_bot7` still serves `Bot7`.
 
 This is the **account** password, unrelated to `PROXY_GROUP_<N>_USER` / `_PASS` (the
 proxy's login) — the group is only used here as "these bots belong together". The group
@@ -610,10 +635,42 @@ The password is never logged: `/status` reports which variable supplied it
 which is what you need to debug a rejected login without putting the value in the
 dashboard, the log file, or Discord.
 
-> Because the password is attached to the group, moving a bot to another group changes
-the password it logs in with. If a bot is registered on the server with its own
-password, keep it in a group whose `LOGIN_PASSWORD` matches. A per-bot map is not
-implemented — ask if you want one.
+> Because a group password is attached to the *group*, moving a bot between groups
+> changes the password it logs in with. Give a bot that has its own password a
+> `BOT_PASSWORD_<BOT>` entry and the move is harmless.
+
+#### Rejected logins stop the bot instead of hammering the server
+
+A wrong password used to be retried forever: the bot answers every `/login` prompt it
+sees, the server kicks for repeated failures, and the reconnect loop starts again — which
+is how a one-character typo in `.env` became a ban.
+
+Now a rejection is recognised and recorded (per bot, in memory only):
+
+```
+BotOne: auth bad-password — Wrong password — stopped sending auth commands
+BotOne: fix the password (LOGIN_PASSWORD, PROXY_GROUP_<N>_LOGIN_PASSWORD, or BOT_PASSWORDS), then run /auth-retry BotOne
+```
+
+- **`bad-password`** — wrong/incorrect/invalid password, "passwords do not match",
+  "authentication failed". Sticky: the bot stops answering prompts, the bot card gets a
+  `🔑` badge, `/list` and `/status` say why, and Discord is alerted **once** naming the
+  variable to fix.
+- **`throttled`** — "too many attempts", "please wait before trying again", "try again
+  later". The bot waits, then tries again, but only `AUTH_MAX_THROTTLED_RETRIES` times
+  before escalating to `bad-password` — an endlessly repeated "try again later" is a wrong
+  password wearing a hat, and no amount of waiting should turn into an infinite retry.
+- **`already`** — "already logged in", "already registered". A short pause only, never a
+  credential verdict: on a fast reconnect the previous session often has not expired yet.
+
+`/auth-retry <bot>` clears the record and reconnects. A **process restart also clears** it,
+deliberately — the fix is an edit to `.env`, and a restart is how that edit lands.
+
+The wording is the only evidence available (the server sends auth failures as ordinary
+chat), so the guard is deliberately narrow: a reply only counts as a failure if the bot
+sent an auth command within `AUTH_REPLY_WINDOW_MS`, and anything shaped like player chat
+(`Name: message`) is ignored. A player typing "wrong password" in chat cannot disable a
+bot.
 
 ### Web dashboard
 
@@ -915,6 +972,7 @@ Any unrecognized input is sent as a Minecraft chat message or command.
 | `/reconnect-all` | Reconnect currently offline bots |
 | `/reconnect-all-slow` | Reconnect all bots with a configurable stagger |
 | `/removed` | List the removed / permanently-banned bots |
+| `/auth-retry <bot>` | Clear a recorded login/register failure and reconnect so it can authenticate again |
 | `/unban <bot>` | Take a bot off the removed list and reconnect it |
 | `/closeBot` | Disconnect and remove the active bot |
 | `/dump` | TPA and deposit inventory into nearby chests |
@@ -1228,6 +1286,7 @@ Three settings, all optional:
 | --- | --- | --- |
 | `BAN_MESSAGE_REGEX` | *(unset)* | Extra case-insensitive pattern for your server's own wording, e.g. `you have been removed from`. An invalid pattern is ignored with a startup warning. |
 | `DISCORD_BAN_COOLDOWN_MS` | `900000` | How long one ban alert suppresses repeats for the same bot and type |
+| `DISCORD_AUTH_COOLDOWN_MS` | `1800000` | How long one login-rejected alert suppresses repeats for the same bot and kind |
 | `BAN_SWEEP_MS` | `60000` | How often a held ban is checked for expiry |
 | `BAN_RETRY_MS` | `1800000` | Retry window for a ban whose length the server never stated |
 | `PERMANENT_BAN_ACTION` | `remove` | What a permanent ban does to the live roster: `remove` (like `/closeBot`) or `hold` (stays visible with the badge) |

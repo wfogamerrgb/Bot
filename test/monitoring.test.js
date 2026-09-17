@@ -152,7 +152,7 @@ test('BAN_MESSAGE_REGEX adds a server-specific ban phrase', () => {
 // ── Discord alerting ────────────────────────────────────────────────────────
 // createMonitoring reads its config at construction and posts through global
 // fetch, so both are stubbed here and restored afterwards.
-const ENV_KEYS = ['DISCORD_WEBHOOK_URL', 'DISCORD_USER_ID', 'DISCORD_NOTIFICATIONS', 'DISCORD_BAN_COOLDOWN_MS', 'MEMORY_WATCHDOG', 'DISCORD_MENTION_CRITICAL_ONLY']
+const ENV_KEYS = ['DISCORD_WEBHOOK_URL', 'DISCORD_USER_ID', 'DISCORD_NOTIFICATIONS', 'DISCORD_BAN_COOLDOWN_MS', 'DISCORD_AUTH_COOLDOWN_MS', 'MEMORY_WATCHDOG', 'DISCORD_MENTION_CRITICAL_ONLY']
 
 async function withMonitoring (env, fn) {
   const { createMonitoring } = require('../monitoring')
@@ -217,6 +217,42 @@ test('a ban alert is not repeated while the same ban is still in effect', async 
     await monitoring.onKick('Hypr_7_core', 'You are banned!')
     await monitoring.onKick('Hypr_7_core', 'You are banned!')
     assert.equal(sent.length, 1, 'reconnect attempts against the same ban must not spam Discord')
+  })
+})
+
+// A rejected /login is our own credential being wrong, not the server punishing
+// an account, and the bot has stopped trying — so the alert has to say what to
+// edit, and must not read like one more reconnect in the feed.
+test('a rejected login pages the operator once, naming the variable to fix', async () => {
+  await withMonitoring({ DISCORD_USER_ID: '12345', DISCORD_MENTION_CRITICAL_ONLY: 'true' }, async ({ monitoring, sent, lines }) => {
+    const failure = { kind: 'bad-password', reason: 'Wrong password', at: 1000, until: null, count: 1 }
+    await monitoring.onAuthFailure('BotOne', failure)
+    assert.equal(sent.length, 1)
+    const embed = sent[0].embeds[0]
+    assert.equal(embed.title, 'Bot login rejected')
+    assert.equal(embed.color, 0xdc2626)
+    assert.match(embed.description, /Wrong password/)
+    assert.match(embed.description, /stopped sending/)
+    assert.match(embed.description, /LOGIN_PASSWORD/)
+    assert.match(embed.description, /\/auth-retry BotOne/)
+    assert.deepEqual(embed.fields, [{ name: 'Failure', value: 'bad-password', inline: true }])
+    assert.match(sent[0].content, /<@12345>/, 'a wrong password is critical: it cannot fix itself')
+    assert.ok(lines.some(line => /auth bad-password/.test(line)), 'and it is written to the local log')
+
+    // Reconnect attempts against the same failure must not spam the channel.
+    await monitoring.onAuthFailure('BotOne', failure)
+    assert.equal(sent.length, 1, 'the same failure alerts once')
+  })
+})
+
+test('a throttled auth failure is amber and does not page the operator', async () => {
+  await withMonitoring({ DISCORD_USER_ID: '12345', DISCORD_MENTION_CRITICAL_ONLY: 'true' }, async ({ monitoring, sent }) => {
+    await monitoring.onAuthFailure('BotOne', { kind: 'throttled', reason: 'Too many failed attempts', until: Date.now() + 300000, count: 1 })
+    const embed = sent[0].embeds[0]
+    assert.equal(embed.title, 'Bot auth cannot proceed')
+    assert.equal(embed.color, 0xf97316)
+    assert.match(embed.description, /waiting before trying again/)
+    assert.equal(sent[0].content, '', 'waiting is not worth a mention')
   })
 })
 

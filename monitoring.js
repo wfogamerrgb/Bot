@@ -218,7 +218,11 @@ function createMonitoring({ logFor, systemId, sanitize, getStats, getBotCount })
     eventCooldownMs: envInt('DISCORD_EVENT_COOLDOWN_MS', 60000, 1000),
     // A ban is a long-lived state, not a blip: one alert per bot per kind, then
     // no repeat spam while reconnect attempts keep failing against the same ban.
-    banCooldownMs: envInt('DISCORD_BAN_COOLDOWN_MS', 900000, 60000)
+    banCooldownMs: envInt('DISCORD_BAN_COOLDOWN_MS', 900000, 60000),
+    // A rejected password is a config mistake that a retry cannot fix, so the
+    // alert is deliberately long-lived: one message, then quiet until it is
+    // actually resolved (or the process restarts with a fixed password).
+    authCooldownMs: envInt('DISCORD_AUTH_COOLDOWN_MS', 1800000, 60000)
   }
   if ((process.env.BAN_MESSAGE_REGEX || '').trim() && !EXTRA_BAN_RE) {
     // Warn once at startup rather than silently ignoring a broken pattern.
@@ -355,6 +359,32 @@ function createMonitoring({ logFor, systemId, sanitize, getStats, getBotCount })
     })
   }
 
+  // Login/register rejected. Distinct from a kick on purpose: the account is
+  // not being punished by the server, our own credentials are wrong, and the
+  // bot has stopped trying — so the alert must say which variable to fix
+  // instead of reading like one more reconnect in the feed.
+  function onAuthFailure(botId, failure) {
+    const kind = failure.kind || 'bad-password'
+    const certain = kind === 'bad-password'
+    local('error', `${botId} auth ${kind}: ${failure.reason}${failure.until ? '' : ' — stopped sending auth commands'}`)
+    const vars = '`LOGIN_PASSWORD`, `PROXY_GROUP_<N>_LOGIN_PASSWORD`, or `BOT_PASSWORDS`'
+    return notify({
+      key: `auth:${botId}:${kind}`,
+      title: certain ? 'Bot login rejected' : 'Bot auth cannot proceed',
+      description: [
+        `**${clampText(botId, 80)}** could not authenticate: ${clampText(failure.reason, 400)}`,
+        '',
+        certain
+          ? `It has stopped sending \`/login\` so the account is not rate-limited or banned. Fix the password in ${vars}, then run \`/auth-retry ${clampText(botId, 80)}\`.`
+          : `It is waiting before trying again${failure.until ? ` (until <t:${Math.floor(failure.until / 1000)}:t>)` : ''}. Repeated throttling escalates to a wrong-password failure rather than retrying forever.`
+      ].filter(Boolean).join('\n'),
+      color: certain ? 0xdc2626 : 0xf97316,
+      critical: certain,
+      cooldownMs: cfg.authCooldownMs,
+      fields: [{ name: 'Failure', value: kind, inline: true }]
+    })
+  }
+
   function onKick(botId, reason) {
     const text = clampText(reason || 'Unknown reason', 2000)
     const verdict = classifyKick(text)
@@ -388,7 +418,7 @@ function createMonitoring({ logFor, systemId, sanitize, getStats, getBotCount })
     if (timer.unref) timer.unref()
     setTimeout(checkMemory, 1000).unref?.()
   }
-  return { cfg, notify, checkMemory, getMemorySnapshot: () => ({ ...memory }), inspectServerMessage, onKick, onBan, onDisconnect, onRecovered, onReconnectExhausted, onProxyStall, onSecurityLockout, onFatal, stop: () => timer && clearInterval(timer) }
+  return { cfg, notify, checkMemory, getMemorySnapshot: () => ({ ...memory }), inspectServerMessage, onKick, onBan, onAuthFailure, onDisconnect, onRecovered, onReconnectExhausted, onProxyStall, onSecurityLockout, onFatal, stop: () => timer && clearInterval(timer) }
 }
 
 module.exports = { createMonitoring, classifyKick, chatText, parseBanDuration }
