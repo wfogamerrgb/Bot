@@ -30,7 +30,7 @@
  *   anonymous call has no permission to the spreadsheet and writes fail.
  *
  * ── What this script touches, and what it never touches ──────────────────────
- * Only the `Bots`, `Spawners`, `Lifetime`, and `Bans` tabs are written, and
+ * Only the `Bots`, `Spawners`, and `Bans` tabs are written, and
  * inside them only the COLUMNS this script created — the ones whose header names
  * come from the pushed payload (bot, balance, coins, shards, earned, ...).
  *
@@ -40,7 +40,7 @@
  *     header you added stays exactly as you left it.
  *   · Other tabs are never opened, created, or modified. Add as many as you like.
  *     A tab we have never written to is left untouched even when a payload is
- *     empty, so a hand-made `Lifetime` summary is never cleared.
+ *     empty, so a summary tab you keep by hand is never cleared.
  *   · Fonts, colours, borders, notes, and conditional formatting are never set
  *     or cleared. We use clearContents(), which preserves formatting; this script
  *     never calls clear()/clear({format: true}).
@@ -54,8 +54,12 @@
  *     run resetLayout() first to hand those columns back to you.
  *
  * A "TOTAL" row of =SUM() formulas is appended under the data (see TOTALS_ROW /
- * TOTALS_COLUMNS). It sums `balance`, `coins`, and `shards` on Bots, and
- * `earned` / `lifetimeEarned` on Spawners.
+ * TOTALS_COLUMNS). It sums `balance`, `coins`, `shards`, `invUsed`, `earned`,
+ * and `lifetimeEarned` on Bots, plus `earned` on Spawners. Those sums are the
+ * totals to trust: `lifetimeEarned` on Bots is a running total accumulated where
+ * the balance is actually measured (one bot), while a spawner row's `earned` is
+ * that row's last measured window, so summing the spawner rows totals the last
+ * run rather than all time.
  *
  * ── Readable times ───────────────────────────────────────────────────────────
  * Timestamps (`recordedAt`, `runStartedAt`, `lastRunAt`, ...) arrive as epoch
@@ -77,12 +81,16 @@ var SPREADSHEET_ID_OVERRIDE = ''
 
 var SHEET_BOTS = 'Bots'
 var SHEET_SPAWNERS = 'Spawners'
-var SHEET_LIFETIME = 'Lifetime'
+// Retired: an older version of this script wrote a one-row `Lifetime` summary
+// here. Nothing writes it any more (the running total lives on the Bots tab, so
+// the sheet's own TOTAL row can sum it). The tab itself is left untouched, and
+// removeLifetimeTab() below deletes it on request.
+var SHEET_LIFETIME_RETIRED = 'Lifetime'
 // One row per banned bot: current ban state, its reason, and whether the ban
 // expires. Written from the `bans` array the bot keeps in its data file, so the
 // record survives a restart even though the bot itself cannot reconnect.
 var SHEET_BANS = 'Bans'
-var MANAGED_SHEETS = [SHEET_BOTS, SHEET_SPAWNERS, SHEET_LIFETIME, SHEET_BANS]
+var MANAGED_SHEETS = [SHEET_BOTS, SHEET_SPAWNERS, SHEET_BANS]
 // Apps Script rejects cells longer than 50,000 characters.
 var MAX_CELL_LENGTH = 49000
 
@@ -97,7 +105,6 @@ var DEFAULT_NUMBER_FORMATS = {
   balanceAfter: MONEY_FORMAT,
   earned: MONEY_FORMAT,
   lifetimeEarned: MONEY_FORMAT,
-  totalEarned: MONEY_FORMAT,
   ratePerHour: MONEY_FORMAT,
   coins: COUNT_FORMAT,
   shards: COUNT_FORMAT,
@@ -105,7 +112,9 @@ var DEFAULT_NUMBER_FORMATS = {
   trackedSpawners: COUNT_FORMAT,
   successfulSpawners: COUNT_FORMAT,
   spawnerNumber: COUNT_FORMAT,
-  samples: COUNT_FORMAT,
+  invUsed: COUNT_FORMAT,
+  invFree: COUNT_FORMAT,
+  invTotal: COUNT_FORMAT,
   count: COUNT_FORMAT,
   // Coordinates are floats, so they get two decimals to line up in a column.
   x: MONEY_FORMAT,
@@ -115,7 +124,7 @@ var DEFAULT_NUMBER_FORMATS = {
 
 // Which owned columns get a =SUM() in the TOTAL row. Names not present on the
 // sheet are skipped, so one list covers every tab.
-var DEFAULT_TOTALS_COLUMNS = ['balance', 'coins', 'shards', 'earned', 'lifetimeEarned', 'totalEarned']
+var DEFAULT_TOTALS_COLUMNS = ['balance', 'coins', 'shards', 'invUsed', 'earned', 'lifetimeEarned']
 
 var TOTALS_LABEL = 'TOTAL'
 
@@ -191,7 +200,7 @@ function doGet () {
   return json_({
     ok: Boolean(sheetId) && !spreadsheetError,
     service: 'openmontage-data',
-    version: 3,
+    version: 4,
     spreadsheetId: sheetId,
     spreadsheetError: spreadsheetError,
     sheets: sheets,
@@ -228,7 +237,7 @@ function doPost (e) {
     return json_({ ok: false, errors: ['Request body is not valid JSON: ' + err.message] })
   }
   if (!body || typeof body !== 'object') {
-    return json_({ ok: false, errors: ['Request body must be a JSON object with bots/spawners/lifetime keys.'] })
+    return json_({ ok: false, errors: ['Request body must be a JSON object with bots/spawners/bans keys.'] })
   }
 
   var expectedSecret = secret_()
@@ -252,9 +261,11 @@ function doPost (e) {
   var plan = [
     [SHEET_BOTS, normalizeRows_(body.bots)],
     [SHEET_SPAWNERS, normalizeRows_(body.spawners)],
-    [SHEET_LIFETIME, normalizeRows_(body.lifetime)],
     [SHEET_BANS, normalizeRows_(body.bans)]
   ]
+  // The `Lifetime` tab is gone. An older Code.gs copy wrote it; this one stops
+  // touching it entirely, so a tab with that name is simply left as it is
+  // (delete it by hand if you want it gone).
   plan.forEach(function (entry) {
     try {
       var result = writeSheet_(ss, entry[0], entry[1])
@@ -396,7 +407,7 @@ function writeSheet_ (ss, name, rows) {
   if (!owned.length) {
     // Nothing has ever been written here and nothing is being written now, so
     // leave the tab exactly as it is. Clearing here would wipe a tab you have
-    // been keeping by hand (an empty `lifetime` object hits this path).
+    // been keeping by hand (an empty payload hits this path).
     return { rows: 0, columns: {}, totalsRow: 0, cleared: 0 }
   }
 
@@ -583,7 +594,26 @@ function resetLayout () {
     props_().deleteProperty(ownedColumnsKey_(name))
     props_().deleteProperty(ownedRowsKey_(name))
   })
+  // Memory of the retired Lifetime tab goes too, so nothing lingers once the tab
+  // is gone.
+  props_().deleteProperty(ownedColumnsKey_(SHEET_LIFETIME_RETIRED))
+  props_().deleteProperty(ownedRowsKey_(SHEET_LIFETIME_RETIRED))
   return 'Layout memory cleared for: ' + (dropped.join(', ') || '(nothing was tracked)')
+}
+
+// Deletes the retired `Lifetime` tab. Nothing calls this automatically: deleting
+// a sheet is not something a /data push should ever decide to do. Run it once
+// from the editor if you want the old tab gone.
+function removeLifetimeTab () {
+  var id = spreadsheetId_()
+  if (!id) throw new Error('Run setSpreadsheetId("<spreadsheet id>") first.')
+  var ss = SpreadsheetApp.openById(id)
+  var sheet = ss.getSheetByName(SHEET_LIFETIME_RETIRED)
+  if (!sheet) return 'No ' + SHEET_LIFETIME_RETIRED + ' tab to remove.'
+  ss.deleteSheet(sheet)
+  props_().deleteProperty(ownedColumnsKey_(SHEET_LIFETIME_RETIRED))
+  props_().deleteProperty(ownedRowsKey_(SHEET_LIFETIME_RETIRED))
+  return SHEET_LIFETIME_RETIRED + ' tab removed — the running total is on Bots (lifetimeEarned) now.'
 }
 
 function listSettings () {
@@ -613,11 +643,10 @@ function testWrite () {
     postData: {
       contents: JSON.stringify({
         bots: [
-          { bot: 'TestBotA', rank: 'Member', shards: 1200, coins: 900, balance: 1234.5, botPosition: { x: 1, y: 2, z: 3 }, spawnerCount: 1, recordedAt: Date.now() },
-          { bot: 'TestBotB', rank: 'Regent', shards: 800, coins: 150, balance: 765.25, botPosition: { x: 4, y: 5, z: 6 }, spawnerCount: 1, recordedAt: Date.now() }
+          { bot: 'TestBotA', rank: 'Member', shards: 1200, coins: 900, balance: 1234.5, earned: 40, lifetimeEarned: 400, invUsed: 12, invFree: 24, invTotal: 36, botPosition: { x: 1, y: 2, z: 3 }, spawnerCount: 1, recordedAt: Date.now() },
+          { bot: 'TestBotB', rank: 'Regent', shards: 800, coins: 150, balance: 765.25, earned: 12, lifetimeEarned: 120, invUsed: 30, invFree: 6, invTotal: 36, botPosition: { x: 4, y: 5, z: 6 }, spawnerCount: 1, recordedAt: Date.now() }
         ],
-        spawners: [{ bot: 'TestBotA', spawnerNumber: 1, earned: 10, lifetimeEarned: 10, ratePerHour: 120.5, balanceBefore: 0, balanceAfter: 10, calculationStatus: 'calculated', recordedAt: Date.now() }],
-        lifetime: { totalEarned: 10, samples: 1 },
+        spawners: [{ bot: 'TestBotA', spawnerNumber: 1, earned: 10, ratePerHour: 120.5, balanceBefore: 0, balanceAfter: 10, calculationStatus: 'calculated', recordedAt: Date.now() }],
         generatedAt: new Date().toISOString(),
         secret: secret
       })

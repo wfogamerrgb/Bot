@@ -27,7 +27,6 @@ function seedUserColumn (sheet, col, header, value, formula) {
 const botsOnly = name => ({
   bots: [{ bot: name }],
   spawners: [],
-  lifetime: { totalEarned: 0, samples: 0 }
 })
 
 // A sheet mock with the fidelity the write path needs: cells can be empty,
@@ -129,7 +128,8 @@ function run ({ properties = { SPREADSHEET_ID }, failWrites = [] } = {}) {
       const sheet = makeSheet(name, { failWrites: failWrites.includes(name) })
       sheets.set(name, sheet)
       return sheet
-    }
+    },
+    deleteSheet: (sheet) => { sheets.delete(sheet.getName()) }
   }
   const sandbox = {
     SpreadsheetApp: {
@@ -177,7 +177,6 @@ const payload = {
   spawners: [
     { bot: 'BotA', spawnerNumber: 1, earned: 100, ratePerHour: 1200, status: 'calculated' }
   ],
-  lifetime: { totalEarned: 100, samples: 1 },
   generatedAt: '2026-01-01T00:00:00.000Z'
 }
 
@@ -197,15 +196,15 @@ test('doGet reports a spreadsheet that cannot be opened', () => {
   assert.match(health.spreadsheetError, /No permission to open/)
 })
 
-test('doPost replaces Bots, Spawners, and Lifetime and reports row counts', () => {
+test('doPost replaces Bots, Spawners, and Bans and reports row counts', () => {
   const { sandbox, sheet, post } = run()
   const result = post(payload)
   assert.equal(result.ok, true)
-  assert.deepEqual(result.written, { Bots: 2, Spawners: 1, Lifetime: 1, Bans: 0 })
+  assert.deepEqual(result.written, { Bots: 2, Spawners: 1, Bans: 0 })
   assert.equal(result.generatedAt, '2026-01-01T00:00:00.000Z')
   assert.deepEqual(sheet('Bots').rows[0], ['bot', 'rank', 'balance', 'botPosition', 'spawnerCount'])
   assert.deepEqual(sheet('Bots').rows[1], ['BotA', 'Member', 12.5, '{"x":1,"y":64,"z":-3}', 2])
-  assert.deepEqual(sheet('Lifetime').rows[1], [100, 1])
+  assert.equal(sheet('Lifetime'), undefined, 'the Lifetime tab is gone from the contract')
 })
 
 test('doPost uses the union of every row key so uneven rows still write', () => {
@@ -213,7 +212,6 @@ test('doPost uses the union of every row key so uneven rows still write', () => 
   const result = post({
     bots: [{ bot: 'BotA', rank: 'Member' }, { bot: 'BotB', balance: 5 }],
     spawners: [],
-    lifetime: { totalEarned: 0, samples: 0 }
   })
   assert.equal(result.ok, true)
   assert.deepEqual(sheet('Bots').rows[0], ['bot', 'rank', 'balance'])
@@ -221,19 +219,18 @@ test('doPost uses the union of every row key so uneven rows still write', () => 
   assert.deepEqual(sheet('Bots').rows[2], ['BotB', '', 5])
 })
 
-test('doPost survives an empty Lifetime object (the old code threw here)', () => {
+test('a payload with no lifetime key writes everything else', () => {
   const { sheet, post } = run()
-  const result = post({ bots: [{ bot: 'BotA' }], spawners: [], lifetime: {} })
+  const result = post({ bots: [{ bot: 'BotA' }], spawners: [] })
   assert.equal(result.ok, true)
-  assert.deepEqual(result.written, { Bots: 1, Spawners: 0, Lifetime: 0, Bans: 0 })
+  assert.deepEqual(result.written, { Bots: 1, Spawners: 0, Bans: 0 })
   assert.deepEqual(sheet('Bots').rows[1], ['BotA'])
-  assert.deepEqual(sheet('Lifetime').rows, [], 'an empty lifetime clears the tab instead of failing')
 })
 
 test('doPost clears stale rows instead of appending forever', () => {
   const { sheet, post } = run()
-  post({ bots: [{ bot: 'BotA' }, { bot: 'BotB' }], spawners: [], lifetime: { totalEarned: 0, samples: 0 } })
-  post({ bots: [{ bot: 'BotA' }], spawners: [], lifetime: { totalEarned: 0, samples: 0 } })
+  post({ bots: [{ bot: 'BotA' }, { bot: 'BotB' }], spawners: [] })
+  post({ bots: [{ bot: 'BotA' }], spawners: [] })
   const bots = sheet('Bots')
   assert.equal(bots.getLastRow(), 2, 'header + one data row — the departed bot is gone')
   assert.equal(bots.rows[1][0], 'BotA')
@@ -243,7 +240,7 @@ test('doPost clears stale rows instead of appending forever', () => {
 test('doPost truncates oversized cells instead of failing the write', () => {
   const { sheet, post } = run()
   const huge = 'x'.repeat(60000)
-  const result = post({ bots: [{ bot: 'BotA', note: huge }], spawners: [], lifetime: { totalEarned: 0, samples: 0 } })
+  const result = post({ bots: [{ bot: 'BotA', note: huge }], spawners: [] })
   assert.equal(result.ok, true)
   const written = String(sheet('Bots').rows[1][1])
   assert.ok(written.length < 50000, 'cell stays inside the Apps Script limit')
@@ -345,7 +342,7 @@ test('a new payload column is appended after your columns, never over them', () 
   post(botsOnly('BotA'))
   const bots = sheet('Bots')
   seedUserColumn(bots, 2, 'My Notes', 'mine')
-  post({ bots: [{ bot: 'BotA', balance: 5 }], spawners: [], lifetime: {} })
+  post({ bots: [{ bot: 'BotA', balance: 5 }], spawners: [] })
 
   assert.equal(bots.rows[0][1], 'My Notes', 'your column keeps its place')
   assert.equal(bots.rows[1][1], 'mine')
@@ -353,15 +350,16 @@ test('a new payload column is appended after your columns, never over them', () 
   assert.equal(bots.rows[1][2], 5)
 })
 
-// An empty payload used to call clearContents() on the whole tab, which wiped a
-// hand-made summary on a tab the script had never written to.
-test('an empty payload never clears a tab the script does not own', () => {
+// A tab the script no longer manages must be left exactly as it is — the
+// Lifetime tab from an older Code.gs copy included, since people may have kept
+// their own summary there.
+test('a tab the script no longer manages is never touched', () => {
   const { sandbox, post } = run()
   const lifetime = sandbox.SpreadsheetApp.openById(SPREADSHEET_ID).insertSheet('Lifetime')
   lifetime.getRange(1, 1, 2, 1).setValues([['My own summary'], ['do not clear me']])
-  const result = post({ bots: [{ bot: 'BotA' }], spawners: [], lifetime: {} })
+  const result = post({ bots: [{ bot: 'BotA' }], spawners: [] })
   assert.equal(result.ok, true)
-  assert.equal(result.written.Lifetime, 0)
+  assert.equal(result.written.Lifetime, undefined)
   assert.deepEqual(lifetime.rows[0], ['My own summary'])
   assert.deepEqual(lifetime.rows[1], ['do not clear me'])
 })
@@ -370,7 +368,7 @@ test('only the managed tabs are ever created', () => {
   const { sandbox, post } = run()
   post(payload)
   const names = sandbox.SpreadsheetApp.openById(SPREADSHEET_ID).getSheets().map(sheet => sheet.getName())
-  assert.deepEqual(names, ['Bots', 'Spawners', 'Lifetime', 'Bans'])
+  assert.deepEqual(names, ['Bots', 'Spawners', 'Bans'])
 })
 
 // ── Bans tab ────────────────────────────────────────────────────────────────
@@ -381,7 +379,6 @@ test('ban records are published to a Bans tab', () => {
   const result = post({
     bots: [],
     spawners: [],
-    lifetime: { totalEarned: 0, samples: 0 },
     bans: [
       { bot: 'Hypr_7_alt', kind: 'temporary', reason: 'Alt Farming (3rd)', caseId: '1129', duration: '29 days, 11 hours, 17 minutes', expiresAt: new Date(expiresAt).toISOString(), permanent: false, firstBannedAt: new Date(expiresAt).toISOString(), lastBannedAt: new Date(expiresAt).toISOString(), count: 2 },
       { bot: 'Hypr_7_core', kind: 'permanent', reason: 'cheating', caseId: '', duration: '', expiresAt: '', permanent: true, firstBannedAt: '', lastBannedAt: '', count: 1 }
@@ -412,62 +409,64 @@ test('ban records are published to a Bans tab', () => {
 
 test('an empty bans list leaves the Bans tab alone', () => {
   const { sheet, post } = run()
-  post({ bots: [{ bot: 'BotA' }], spawners: [], lifetime: {}, bans: [] })
+  post({ bots: [{ bot: 'BotA' }], spawners: [], bans: [] })
   assert.equal(sheet('Bans').getLastRow(), 0)
 })
 
 // ── Totals ──────────────────────────────────────────────────────────────────
 
-test('appends a TOTAL row summing balance, coins, and shards on Bots', () => {
+test('appends a TOTAL row summing the money, inventory, and earned columns on Bots', () => {
   const { sheet, post } = run()
   const result = post({
     bots: [
-      { bot: 'BotA', shards: 1200, coins: 900, balance: 1234.5 },
-      { bot: 'BotB', shards: 800, coins: 150, balance: 765.25 }
+      { bot: 'BotA', shards: 1200, coins: 900, balance: 1234.5, earned: 40, lifetimeEarned: 400, invUsed: 12 },
+      { bot: 'BotB', shards: 800, coins: 150, balance: 765.25, earned: 12, lifetimeEarned: 120, invUsed: 30 }
     ],
-    spawners: [],
-    lifetime: { totalEarned: 0, samples: 0 }
+    spawners: []
   })
   const bots = sheet('Bots')
-  // columns: bot(A), shards(B), coins(C), balance(D)
+  // columns: bot(A), shards(B), coins(C), balance(D), earned(E), lifetimeEarned(F), invUsed(G)
   assert.equal(result.written.Bots, 2, 'the TOTAL row is not counted as a data row')
   assert.equal(bots.rows[3][0], 'TOTAL')
   assert.equal(bots.formulaAt(4, 2), '=SUM(B2:B3)')
   assert.equal(bots.formulaAt(4, 3), '=SUM(C2:C3)')
   assert.equal(bots.formulaAt(4, 4), '=SUM(D2:D3)')
+  assert.equal(bots.formulaAt(4, 5), '=SUM(E2:E3)', 'the last measured window per bot')
+  assert.equal(bots.formulaAt(4, 6), '=SUM(F2:F3)', 'lifetimeEarned is the row that replaces the Lifetime tab')
+  assert.equal(bots.formulaAt(4, 7), '=SUM(G2:G3)', 'items held across the fleet')
   assert.equal(bots.formatAt(4, 4), '#,##0.00')
+  assert.equal(bots.formatAt(4, 7), '#,##0', 'slot counts stay whole numbers')
   assert.ok(bots.isBold(4, 4), 'the TOTAL row is bolded')
 })
 
-test('Spawners totals cover earned and lifetimeEarned but not the spawner number', () => {
+test('Spawners totals cover the measured window but not the spawner number', () => {
   const { sheet, post } = run()
   post({
     bots: [],
     spawners: [
-      { bot: 'BotA', spawnerNumber: 1, earned: 10, lifetimeEarned: 100 },
-      { bot: 'BotA', spawnerNumber: 2, earned: 5, lifetimeEarned: 50 }
-    ],
-    lifetime: { totalEarned: 150, samples: 2 }
+      { bot: 'BotA', spawnerNumber: 1, earned: 10, ratePerHour: 120 },
+      { bot: 'BotA', spawnerNumber: 2, earned: 5, ratePerHour: 60 }
+    ]
   })
   const spawners = sheet('Spawners')
-  // columns: bot(A), spawnerNumber(B), earned(C), lifetimeEarned(D)
+  // columns: bot(A), spawnerNumber(B), earned(C), ratePerHour(D)
   assert.equal(spawners.rows[3][0], 'TOTAL')
-  assert.equal(spawners.formulaAt(4, 3), '=SUM(C2:C3)')
-  assert.equal(spawners.formulaAt(4, 4), '=SUM(D2:D3)')
+  assert.equal(spawners.formulaAt(4, 3), '=SUM(C2:C3)', 'the last measured window, summed across spawners')
   assert.equal(spawners.formulaAt(4, 2), '', 'spawnerNumber is not summed')
+  assert.equal(spawners.formulaAt(4, 4), '', 'rates are not summed — the fleet rate lives on Bots')
+  assert.equal(spawners.rows[0].indexOf('lifetimeEarned'), -1, 'the unreliable per-spawner lifetime column is gone')
 })
 
-test('a single data row gets no TOTAL row (Lifetime stays a one-row summary)', () => {
+test('a single data row gets no TOTAL row', () => {
   const { sheet, post } = run()
-  post(payload)
-  assert.equal(sheet('Lifetime').getLastRow(), 2, 'header + the single summary row')
-  assert.equal(sheet('Lifetime').rows[1][0], 100)
+  post({ bots: [{ bot: 'BotA' }], spawners: [] })
+  assert.equal(sheet('Bots').getLastRow(), 2, 'header + the single data row, no TOTAL')
 })
 
 test('TOTALS_ROW moves the totals to the top or switches them off', () => {
   const top = run()
   top.sandbox.setTotalsRow('top')
-  const topResult = top.post({ bots: [{ bot: 'BotA' }, { bot: 'BotB' }], spawners: [], lifetime: {} })
+  const topResult = top.post({ bots: [{ bot: 'BotA' }, { bot: 'BotB' }], spawners: [] })
   assert.equal(top.sheet('Bots').rows[1][0], 'TOTAL', 'row 2 is the totals row')
   assert.equal(top.sheet('Bots').rows[2][0], 'BotA', 'data starts at row 3')
   assert.equal(top.sheet('Bots').formulaAt(2, 1), '', 'the label column shows the label, not a sum')
@@ -475,14 +474,14 @@ test('TOTALS_ROW moves the totals to the top or switches them off', () => {
 
   const off = run()
   off.sandbox.setTotalsRow('off')
-  off.post({ bots: [{ bot: 'BotA' }, { bot: 'BotB' }], spawners: [], lifetime: {} })
+  off.post({ bots: [{ bot: 'BotA' }, { bot: 'BotB' }], spawners: [] })
   assert.equal(off.sheet('Bots').getLastRow(), 3, 'header + two data rows, no TOTAL row')
 })
 
 test('TOTALS_COLUMNS narrows which columns are summed', () => {
   const { sandbox, sheet, post } = run()
   sandbox.setTotalsColumns(['balance'])
-  post({ bots: [{ bot: 'BotA', coins: 1, balance: 2 }, { bot: 'BotB', coins: 3, balance: 4 }], spawners: [], lifetime: {} })
+  post({ bots: [{ bot: 'BotA', coins: 1, balance: 2 }, { bot: 'BotB', coins: 3, balance: 4 }], spawners: [] })
   const bots = sheet('Bots')
   // columns: bot(A), coins(B), balance(C)
   assert.equal(bots.formulaAt(4, 3), '=SUM(C2:C3)')
@@ -500,7 +499,6 @@ test('epoch timestamps become real dates instead of 1758067200000', () => {
       { bot: 'BotB', recordedAt: when, lastRunAt: '2026-09-17T00:45:43.000Z' }
     ],
     spawners: [],
-    lifetime: { totalEarned: 0, samples: 0 }
   })
   const bots = sheet('Bots')
   // columns: bot(A), recordedAt(B), lastRunAt(C)
@@ -513,14 +511,14 @@ test('epoch timestamps become real dates instead of 1758067200000', () => {
 
 test('an unparseable timestamp falls back to plain text', () => {
   const { sheet, post } = run()
-  post({ bots: [{ bot: 'BotA', recordedAt: 'sometime' }, { bot: 'BotB', recordedAt: null }], spawners: [], lifetime: {} })
+  post({ bots: [{ bot: 'BotA', recordedAt: 'sometime' }, { bot: 'BotB', recordedAt: null }], spawners: [] })
   assert.equal(sheet('Bots').rows[1][1], 'sometime')
   assert.equal(sheet('Bots').rows[2][1], '')
 })
 
 test('owned columns get number formats; text columns get none', () => {
   const { sheet, post } = run()
-  post({ bots: [{ bot: 'BotA', balance: 1234.5, coins: 900, rank: 'Member' }, { bot: 'BotB', balance: 1, coins: 2, rank: 'Regent' }], spawners: [], lifetime: {} })
+  post({ bots: [{ bot: 'BotA', balance: 1234.5, coins: 900, rank: 'Member' }, { bot: 'BotB', balance: 1, coins: 2, rank: 'Regent' }], spawners: [] })
   const bots = sheet('Bots')
   // columns: bot(A), balance(B), coins(C), rank(D)
   assert.equal(bots.formatAt(2, 2), '#,##0.00')
@@ -532,18 +530,18 @@ test('owned columns get number formats; text columns get none', () => {
 test('NUMBER_FORMATS=off leaves your own number formatting alone', () => {
   const { sandbox, sheet, post } = run()
   sandbox.setNumberFormats('off')
-  post({ bots: [{ bot: 'BotA', balance: 1 }, { bot: 'BotB', balance: 2 }], spawners: [], lifetime: {} })
+  post({ bots: [{ bot: 'BotA', balance: 1 }, { bot: 'BotB', balance: 2 }], spawners: [] })
   assert.equal(sheet('Bots').formatAt(2, 2), '')
 })
 
 test('TIMESTAMP_FORMAT is applied only when you set it', () => {
   const plain = run()
-  plain.post({ bots: [{ bot: 'BotA', recordedAt: 1000 }, { bot: 'BotB', recordedAt: 2000 }], spawners: [], lifetime: {} })
+  plain.post({ bots: [{ bot: 'BotA', recordedAt: 1000 }, { bot: 'BotB', recordedAt: 2000 }], spawners: [] })
   assert.equal(plain.sheet('Bots').formatAt(2, 2), '', 'the spreadsheet locale format is used by default')
 
   const forced = run()
   forced.sandbox.setTimestampFormat('yyyy-mm-dd hh:mm')
-  forced.post({ bots: [{ bot: 'BotA', recordedAt: 1000 }, { bot: 'BotB', recordedAt: 2000 }], spawners: [], lifetime: {} })
+  forced.post({ bots: [{ bot: 'BotA', recordedAt: 1000 }, { bot: 'BotB', recordedAt: 2000 }], spawners: [] })
   assert.equal(forced.sheet('Bots').formatAt(2, 2), 'yyyy-mm-dd hh:mm')
   assert.equal(forced.sandbox.clearTimestampFormat(), 'TIMESTAMP_FORMAT cleared — dates use the spreadsheet locale format')
 })
@@ -555,7 +553,7 @@ test('doGet and the POST response report the owned layout', () => {
   const result = post(botsOnly('BotA'))
   assert.deepEqual(result.layout.Bots, { bot: 'A' })
   const health = JSON.parse(sandbox.doGet().getContent())
-  assert.equal(health.version, 3)
+  assert.equal(health.version, 4)
   assert.deepEqual(health.layout.Bots, ['bot'])
   assert.equal(health.totalsRow, 'bottom')
   assert.equal(health.numberFormats, 'custom')
@@ -568,6 +566,18 @@ test('renaming an owned header makes the script append a fresh column', () => {
   bots.getRange(1, 1).setValues([['Account']])
   post(botsOnly('BotA'))
   assert.deepEqual([bots.rows[0][0], bots.rows[0][1]], ['Account', 'bot'], 'the renamed column is left to you')
+})
+
+// Deleting a tab is never automatic: the push path leaves the retired Lifetime
+// tab alone, and this helper is the explicit, run-once way to remove it.
+test('removeLifetimeTab deletes the retired tab only when it is asked to', () => {
+  const { sandbox, sheet, post } = run()
+  sandbox.SpreadsheetApp.openById(SPREADSHEET_ID).insertSheet('Lifetime')
+  post(payload)
+  assert.ok(sheet('Lifetime'), 'a push never deletes it')
+  assert.match(sandbox.removeLifetimeTab(), /tab removed/)
+  assert.equal(sheet('Lifetime'), undefined)
+  assert.equal(sandbox.removeLifetimeTab(), 'No Lifetime tab to remove.')
 })
 
 test('resetLayout hands the owned columns back to you', () => {

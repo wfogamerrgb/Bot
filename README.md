@@ -125,7 +125,7 @@ and `afk=now|off|<seconds>` — so:
 
 ```text
 /crates-all 5 purple dump=off afk=now   5 bots, no dump, AFK the moment each finishes
-/crates-solo B dump=Smith                one bot, dump at Smith
+/crates-solo B dump=player:Smith                one bot, dump at Smith
 /crates-all dump=home afk=off            dump via /home stash, then stay there
 /crates-all dump=hidden                  arm the hidden chain, stay put
 ```
@@ -156,13 +156,12 @@ it into an Apps Script project, run `setSpreadsheetId('<id>')` once in the
 editor, then deploy it as a web app with **Execute as: me** and **Who has
 access: Anyone**, and set the resulting `/exec` URL as `DATA_WEBHOOK_URL`.
 
-- `doPost` maintains **only its own columns** on the `Bots`, `Spawners`,
-  `Lifetime`, and `Bans` tabs — never the whole tab. The header row is the union of every
-  row's keys, so rows that differ (a baseline row with no rate yet, a bot with no
-  rank yet) can no longer throw mid-write and leave the sheet stale, and an empty
-  `lifetime` object no longer aborts the run. It answers with JSON —
-  `{ ok, written: { Bots, Spawners, Lifetime }, layout, errors: [ ... ] }` — and
-  the bot logs the row counts it reported, so a push is verifiable from the
+- `doPost` maintains **only its own columns** on the `Bots`, `Spawners`, and
+  `Bans` tabs — never the whole tab. The header row is the union of every row's
+  keys, so rows that differ (a baseline row with no rate yet, a bot with no rank
+  yet) can no longer throw mid-write and leave the sheet stale. It answers with
+  JSON — `{ ok, written: { Bots, Spawners, Bans }, layout, errors: [ ... ] }` —
+  and the bot logs the row counts it reported, so a push is verifiable from the
   dashboard log.
 - Opening the `/exec` URL in a browser (`doGet`) returns a health JSON with the
   spreadsheet id, tab names, and whether a secret is required. Seeing a Google
@@ -195,8 +194,11 @@ push writes the columns whose headers come from its payload (`bot`, `balance`,
   payload stopped sending is emptied instead of left stale.
 - **A new payload column is appended to the right of yours**, never written over
   the top of one.
-- **Only `Bots`, `Spawners`, `Lifetime`, and `Bans` are ever opened or created.**
-  Your own tabs are never read, created, or modified.
+- **Only `Bots`, `Spawners`, and `Bans` are ever opened or created.** Your own
+  tabs are never read, created, or modified — including a `Lifetime` tab left
+  over from an older `Code.gs`, which the script simply stops touching. Run
+  `removeLifetimeTab()` once in the editor if you want that leftover tab gone;
+  no push ever deletes a sheet for you.
 - **Fonts, colours, borders, notes, and conditional formatting are never set or
   cleared.** The script uses `clearContents()`, which preserves formatting, and
   never calls `clear()`. Setting `NUMBER_FORMATS` to `off` also stops it from
@@ -222,9 +224,21 @@ Useful when you keep your own totals, lookups, and diffs next to the data:
 #### Totals row
 
 A `TOTAL` row of live `=SUM()` formulas is appended under the data, bolded:
-`balance`, `coins`, and `shards` on **Bots**; `earned` and `lifetimeEarned` on
-**Spawners**. Because they are formulas, they keep working if you edit a value.
-A tab with a single data row (Lifetime) gets no totals row.
+`balance`, `coins`, `shards`, `invUsed`, `earned`, and `lifetimeEarned` on
+**Bots**, plus `earned` on **Spawners**. Because they are formulas, they keep
+working if you edit a value.
+
+Which of those sums answer "how much have I earned?":
+
+- **`lifetimeEarned` on `Bots` is the all-time number.** It accumulates on the
+  bot row, where the balance is actually measured, run after run and restart
+  after restart. `SUM(lifetimeEarned)` replaces the old `Lifetime` tab.
+- **`earned` on `Bots` is the last `/spawners` pass**, so it is the fresh one to
+  plot or alert on.
+- **`SUM(earned)` on `Spawners` totals the last pass across every spawner**, not
+  all time — see [Lifetime earnings](#lifetime-earnings-and-why-the-sums-add-up).
+
+A tab with a single data row gets no totals row (there is nothing to add up).
 
 | Helper | Effect |
 | --- | --- |
@@ -268,6 +282,12 @@ in a formula:
 | `shards` | `/shards` | Shards held |
 | `x`, `y`, `z` | live entity position | Three numbers, not one `{"x":1,"y":64,"z":-3}` blob — so you can sort by height, or diff positions to spot a bot that has wandered |
 | `dimension` | current world | Coordinates are meaningless without it on a multi-world server |
+| `earned` | `/spawners` | Money the bot made over the last pass — the window total, not a per-spawner slice |
+| `lifetimeEarned` | `/spawners` | The running all-time total; this is the number the old `Lifetime` tab tried to be |
+| `ratePerHour` | `/spawners` | That window's earnings extrapolated to an hour |
+| `invUsed` | live inventory | Storage slots in use out of 36 (27 main + 9 hotbar) |
+| `invFree` | live inventory | Slots still free — the "is this bot full" number |
+| `invTotal` | constant | 36, so `invUsed`/`invTotal` is a percentage you can format directly |
 | `spawnerCount` | `/spawners` | How many spawners were found on the plot |
 | `successfulSpawners` | `/spawners` | How many of those were fully clicked, so a partial pass is visible instead of implied |
 | `runStartedAt` | `/spawners` | When that pass began |
@@ -290,23 +310,48 @@ next `/data`. That hands the old `botPosition` column back to you (delete it
 whenever you like) and lets the script append `x`, `y`, `z`, and `dimension` at
 the end. Your existing columns are found by header name and keep their place.
 
-#### What the `Lifetime` tab means
+#### Lifetime earnings, and why the sums add up
 
-`Lifetime` is a one-row running summary of **every spawner the bot has ever
-recorded**, across all bots — not just the ones online now:
+The old `Lifetime` tab summed a `lifetimeEarned` column that sat on **spawner**
+rows, and that could not add up:
 
-| Column | Meaning |
-| --- | --- |
-| `totalEarned` | Sum of each spawner row's `lifetimeEarned` (falling back to `earned` for rows recorded before lifetime tracking existed) |
-| `samples` | How many spawner rows contributed, so you can tell "earned 0" from "never measured" |
+- `spawnerNumber` is the position in a distance-sorted list, not a stable
+  identity — when a bot moved, or a plot changed, the same column accumulated
+  different blocks' earnings.
+- The number being sampled is the bot's **whole-player** balance (`/bal`),
+  measured around one click at a time. Each spawner row only ever held a slice of
+  it, so a per-spawner "lifetime" was a share of one measurement pretending to be
+  a measurement of its own.
 
-Each spawner row's own `lifetimeEarned` is a running total kept in the bot's
-local state file and incremented on every `/spawners` pass, so it survives the
-`Bots` and `Spawners` tabs being rewritten. `earned` is the current pass only;
-`lifetimeEarned` is the accumulate-forever number; `Lifetime.totalEarned` is the
-sum of those across the roster. It is measured in the same unit as `balance` —
-money the spawners produced, not your current holdings — so it will not match a
-balance sum, and a bot that was removed from the roster still counts toward it.
+So the running total moved to the row where the measurement happens — the **bot
+row** (`lifetimeEarned`, `earned`, `ratePerHour` on `Bots`) — and the sheet's own
+`TOTAL` row does the summing. Everything still lines up:
+
+| Column | Window | Adds up to |
+| --- | --- | --- |
+| `Bots.lifetimeEarned` | all time, per bot | `SUM` = every bot, ever measured — the number the `Lifetime` tab was for |
+| `Bots.earned` | the last `/spawners` pass | `SUM` = what the fleet earned since the previous pass |
+| `Spawners.earned` | that row's last measured window | `SUM` = the same last pass, split per spawner (bot-level total and spawner-level total are consistent by construction) |
+| `Spawners.ratePerHour` | that row's window | not summed — rates are already per hour, and the fleet figure is `Bots.ratePerHour` |
+
+Two details worth knowing when reading the numbers:
+
+- **The first `/spawners` pass only records baselines.** `earned` is a change, so
+  it needs a previous balance; the first pass after a restart establishes it and
+  `lifetimeEarned` stays put that run.
+- **A row a pass did not visit has its `earned` and `ratePerHour` cleared** and is
+  marked `not seen this run`, so it cannot keep contributing to the spawner sum
+  forever. A pass cut short by a disconnect clears nothing — a partial pass is
+  not evidence that a spawner is gone.
+- Both numbers are measured in the same unit as `balance` — money the spawners
+  produced, not your current holdings — so they will not match a balance sum.
+
+**Migrating:** redeploy `Code.gs` (Deploy → Manage deployments → pencil →
+Version: **New version** → Deploy) and the `Lifetime` tab simply stops being
+written; the `earned` / `lifetimeEarned` columns then appear on `Bots` on the next
+`/data`. Any previous per-spawner `lifetimeEarned` column on `Spawners` is emptied
+automatically, because the payload no longer sends it. Run `removeLifetimeTab()`
+in the editor if you want the leftover tab deleted as well.
 
 - `setWebhookSecret('<value>')` in the editor plus `DATA_WEBHOOK_SECRET=<value>`
   in `.env` enables the shared-secret check. Apps Script web apps cannot read

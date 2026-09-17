@@ -394,14 +394,14 @@ const CRATES_ALL_STEP_WAIT_MS = parseInt(process.env.CRATES_ALL_STEP_WAIT_MS || 
 // What /crates-all does once the crates are done. Defaults reproduce the
 // original behaviour exactly (TPA to TPA_MAIN_PLAYER → dump into nearby chests
 // → /warp afk after 15s), so an existing .env keeps working unchanged:
-//   CRATES_ALL_DUMP         off | tpa (default) | home | hidden | <player name>
+//   CRATES_ALL_DUMP         off | tpa (default) | home | hidden | player:<name>
 //   CRATES_ALL_AFK_WARP     false leaves each bot wherever the sequence ended
 //   CRATES_ALL_AFK_DELAY_MS 0 warps to AFK the instant the routine finishes
 // The same two knobs are available per run as `dump=` / `afk=` flags.
 const CRATES_ALL_DUMP_ENV = parseCratesAllDump(process.env.CRATES_ALL_DUMP)
 const CRATES_ALL_AFK_WARP = /^(1|true|yes|on)$/i.test(process.env.CRATES_ALL_AFK_WARP ?? 'true')
 const CRATES_ALL_AFK_DELAY_MS = readInt(process.env.CRATES_ALL_AFK_DELAY_MS, 15000, 0, 2147483647)
-const CRATES_ALL_FLAGS_USAGE = '[dump=off|tpa|home|hidden|<player>] [afk=now|off|<seconds>]'
+const CRATES_ALL_FLAGS_USAGE = '[dump=off|tpa|home|hidden|player:<name>] [afk=now|off|<seconds>]'
 const CRATES_ALL_USAGE = `/crates-all [n] [color] ${CRATES_ALL_FLAGS_USAGE}`
 const CRATES_ALL_SOLO_USAGE = `/crates-solo [bot name or number] [color] ${CRATES_ALL_FLAGS_USAGE}`
 
@@ -3027,7 +3027,7 @@ const COMMANDS = {
 '/crates [color]': `Warp to crates, find + walk to the nearest shulker box of [color] (default: ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')}, within ${CRATE_SCAN_RADIUS} blocks) and right-click it; falls back to ${WARP_AFK} if not found or unreachable. [color] can be a name like "purple" or a full block id like "purple_shulker_box"`,
 '/crates-loop [n] [color]': 'Run /crates repeatedly (default: until failure). Specify n for a fixed count and/or a crate [color]',
 '/shardshop-loop [slot]': `Repeatedly run ${SHARDSHOP_COMMAND} until the server signals it's empty (grep: SHARDSHOP_STOP_PHRASES) or hits the ${SHARDSHOP_LOOP_MAX_RUNS}-run safety cap; optional [slot] overrides default GUI slot`,
-'/crates-all [n] [color] [dump=…] [afk=…]': `Run shardshop → crates → dump on bots 1 through n (default: all bots) targeting crate [color] (default: ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')}), ${(CRATES_ALL_STAGGER_MS / 1000).toFixed(0)}s apart so they don't hit the server at once. dump=off|tpa|home|hidden|<player> chooses the dump step and afk=now|off|<seconds> chooses the AFK warp; both override CRATES_ALL_DUMP / CRATES_ALL_AFK_WARP / CRATES_ALL_AFK_DELAY_MS for that run`,
+'/crates-all [n] [color] [dump=…] [afk=…]': `Run shardshop → crates → dump on bots 1 through n (default: all bots) targeting crate [color] (default: ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')}), ${(CRATES_ALL_STAGGER_MS / 1000).toFixed(0)}s apart so they don't hit the server at once. dump=off|tpa|home|hidden|player:<name> chooses the dump step and afk=now|off|<seconds> chooses the AFK warp; both override CRATES_ALL_DUMP / CRATES_ALL_AFK_WARP / CRATES_ALL_AFK_DELAY_MS for that run`,
 '/crates-solo [bot] [color] [dump=…] [afk=…]': 'Run shardshop → crates → dump on just one bot (default: active bot) targeting crate [color] — not all bots. Takes the same dump= / afk= flags as /crates-all',
 '/spawners': `Without moving, right-click every ${SPAWNER_BLOCK.replace(/_/g, ' ')} already within reach (${SPAWNER_REACH} blocks), clicking GUI slot ${SPAWNER_SLOT_FIRST} then slot ${SPAWNER_SLOT_SECOND} on each one`,
 '/data': 'Compile all saved bot/spawner data, save the local JSON snapshot, and push the current snapshot to the Google Sheets Apps Script webhook. Subcommands: /data check (verify the webhook deployment end-to-end), /data status (show webhook config + tracked counts)',
@@ -3895,9 +3895,19 @@ positions.sort((a, b) => bot.entity.position.distanceTo(a) - bot.entity.position
 logFor(id, `{cyan-fg}› Found ${positions.length} spawner(s) in reach — clicking slot ${SPAWNER_SLOT_FIRST} then ${SPAWNER_SLOT_SECOND} on each…{/cyan-fg}`)
 
 let done = 0
+// A run that finishes knows which spawner rows it did NOT visit; a run cut short
+// by a disconnect knows nothing, and must not clear anything.
+let completed = true
+let earnSum = 0
+let sawBalance = false
+// The earliest last-sample the run measured from. A spawner's `earned` is the
+// balance change since THAT row was last sampled (usually the previous run), so
+// the honest elapsed time for the sum is this window — not the duration of the
+// clicking itself.
+let windowStart = Infinity
 const runStartedAt = Date.now()
 for (let idx = 0; idx < positions.length; idx++) {
-if (!bot.entity) { logFor(id, `{red-fg}✗ ${id} despawned during /spawners — stopping.{/red-fg}`); break }
+if (!bot.entity) { logFor(id, `{red-fg}✗ ${id} despawned during /spawners — stopping.{/red-fg}`); completed = false; break }
 const pos = positions[idx]
 logFor(id, `{cyan-fg}› Spawner ${idx + 1}/${positions.length} at ${pos.x}, ${pos.y}, ${pos.z}…{/cyan-fg}`)
 const result = await clickSpawnerOnce(bot, id, pos)
@@ -3905,6 +3915,7 @@ if (result.ok) done++
 const spawnerNumber = idx + 1
 const key = `${id}:${spawnerNumber}`
 const previous = dataState.spawners[key]
+if (Number.isFinite(previous?.recordedAt)) windowStart = Math.min(windowStart, previous.recordedAt)
 const balance = Number.isFinite(result.balanceAfter) ? result.balanceAfter : null
 const production = dataStore.calculateProduction(previous, balance, Date.now())
 dataStore.upsertSpawner(dataState, {
@@ -3917,16 +3928,34 @@ dataStore.upsertSpawner(dataState, {
   balanceBefore: result.balanceBefore,
   balance,
   earned: production.earned,
-  lifetimeEarned: (Number.isFinite(previous?.lifetimeEarned) ? previous.lifetimeEarned : 0) + (Number.isFinite(production.earned) ? production.earned : 0),
   ratePerHour: production.ratePerHour,
   calculationStatus: production.status,
   successful: result.ok
 })
+if (Number.isFinite(production.earned)) { earnSum += production.earned; sawBalance = true }
 persistData()
 if (idx < positions.length - 1) await new Promise(r => setTimeout(r, SPAWNER_NEXT_DELAY_MS))
 }
 
+// The number being measured is the bot's WHOLE-player balance, sampled around
+// one click at a time. Every spawner row therefore holds a slice of the same
+// measurement and only their sum is real, so the window total is accumulated on
+// the BOT row — where the measurement belongs — and the old per-spawner
+// `lifetimeEarned` is gone. (spawnerNumber is the ordinal in a distance-sorted
+// list, not a stable identity, so those per-spawner totals were accumulating the
+// wrong windows onto the wrong blocks.)
+const runEarned = sawBalance ? earnSum : null
+if (completed) {
+  Object.values(dataState.spawners).forEach(row => {
+    if (row.bot !== id || row.spawnerNumber <= positions.length) return
+    if (row.earned == null && row.ratePerHour == null) return
+    dataStore.upsertSpawner(dataState, { bot: id, spawnerNumber: row.spawnerNumber, earned: null, ratePerHour: null, calculationStatus: 'not seen this run' })
+  })
+}
+
 logFor(id, `{green-fg}✓ /spawners finished — ${done}/${positions.length} spawner(s) fully clicked.{/green-fg}`)
+const previousBot = dataState.bots[id]
+const windowMs = Number.isFinite(windowStart) ? Date.now() - windowStart : 0
 dataStore.upsertBot(dataState, {
   bot: id,
   recordedAt: Date.now(),
@@ -3936,6 +3965,13 @@ dataStore.upsertBot(dataState, {
   // the /spawners pass alone.
   spawnerCount: positions.length,
   successfulSpawners: done,
+  // The measured window at the level it was measured (this run), the running
+  // total that replaces the old Lifetime tab, and the rate derived from the
+  // window instead of from a single spawner's slice of it.
+  earned: runEarned,
+  lifetimeEarned: (Number.isFinite(previousBot?.lifetimeEarned) ? previousBot.lifetimeEarned : 0) + (runEarned || 0),
+  ratePerHour: runEarned !== null && windowMs > 0 ? runEarned * 3600000 / windowMs : null,
+  ...botInventoryColumns(bot),
   runStartedAt
 })
 persistData()
@@ -4298,9 +4334,18 @@ async function queryRank (id) {
 // -- Inventory slot usage ---------------------------------------------------
 // Player storage = 27 main inventory slots (9-35) + 9 hotbar slots (36-44)
 // = 36 slots. Armor (5-8), offhand (45), the crafting grid (1-4) and the
-// craft result (0) are deliberately NOT counted, so "N free" only ever
+// result (0) are deliberately NOT counted, so "N free" only ever
 // refers to real storage.
 const INVENTORY_STORAGE_SLOTS = 36
+
+// The same numbers for the spreadsheet: "how full is this bot" is what a filled
+// inventory asks, and it is not derivable from anything else the sheet carries.
+// Published only while the bot is actually spawned, so 0-of-36 and "no data yet"
+// can never look alike.
+function botInventoryColumns (bot) {
+  const inv = inventorySlotUsage(bot)
+  return inv.used === null ? {} : { invUsed: inv.used, invFree: inv.free, invTotal: inv.total }
+}
 function inventorySlotUsage (bot) {
   const slots = bot?.inventory?.slots
   if (!slots || typeof slots.length !== 'number') {
@@ -4334,6 +4379,7 @@ async function compileAndPushData (log = () => {}, onlyIds = null) {
       rank: rank || 'N/A',
       shards, coins, balance: money,
       ...dataStore.flattenPosition(botLocation(entry.bot)),
+      ...botInventoryColumns(entry.bot),
       trackedSpawners: Object.values(dataState.spawners).filter(row => row.bot === name).length,
       // Survivors of a ban keep banned:true in the data state, so a bot that is
       // back online must publish an explicit false rather than a blank cell.
@@ -4743,7 +4789,7 @@ if (trimmed === '/data' || trimmed.startsWith('/data ')) {
     logDataStatus(message => logInfo(message))
     return
   }
-  logInfo('Compiling saved bot, spawner, production, location, and lifetime data…')
+  logInfo('Compiling saved bot, spawner, production, location, and inventory data…')
   compileAndPushData(message => logInfo(message)).catch(err => logError(`Data compilation failed: ${sanitize(err.message)}`))
   return
 }

@@ -24,15 +24,20 @@ test('N/A balance skips production calculation', () => {
   assert.equal(result.status, 'N/A balance')
 })
 
-test('snapshot preserves bot and spawner rows plus lifetime totals', () => {
+test('snapshot carries the bot and spawner rows and nothing that pretends to total them', () => {
   const state = store.emptyState()
-  store.upsertBot(state, { bot: 'A', rank: 'Member' })
+  store.upsertBot(state, { bot: 'A', rank: 'Member', lifetimeEarned: 10 })
   store.upsertSpawner(state, { bot: 'A', spawnerNumber: 1, earned: 4 })
   store.upsertSpawner(state, { bot: 'A', spawnerNumber: 2, earned: 6 })
   const snapshot = store.buildSnapshot(state, 0)
   assert.equal(snapshot.bots.length, 1)
   assert.equal(snapshot.spawners.length, 2)
-  assert.deepEqual(snapshot.lifetime, { totalEarned: 10, samples: 2 })
+  // The old `lifetime` block was a sheet tab summed from a per-spawner column
+  // that could not add up. The running total now lives on the bot row, and the
+  // spreadsheet's TOTAL row does the summing.
+  assert.equal(snapshot.lifetime, undefined)
+  assert.equal(snapshot.bots[0].lifetimeEarned, 10)
+  assert.deepEqual(Object.keys(snapshot).sort(), ['bans', 'bots', 'generatedAt', 'spawners', 'version'])
 })
 
 // What lands in the Google Sheet is a display document: a raw epoch millisecond
@@ -40,14 +45,15 @@ test('snapshot preserves bot and spawner rows plus lifetime totals', () => {
 test('the published snapshot carries readable times and rounded money', () => {
   const state = store.emptyState()
   store.upsertBot(state, { bot: 'A', recordedAt: Date.UTC(2026, 8, 17, 0, 45, 43), balance: 1234.5678 })
-  store.upsertSpawner(state, { bot: 'A', spawnerNumber: 1, recordedAt: 1000, ratePerHour: 33333.333333333336, lifetimeEarned: 10.006 })
+  store.upsertBot(state, { bot: 'A', recordedAt: Date.UTC(2026, 8, 17, 0, 45, 43), lifetimeEarned: 10.006 })
+  store.upsertSpawner(state, { bot: 'A', spawnerNumber: 1, recordedAt: 1000, ratePerHour: 33333.333333333336 })
 
   const snapshot = store.buildSnapshot(state, Date.UTC(2026, 8, 17, 0, 45, 43))
   assert.equal(snapshot.bots[0].recordedAt, '2026-09-17T00:45:43.000Z', 'epoch ms is not readable in a cell')
   assert.equal(snapshot.bots[0].balance, 1234.57)
+  assert.equal(snapshot.bots[0].lifetimeEarned, 10.01)
   assert.equal(snapshot.spawners[0].recordedAt, '1970-01-01T00:00:01.000Z')
   assert.equal(snapshot.spawners[0].ratePerHour, 33333.33)
-  assert.equal(snapshot.lifetime.totalEarned, 10.01)
 })
 
 // The local state file is what production rates are calculated from, so it must
@@ -236,7 +242,7 @@ test('webhook sends the shared secret as a query parameter and a body field', as
   let request
   await store.pushWebhook('https://script.test/exec?foo=1', { bots: [] }, async (url, options) => {
     request = { url, options }
-    return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, written: { Bots: 0, Spawners: 0, Lifetime: 0 } }) }
+    return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, written: { Bots: 0, Spawners: 0, Bans: 0 } }) }
   }, { secret: 's3cret value' })
   assert.equal(request.url, 'https://script.test/exec?foo=1&secret=s3cret%20value')
   assert.equal(JSON.parse(request.options.body).secret, 's3cret value')
@@ -246,10 +252,10 @@ test('webhook reports the rows the Apps Script endpoint actually wrote', async (
   const response = await store.pushWebhook('https://script.test/exec', { bots: [] }, async () => ({
     ok: true,
     status: 200,
-    text: async () => JSON.stringify({ ok: true, written: { Bots: 3, Spawners: 8, Lifetime: 1 } })
+    text: async () => JSON.stringify({ ok: true, written: { Bots: 3, Spawners: 8, Bans: 1 } })
   }))
   assert.equal(response.pushed, true)
-  assert.deepEqual(response.response.written, { Bots: 3, Spawners: 8, Lifetime: 1 })
+  assert.deepEqual(response.response.written, { Bots: 3, Spawners: 8, Bans: 1 })
 })
 
 // A web app that is not deployed with "Who has access: Anyone" answers with an

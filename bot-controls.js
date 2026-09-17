@@ -47,8 +47,8 @@ function parseDataArgs(args) {
 // `/crates-all` and `/crates-solo` accept trailing `key=value` flags on top of
 // their positional args. Parsed here — beside the other arg parsers — so the
 // .env defaults and the per-command overrides share one vocabulary:
-//   dump=off | tpa | home | hidden | <player>   what happens after the crates
-//   afk=now | off | <seconds>                   what happens after the dump
+//   dump=off | tpa | home | hidden | player:<name>   what happens after crates
+//   afk=now | off | <seconds>                       what happens after the dump
 function parseCratesAllDump(value) {
   const raw = String(value == null ? '' : value).trim()
   const lower = raw.toLowerCase()
@@ -61,8 +61,10 @@ function parseCratesAllDump(value) {
     const name = raw.slice('player:'.length).trim()
     return name ? { dump: 'tpa', target: name, unknown: null } : { dump: 'tpa', target: null, unknown: raw }
   }
-  // Anything else is a TPA target, so `dump=Smith` reads as "dump at Smith".
-  return { dump: 'tpa', target: raw, unknown: null }
+  // Anything else is a typo, not a player name. A target must say so
+  // (`dump=player:Smith`) because a mistyped keyword that silently teleports a
+  // bot to a player named "hmeo" is exactly what this parser exists to prevent.
+  return { dump: 'tpa', target: null, unknown: raw }
 }
 
 function parseCratesAllAfk(value) {

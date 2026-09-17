@@ -131,22 +131,17 @@ function publishRow (row) {
   return out
 }
 
+// One object per tab. There is no `lifetime` block any more: it was a single
+// row summing a per-spawner `lifetimeEarned` that could not add up (the balance
+// it came from is the whole bot's, sampled around one click at a time), so the
+// running total lives on the Bots tab, where the measurement is actually taken,
+// and the sheet's own TOTAL row sums it.
 function buildSnapshot (state, now = Date.now()) {
-  const spawners = Object.values(state.spawners)
-  const totals = spawners.reduce((out, row) => {
-    const lifetime = Number.isFinite(row.lifetimeEarned) ? row.lifetimeEarned : row.earned
-    if (Number.isFinite(lifetime)) {
-      out.totalEarned += lifetime
-      out.samples += 1
-    }
-    return out
-  }, { totalEarned: 0, samples: 0 })
   return {
     version: state.version,
     generatedAt: new Date(now).toISOString(),
     bots: Object.values(state.bots).map(publishRow),
-    spawners: spawners.map(publishRow),
-    lifetime: { totalEarned: roundPublished(totals.totalEarned), samples: totals.samples },
+    spawners: Object.values(state.spawners).map(publishRow),
     bans: (state.bans || []).map(publishRow)
   }
 }

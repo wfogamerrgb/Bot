@@ -1042,7 +1042,7 @@ test('/crates-all options default to the env values and are overridden per run',
   assert.deepEqual(withEnvDefaults[0], { id: 'A', plan: { dump: 'home', target: '', afkWarp: true, afkDelayMs: 0 } })
   assert.match(logsText(r), /Starting \/crates-all for 3 bot\(s\) \[1–3\], 30s apart — dump via \/home stash, immediate \/warp afk…/)
 
-  r.run("captured = []; handleCommand('/crates-all 1 purple dump=Smith afk=off')")
+  r.run("captured = []; handleCommand('/crates-all 1 purple dump=player:Smith afk=off')")
   runPendingTimers(r)
   await flushMicrotasks()
   const withFlags = captured()
@@ -1060,6 +1060,17 @@ test('/crates-solo takes the same dump=/afk= flags', async () => {
   r.run("handleCommand('/crates-solo B dump=off afk=now')")
   await flushMicrotasks()
   assert.deepEqual(captured(), [{ id: 'B', plan: { dump: 'off', target: '', afkWarp: true, afkDelayMs: 0 } }])
+
+  // A bare word is not a target: it is a typo, and a typo must not teleport a
+  // bot to a player whose name happens to match it.
+  r.run("captured = []; handleCommand('/crates-solo B dump=Smith')")
+  await flushMicrotasks()
+  assert.deepEqual(captured(), [])
+  assert.match(logsText(r), /Unknown option "dump=Smith"/)
+
+  r.run("captured = []; handleCommand('/crates-solo B dump=player:Smith afk=off')")
+  await flushMicrotasks()
+  assert.deepEqual(captured(), [{ id: 'B', plan: { dump: 'tpa', target: 'Smith', afkWarp: false, afkDelayMs: 15000 } }])
 
   // A token the parser cannot read must warn and run nothing at all — the
   // whole point of reporting instead of guessing.
@@ -1128,4 +1139,57 @@ test('/play embeds the client once a build exists', async () => {
   assert.match(res.body, /<iframe/)
   assert.doesNotMatch(res.body, /build not found/)
   try { wcModule.stopWebClient(r.run('webHandle.webClient'), () => {}) } catch (_) {}
+})
+
+// The balance being sampled is the bot's WHOLE-player balance, so one run's
+// spawner rows are slices of the same number. This drives the real
+// runSpawnerRoutine with stubbed clicks to pin down where the total is kept.
+test('/spawners accumulates earnings on the bot row and publishes inventory usage', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spawner-data-'))
+  const r = runtime({ DATA_FILE: path.join(dir, 'spawner-data.json') })
+  await r.run(`
+    chats = []
+    var balances = [100, 130, 200, 250]
+    bots.A.bot = {
+      entity: { position: { x: 0, y: 64, z: 0, distanceTo: () => 1 } },
+      game: { dimension: 'overworld' },
+      registry: { blocksByName: { spawner: { id: 1 } } },
+      inventory: { slots: Object.assign(new Array(46).fill(null), { 9: { name: 'stone' }, 10: { name: 'stone' }, 11: { name: 'stone' } }) },
+      findBlocks: () => [{ x: 1, y: 2, z: 3 }, { x: 4, y: 5, z: 6 }],
+      currentWindow: null
+    }
+    clickSpawnerOnce = async () => ({ ok: true, balanceBefore: 0, balanceAfter: balances.shift() })
+    queryBalance = async () => 250
+  `)
+
+  // Run 1 only establishes each spawner's baseline balance — nothing is earned yet.
+  await driveSequence(r, r.run("runSpawnerRoutine('A')"))
+  assert.equal(r.run('dataState.spawners["A:1"].balance'), 100)
+  assert.equal(r.run('dataState.spawners["A:1"].earned'), null)
+  assert.equal(r.run('dataState.spawners["A:1"].lifetimeEarned'), undefined, 'no per-spawner lifetime column any more')
+  assert.equal(r.run('dataState.bots.A.lifetimeEarned'), 0)
+  assert.equal(r.run('dataState.bots.A.invUsed'), 3)
+  assert.equal(r.run('dataState.bots.A.invFree'), 33)
+  assert.equal(r.run('dataState.bots.A.invTotal'), 36)
+
+  // A leftover row from an earlier, larger run must not keep a stale measurement.
+  r.run("dataStore.upsertSpawner(dataState, { bot: 'A', spawnerNumber: 3, earned: 999, ratePerHour: 999 })")
+
+  await driveSequence(r, r.run("runSpawnerRoutine('A')"))
+  assert.equal(r.run('dataState.spawners["A:1"].earned'), 100, 'the row keeps its own slice')
+  assert.equal(r.run('dataState.spawners["A:2"].earned'), 120)
+  // 100 + 120 is the whole run, which is what the bot actually earned.
+  assert.equal(r.run('dataState.bots.A.earned'), 220)
+  assert.equal(r.run('dataState.bots.A.lifetimeEarned'), 220)
+  assert.ok(r.run('dataState.bots.A.ratePerHour') > 0, 'the rate comes from the run window')
+  const stale = plain(r.run('dataState.spawners["A:3"]'))
+  assert.equal(stale.earned, null, 'a row this run did not visit is not counted into the sheet total')
+  assert.equal(stale.ratePerHour, null)
+  assert.equal(stale.calculationStatus, 'not seen this run')
+
+  // A second completed run keeps accumulating on the same bot row.
+  r.run('balances = [300, 400]')
+  await driveSequence(r, r.run("runSpawnerRoutine('A')"))
+  assert.equal(r.run('dataState.bots.A.lifetimeEarned'), 220 + (300 - 200) + (400 - 250))
+  assert.equal(r.run('dataState.bots.A.lifetimeEarned'), 470)
 })
