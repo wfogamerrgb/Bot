@@ -1,7 +1,7 @@
 'use strict'
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const { readDelayMs, readInt, readNumber, parseDumpMode, parseDataArgs, shuffledCopy, createSlowBroadcast, createSlowBroadcastManager, parseProxyGroups, resolveBotProxy } = require('../bot-controls')
+const { readDelayMs, readInt, readNumber, parseDumpMode, parseDataArgs, shuffledCopy, createSlowBroadcast, createSlowBroadcastManager, parseProxyGroups, resolveBotProxy, hasProxyAuth, proxyAuthHeader, buildHttpConnectRequest, describeProxy } = require('../bot-controls')
 
 function clock() {
   let time = 0, sequence = 0
@@ -122,8 +122,8 @@ test('parseProxyGroups reads indexed PROXY_GROUP_N_* vars and stops at the first
   }
   const groups = parseProxyGroups(env)
   assert.deepEqual(groups, [
-    { index: 1, bots: ['Alice', 'Bob'], host: '1.2.3.4', port: 1081, type: 'http' },
-    { index: 2, bots: ['Carol'], host: '5.6.7.8', port: 1080, type: 'socks5' }
+    { index: 1, bots: ['Alice', 'Bob'], host: '1.2.3.4', port: 1081, type: 'http', user: '', pass: '' },
+    { index: 2, bots: ['Carol'], host: '5.6.7.8', port: 1080, type: 'socks5', user: '', pass: '' }
   ])
 })
 
@@ -138,8 +138,8 @@ test('resolveBotProxy matches the group containing the bot', () => {
     PROXY_GROUP_1_BOTS: 'Alice,Bob', PROXY_GROUP_1_HOST: '1.2.3.4', PROXY_GROUP_1_PORT: '1081', PROXY_GROUP_1_TYPE: 'http',
     PROXY_GROUP_2_BOTS: 'Carol', PROXY_GROUP_2_HOST: '5.6.7.8'
   })
-  assert.deepEqual(resolveBotProxy('Bob', groups), { host: '1.2.3.4', port: 1081, type: 'http', group: 1 })
-  assert.deepEqual(resolveBotProxy('Carol', groups), { host: '5.6.7.8', port: 1080, type: 'socks5', group: 2 })
+  assert.deepEqual(resolveBotProxy('Bob', groups), { host: '1.2.3.4', port: 1081, type: 'http', user: '', pass: '', group: 1 })
+  assert.deepEqual(resolveBotProxy('Carol', groups), { host: '5.6.7.8', port: 1080, type: 'socks5', user: '', pass: '', group: 2 })
 })
 
 test('resolveBotProxy falls back when unmatched, disabled, or empty', () => {
@@ -149,6 +149,82 @@ test('resolveBotProxy falls back when unmatched, disabled, or empty', () => {
   assert.equal(resolveBotProxy('Zed', groups, null), null)
   assert.equal(resolveBotProxy('Alice', [], fallback), fallback)
   assert.equal(resolveBotProxy('Alice', undefined, fallback), fallback)
+})
+
+test('parseProxyGroups gives each group its own credentials', () => {
+  const groups = parseProxyGroups({
+    PROXY_GROUP_1_BOTS: 'Alice', PROXY_GROUP_1_HOST: '1.2.3.4', PROXY_GROUP_1_USER: 'alice', PROXY_GROUP_1_PASS: 'group-one-secret',
+    PROXY_GROUP_2_BOTS: 'Bob', PROXY_GROUP_2_HOST: '5.6.7.8', PROXY_GROUP_2_PASS: 'password-only'
+  })
+  assert.deepEqual(groups[0], { index: 1, bots: ['Alice'], host: '1.2.3.4', port: 1080, type: 'socks5', user: 'alice', pass: 'group-one-secret' })
+  // A username-less group is legal — some SOCKS5 setups authenticate on the password alone.
+  assert.deepEqual(groups[1], { index: 2, bots: ['Bob'], host: '5.6.7.8', port: 1080, type: 'socks5', user: '', pass: 'password-only' })
+})
+
+test('parseProxyGroups accepts _PASSWORD as a spelling of _PASS, and _PASS wins when both are set', () => {
+  const alias = parseProxyGroups({ PROXY_GROUP_1_BOTS: 'A', PROXY_GROUP_1_HOST: 'h', PROXY_GROUP_1_PASSWORD: 'via-alias' })
+  assert.equal(alias[0].pass, 'via-alias')
+  const both = parseProxyGroups({ PROXY_GROUP_1_BOTS: 'A', PROXY_GROUP_1_HOST: 'h', PROXY_GROUP_1_PASS: 'primary', PROXY_GROUP_1_PASSWORD: 'alias' })
+  assert.equal(both[0].pass, 'primary')
+  // An explicitly empty _PASS is a real value: it must not fall through to the alias.
+  const empty = parseProxyGroups({ PROXY_GROUP_1_BOTS: 'A', PROXY_GROUP_1_HOST: 'h', PROXY_GROUP_1_PASS: '', PROXY_GROUP_1_PASSWORD: 'alias' })
+  assert.equal(empty[0].pass, '')
+})
+
+test('resolveBotProxy carries the matched group credentials and defaults them to empty', () => {
+  const groups = parseProxyGroups({
+    PROXY_GROUP_1_BOTS: 'Alice', PROXY_GROUP_1_HOST: '1.2.3.4', PROXY_GROUP_1_USER: 'u1', PROXY_GROUP_1_PASS: 'p1',
+    PROXY_GROUP_2_BOTS: 'Bob', PROXY_GROUP_2_HOST: '5.6.7.8'
+  })
+  assert.deepEqual(resolveBotProxy('Alice', groups), { host: '1.2.3.4', port: 1080, type: 'socks5', user: 'u1', pass: 'p1', group: 1 })
+  assert.deepEqual(resolveBotProxy('Bob', groups), { host: '5.6.7.8', port: 1080, type: 'socks5', user: '', pass: '', group: 2 })
+  // A group never inherits the global password — credentials belong to a target.
+  const globalFallback = { host: 'global', port: 1080, type: 'socks5', user: 'globaluser', pass: 'globalsecret' }
+  assert.deepEqual(resolveBotProxy('Bob', groups).pass, '')
+  assert.deepEqual(resolveBotProxy('Zed', groups, globalFallback), globalFallback)
+})
+
+test('proxyAuthHeader builds HTTP Basic auth only when credentials exist', () => {
+  assert.equal(proxyAuthHeader(null), '')
+  assert.equal(proxyAuthHeader({ host: 'h', port: 1 }), '')
+  assert.equal(proxyAuthHeader({ host: 'h', port: 1, user: '', pass: '' }), '')
+  assert.equal(proxyAuthHeader({ user: 'alice', pass: 's3cret' }), 'Basic ' + Buffer.from('alice:s3cret').toString('base64'))
+  // Password-only still encodes the empty username rather than omitting the header.
+  assert.equal(proxyAuthHeader({ pass: 'only' }), 'Basic ' + Buffer.from(':only').toString('base64'))
+  // Non-ASCII credentials must survive the round trip as utf8, not latin1.
+  const utf8 = proxyAuthHeader({ user: 'Bjorn', pass: 'pässwörd' })
+  assert.equal(Buffer.from(utf8.slice('Basic '.length), 'base64').toString('utf8'), 'Bjorn:pässwörd')
+})
+
+test('buildHttpConnectRequest sends the auth header only when credentialed, and always ends with a blank line', () => {
+  const plain = buildHttpConnectRequest('mc.example.com', 25565, { host: 'p', port: 8080, type: 'http' })
+  assert.equal(plain, 'CONNECT mc.example.com:25565 HTTP/1.1\r\nHost: mc.example.com:25565\r\nConnection: keep-alive\r\n\r\n')
+  assert.ok(!/Proxy-Authorization/i.test(plain), 'no empty auth header — some proxies answer 407 for one')
+
+  const authed = buildHttpConnectRequest('mc.example.com', 25565, { host: 'p', port: 8080, type: 'http', user: 'alice', pass: 's3cret' })
+  const expected = 'Basic ' + Buffer.from('alice:s3cret').toString('base64')
+  assert.ok(authed.includes(`Proxy-Authorization: ${expected}\r\n`))
+  assert.ok(authed.endsWith('Connection: keep-alive\r\n\r\n'))
+  // The header must land before the terminating blank line, or the proxy reads it as the body.
+  assert.ok(authed.indexOf('Proxy-Authorization') < authed.indexOf('\r\n\r\n'))
+})
+
+test('describeProxy shows the target and username but never the password', () => {
+  assert.equal(describeProxy(null), 'direct (no proxy)')
+  assert.equal(describeProxy({ host: '1.2.3.4', port: 1080, type: 'socks5' }), 'SOCKS5 1.2.3.4:1080')
+  assert.equal(describeProxy({ host: '1.2.3.4', port: 8080, type: 'http', user: 'alice', pass: 'hunter2' }), 'HTTP alice@1.2.3.4:8080')
+  // Password-only: no username to show, but the URL must not silently look credential-free.
+  assert.equal(describeProxy({ host: '1.2.3.4', port: 1080, type: 'socks5', pass: 'hunter2' }), 'SOCKS5 ***@1.2.3.4:1080')
+  const rendered = describeProxy({ host: 'h', port: 1, type: 'http', user: 'alice', pass: 'hunter2' })
+  assert.ok(!rendered.includes('hunter2'), 'the password must never appear in a log line')
+})
+
+test('hasProxyAuth is true for a username or a password, false otherwise', () => {
+  assert.equal(hasProxyAuth(null), false)
+  assert.equal(hasProxyAuth({}), false)
+  assert.equal(hasProxyAuth({ user: '', pass: '' }), false)
+  assert.equal(hasProxyAuth({ user: 'u' }), true)
+  assert.equal(hasProxyAuth({ pass: 'p' }), true)
 })
 
 test('multi-task createSlowBroadcastManager: concurrent tasks, independent timers, selective cancellation, and cancelAll', () => {

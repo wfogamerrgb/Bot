@@ -331,6 +331,7 @@ async function executeCommandChain(chain, ctx, { executeSingle = () => {}, sleep
 // ── Dedicated proxy groups (SOCKS5/HTTP per bot subset) ─────────────────────
 // PROXY_GROUP_<N>_BOTS = comma-separated usernames
 // PROXY_GROUP_<N>_HOST / _PORT / _TYPE = proxy target for that group
+// PROXY_GROUP_<N>_USER / _PASS = credentials for that group (optional)
 // Unassigned bots fall back to the caller-provided default (global PROXY_* or direct).
 function parseProxyGroups(env = process.env) {
   const groups = []
@@ -341,7 +342,15 @@ function parseProxyGroups(env = process.env) {
     const host = (env[`PROXY_GROUP_${n}_HOST`] || '').trim()
     const port = parseInt(env[`PROXY_GROUP_${n}_PORT`] || '1080', 10)
     const type = (env[`PROXY_GROUP_${n}_TYPE`] || 'socks5').toLowerCase()
-    if (bots.length && host) groups.push({ index: n, bots, host, port, type })
+    // Credentials are per group, so one provider's login never follows the bots
+    // that were moved onto a different provider. A group with a username but no
+    // password is legitimate (some SOCKS5 setups are username-only).
+    const user = (env[`PROXY_GROUP_${n}_USER`] || '').trim()
+    const rawPass = env[`PROXY_GROUP_${n}_PASS`] !== undefined
+      ? env[`PROXY_GROUP_${n}_PASS`]
+      : env[`PROXY_GROUP_${n}_PASSWORD`]
+    const pass = rawPass == null ? '' : String(rawPass)
+    if (bots.length && host) groups.push({ index: n, bots, host, port, type, user, pass })
     n++
   }
   return groups
@@ -353,11 +362,57 @@ function resolveBotProxy(username, groups, fallback = null) {
   if (Array.isArray(groups)) {
     for (const group of groups) {
       if (group.bots.includes(username)) {
-        return { host: group.host, port: group.port, type: group.type, group: group.index }
+        return {
+          host: group.host,
+          port: group.port,
+          type: group.type,
+          user: group.user || '',
+          pass: group.pass || '',
+          group: group.index
+        }
       }
     }
   }
   return fallback
+}
+
+// True when a resolved proxy carries credentials worth sending.
+function hasProxyAuth(proxy) {
+  return Boolean(proxy && (proxy.user || proxy.pass))
+}
+
+// `Proxy-Authorization` value for an HTTP CONNECT proxy, or '' when there are
+// no credentials. Basic auth is `base64(user:pass)`, and the empty username is
+// still encoded (":pass") because some proxies accept a password-only login.
+function proxyAuthHeader(proxy) {
+  if (!hasProxyAuth(proxy)) return ''
+  const raw = `${proxy.user || ''}:${proxy.pass || ''}`
+  return `Basic ${Buffer.from(raw, 'utf8').toString('base64')}`
+}
+
+// The CONNECT request an HTTP proxy is sent. Kept here rather than inline in the
+// connect handler so the credential line is verifiable: the header must be
+// omitted entirely when there are no credentials (an empty Proxy-Authorization
+// makes some proxies answer 407 instead of tunnelling), and the request must
+// terminate with a blank line or the proxy waits forever.
+function buildHttpConnectRequest(targetHost, targetPort, proxy = {}) {
+  const auth = proxyAuthHeader(proxy)
+  return `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\n` +
+    `Host: ${targetHost}:${targetPort}\r\n` +
+    (auth ? `Proxy-Authorization: ${auth}\r\n` : '') +
+    'Connection: keep-alive\r\n\r\n'
+}
+
+// One-line proxy target for logs, `/proxy`, and error messages. The password is
+// never included: these strings reach the TUI, the browser console panel, the
+// Discord notifier, and scrollback — a credential in a log line is a leaked
+// credential. The username is shown, because "which login is this bot using?"
+// is exactly the question those lines exist to answer.
+function describeProxy(proxy) {
+  if (!proxy) return 'direct (no proxy)'
+  const type = String(proxy.type || 'socks5').toUpperCase()
+  const creds = proxy.user ? `${proxy.user}@` : (hasProxyAuth(proxy) ? '***@' : '')
+  return `${type} ${creds}${proxy.host}:${proxy.port}`
 }
 
 module.exports = {
@@ -375,6 +430,10 @@ module.exports = {
   createSlowBroadcastManager,
   parseProxyGroups,
   resolveBotProxy,
+  hasProxyAuth,
+  proxyAuthHeader,
+  buildHttpConnectRequest,
+  describeProxy,
   parseSleepDuration,
   parseCommandChain,
   executeCommandChain

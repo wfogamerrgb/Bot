@@ -539,6 +539,8 @@ item matches, the bot falls back to `GUI_SLOT`.
 | `PROXY_HOST` | empty | Enables outbound proxying when set |
 | `PROXY_PORT` | `1080` | Proxy port |
 | `PROXY_TYPE` | `socks5` | `socks5` or `http` |
+| `PROXY_USER` | empty | Username for the global proxy (SOCKS5 user/pass, or HTTP Basic) |
+| `PROXY_PASS` | empty | Password for the global proxy. `PROXY_PASSWORD` also works |
 | `PROXY_STALL_WATCHDOG` | enabled | Set to `0` to disable stall recovery |
 | `PROXY_STALL_TIMEOUT_MS` | `90000` | Silence period before forcing reconnect |
 | `PROXY_STALL_CHECK_MS` | `20000` | Watchdog polling interval |
@@ -548,8 +550,33 @@ item matches, the bot falls back to `GUI_SLOT`.
 | `PROXY_GROUP_<N>_HOST` | unset | Proxy host for group `N` |
 | `PROXY_GROUP_<N>_PORT` | `1080` | Proxy port for group `N` |
 | `PROXY_GROUP_<N>_TYPE` | `socks5` | `socks5` or `http` for group `N` |
+| `PROXY_GROUP_<N>_USER` | empty | Username for group `N`'s proxy |
+| `PROXY_GROUP_<N>_PASS` | empty | Password for group `N`'s proxy. `_PASSWORD` also works |
 
 Bots not listed in any `PROXY_GROUP_<N>_BOTS` fall back to the global `PROXY_HOST` above (or connect directly if it's unset). `/proxy` reports both the configured groups and the fallback.
+
+Credentials are **per proxy target, not per bot**. Each group sends its own `PROXY_GROUP_<N>_USER` / `PROXY_GROUP_<N>_PASS`, and a group with none sends none — it never borrows the global pair, because that would hand one provider's password to a different provider. A username with no password is valid (some SOCKS5 setups authenticate on the username alone), and so is a password with no username.
+
+```ini
+# A proxy per provider, each with its own login
+PROXY_HOST=                 # no global proxy -> bots without a group connect directly
+
+PROXY_GROUP_1_BOTS=Bot1,Bot2
+PROXY_GROUP_1_HOST=1.2.3.4
+PROXY_GROUP_1_PORT=1080
+PROXY_GROUP_1_TYPE=socks5
+PROXY_GROUP_1_USER=provider-one
+PROXY_GROUP_1_PASS=secret-one
+
+PROXY_GROUP_2_BOTS=Bot3
+PROXY_GROUP_2_HOST=5.6.7.8
+PROXY_GROUP_2_PORT=8080
+PROXY_GROUP_2_TYPE=http
+PROXY_GROUP_2_USER=provider-two
+PROXY_GROUP_2_PASS=secret-two
+```
+
+SOCKS5 credentials are negotiated per RFC 1929; HTTP proxies get `Proxy-Authorization: Basic …` on the `CONNECT`. A proxy that answers **407** produces a message naming the exact variables to set (`PROXY_GROUP_2_USER / _PASS`) rather than a bare status line. Passwords are never printed — `/proxy` shows the target and the username, and the log/stderr paths show the target only, so credentials cannot reach the console, the browser panel, or Discord.
 
 ### Web dashboard
 

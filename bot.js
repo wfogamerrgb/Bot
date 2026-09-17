@@ -9,6 +9,10 @@ const {
   createSlowBroadcastManager,
   parseProxyGroups,
   resolveBotProxy,
+  hasProxyAuth,
+  proxyAuthHeader,
+  buildHttpConnectRequest,
+  describeProxy,
   parseSleepDuration,
   parseCommandChain,
   executeCommandChain: executeCommandChainBase,
@@ -332,7 +336,14 @@ const PROXY_HOST = process.env.PROXY_HOST || ''
 const PROXY_ENABLED = Boolean(PROXY_HOST)
 const PROXY_PORT = parseInt(process.env.PROXY_PORT || '1080', 10)
 const PROXY_TYPE = (process.env.PROXY_TYPE || 'socks5').toLowerCase()
-const PROXY_DEFAULT = PROXY_ENABLED ? { host: PROXY_HOST, port: PROXY_PORT, type: PROXY_TYPE } : null
+// Credentials for the GLOBAL proxy. Each PROXY_GROUP_<N>_* carries its own, so
+// two providers on one machine never share a login. _PASSWORD is an accepted
+// spelling of _PASS everywhere, since both read naturally.
+const PROXY_USER = process.env.PROXY_USER || ''
+const PROXY_PASS = process.env.PROXY_PASS !== undefined
+? process.env.PROXY_PASS
+: (process.env.PROXY_PASSWORD || '')
+const PROXY_DEFAULT = PROXY_ENABLED ? { host: PROXY_HOST, port: PROXY_PORT, type: PROXY_TYPE, user: PROXY_USER, pass: PROXY_PASS } : null
 // Dedicated per-bot proxy groups: PROXY_GROUP_<N>_BOTS/_HOST/_PORT/_TYPE (see .env.example).
 // Bots not listed in any group fall back to PROXY_DEFAULT (global proxy, or direct if unset).
 const PROXY_GROUPS = parseProxyGroups()
@@ -395,9 +406,18 @@ client.emit('error', new Error('PROXY_TYPE=socks5 requires the "socks" package �
 client.emit('end', 'Missing socks package')
 return
 }
-onLog?.(`Tunnelling through SOCKS5 proxy ${proxy.host}:${proxy.port}…`)
+onLog?.(`Tunnelling through SOCKS5 proxy ${describeProxy(proxy)}${proxy.pass ? ' (authenticated)' : ''}…`)
 SocksClient.createConnection({
-proxy: { host: proxy.host, port: proxy.port, type: 5 },
+// userId/password are only sent when set — passing undefined makes the
+// library negotiate "no auth" instead of an empty credential pair, which
+// a proxy that requires auth rejects with a clearer error.
+proxy: {
+host: proxy.host,
+port: proxy.port,
+type: 5,
+userId: proxy.user || undefined,
+password: proxy.pass || undefined
+},
 command: 'connect',
 destination: { host: targetHost, port: targetPort }
 }).then(({ socket }) => {
@@ -413,13 +433,9 @@ client.emit('end', errMsg)
 
 function makeHttpConnect(targetHost, targetPort, onLog, proxy) {
 return (client) => {
-onLog?.(`Tunnelling through HTTP proxy ${proxy.host}:${proxy.port}…`)
+onLog?.(`Tunnelling through HTTP proxy ${describeProxy(proxy)}${hasProxyAuth(proxy) ? ' (authenticated)' : ''}…`)
 const socket = net.connect(proxy.port, proxy.host, () => {
-socket.write(
-`CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\n` +
-`Host: ${targetHost}:${targetPort}\r\n` +
-`Connection: keep-alive\r\n\r\n`
-)
+socket.write(buildHttpConnectRequest(targetHost, targetPort, proxy))
 })
 
 let buffer = ''
@@ -435,7 +451,16 @@ const statusCode = match ? parseInt(match[1], 10) : null
 
 if (statusCode !== 200) {
 socket.destroy()
-const errMsg = `HTTP proxy CONNECT failed: ${statusLine || 'no response from proxy'}`
+// 407 means the proxy wants credentials we did not send (or sent wrong ones).
+// Say which of the two it is, because "CONNECT failed: 407" is the one error
+// that is always a config fix, never a retry.
+let errMsg = `HTTP proxy CONNECT failed: ${statusLine || 'no response from proxy'}`
+if (statusCode === 407) {
+const which = proxy.group ? `PROXY_GROUP_${proxy.group}_USER / _PASS` : 'PROXY_USER / PROXY_PASS'
+errMsg = hasProxyAuth(proxy)
+? `HTTP proxy rejected the credentials for ${describeProxy(proxy)} (407) — check ${which}`
+: `HTTP proxy requires a username and password (407) — set ${which} in .env`
+}
 client.emit('error', new Error(errMsg))
 client.emit('end', errMsg)
 return
@@ -915,7 +940,7 @@ const others = names.map((n, i) => i !== (activeIndex - 1) ? `[${i + 1}] ${n}` :
 const othersLabel = others.length ? ` | Others: ${others.join(', ')}` : ''
 const proxyLabel = PROXY_GROUPS_ENABLED
 ? ` — Proxy: ${PROXY_GROUPS.length} group(s)`
-: PROXY_ENABLED ? ` — Proxy: ${PROXY_TYPE.toUpperCase()} ${PROXY_HOST}:${PROXY_PORT}` : ''
+: PROXY_ENABLED ? ` — Proxy: ${describeProxy(PROXY_DEFAULT)}` : ''
 const webLabel = webHandle ? ` — Web: :${webHandle.port}` : ''
 header.setContent(`{center}{bold}⛏ MINEFLAYER AFK CONSOLE{/bold} — ${activeLabel}${othersLabel}${proxyLabel}${webLabel}{/center}`)
 debouncedRender()
@@ -3294,7 +3319,7 @@ const pos = bot.entity.position
 const uptimeSec = entry.spawnTime ? Math.floor((Date.now() - entry.spawnTime) / 1000) : 0
 logFor(id, `{cyan-fg}› Status for ${id}:{/cyan-fg}`)
 logFor(id, ` Server: ${entry.host}:${entry.port} (v${entry.version})`)
-logFor(id, ` Proxy: ${PROXY_ENABLED ? `${PROXY_TYPE.toUpperCase()} ${PROXY_HOST}:${PROXY_PORT}` : 'Direct (no proxy)'}`)
+logFor(id, ` Proxy: ${PROXY_ENABLED ? describeProxy(PROXY_DEFAULT) : 'Direct (no proxy)'}`)
 logFor(id, ` Position: ${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)}`)
 logFor(id, ` Health: ${bot.health ?? 'N/A'} Food: ${bot.food ?? 'N/A'}`)
 logFor(id, ` Ping: ${bot.player?.ping ?? 'N/A'}ms`)
@@ -4644,11 +4669,18 @@ return
 if (trimmed === '/proxy') {
 if (PROXY_GROUPS_ENABLED) {
 logInfo(`{bold}Dedicated proxy groups:{/bold} ${PROXY_GROUPS.length} configured`)
-PROXY_GROUPS.forEach(g => logInfo(`  [${g.index}] ${g.bots.join(', ')} → ${g.type.toUpperCase()} ${g.host}:${g.port}`))
-logInfo(PROXY_DEFAULT ? `  (other bots) → ${PROXY_DEFAULT.type.toUpperCase()} ${PROXY_DEFAULT.host}:${PROXY_DEFAULT.port}` : '  (other bots) → direct connection')
+PROXY_GROUPS.forEach(g => {
+// Say where this group's credentials come from without ever printing them.
+// Credentials belong to the proxy TARGET, not to the bot: a group that sets
+// none sends none, even when the global PROXY_USER/PROXY_PASS is configured.
+// Inheriting would hand the global password to a different proxy operator.
+const auth = hasProxyAuth(g) ? ` · auth: PROXY_GROUP_${g.index}_USER/_PASS` : ' · auth: none'
+logInfo(`  [${g.index}] ${g.bots.join(', ')} → ${describeProxy(g)}${auth}`)
+})
+logInfo(PROXY_DEFAULT ? `  (other bots) → ${describeProxy(PROXY_DEFAULT)}` : '  (other bots) → direct connection')
 }
 if (PROXY_ENABLED) {
-logInfo(`{bold}Outbound proxy:{/bold} ${PROXY_TYPE.toUpperCase()} ${PROXY_HOST}:${PROXY_PORT} (applies to all bots without a dedicated group)`)
+logInfo(`{bold}Outbound proxy:{/bold} ${describeProxy(PROXY_DEFAULT)}${hasProxyAuth(PROXY_DEFAULT) ? ' (authenticated)' : ' (no credentials set)'} (applies to all bots without a dedicated group; these credentials are never shared with a group)`)
 if (PROXY_STALL_ENABLED) {
 const restartInfo = PROXY_RESTART_CMD ? `restart cmd: "${PROXY_RESTART_CMD}"` : 'no restart cmd (proxy isn\'t local — set PROXY_RESTART_CMD in .env if you want auto-restart)'
 logInfo(`{bold}Stall watchdog:{/bold} on — stall timeout ${(PROXY_STALL_TIMEOUT_MS / 1000).toFixed(0)}s, checked every ${(PROXY_STALL_CHECK_MS / 1000).toFixed(0)}s, ${restartInfo}`)

@@ -46,7 +46,12 @@ function runtime(env = {}) {
       if (name === './bot-controls') return {
         ...controls,
         createSlowBroadcast: () => controls.createSlowBroadcast({ setTimer, clearTimer }),
-        createSlowBroadcastManager: () => controls.createSlowBroadcastManager({ setTimer, clearTimer })
+        createSlowBroadcastManager: () => controls.createSlowBroadcastManager({ setTimer, clearTimer }),
+        // bot-controls reads the real process.env by default, but inside this
+        // harness bot.js reads processMock.env — so the group vars have to be
+        // parsed from the same object bot.js sees, exactly as they would be in
+        // production where there is only one process.env.
+        parseProxyGroups: (env = processMock.env) => controls.parseProxyGroups(env)
       }
       if (name === './expose-terminal') return { sshConfig: () => ({ enabled: false }) }
       if (name === './monitoring') return {
@@ -650,6 +655,138 @@ test('/play shows live progress while the client build runs, then the failure', 
   // The failure page must point at both ways forward.
   assert.match(failed.body, /npm run web-client:build/)
   assert.match(failed.body, /MC_WEB_AUTO_BUILD=false/)
+})
+
+// A stand-in for an HTTP CONNECT proxy: records the request the bot sent, then
+// answers with the status the test asks for.
+function fakeHttpProxy(status = 200) {
+  const net = require('node:net')
+  const requests = []
+  const sockets = new Set()
+  const server = net.createServer(socket => {
+    sockets.add(socket)
+    socket.on('close', () => sockets.delete(socket))
+    socket.on('error', () => {})
+    let buf = ''
+    socket.on('data', chunk => {
+      buf += chunk.toString('latin1')
+      if (!buf.includes('\r\n\r\n')) return
+      requests.push(buf)
+      socket.write(status === 200
+        ? 'HTTP/1.1 200 Connection established\r\n\r\n'
+        : `HTTP/1.1 ${status} Proxy Authentication Required\r\n\r\n`)
+    })
+  })
+  return new Promise(resolve => {
+    server.listen(0, '127.0.0.1', () => resolve({
+      server,
+      requests,
+      port: server.address().port,
+      // A successful CONNECT leaves the tunnelled socket open by design, so
+      // closing the listener alone would keep the test runner's event loop alive
+      // (and the suite would never exit).
+      close() { for (const s of sockets) s.destroy(); sockets.clear(); server.close() }
+    }))
+  })
+}
+
+// Drives the real makeProxyConnect closure against a real socket and returns the
+// events the fake mineflayer client saw.
+async function driveProxy(r, proxy, target = 'mc.example.com') {
+  const events = []
+  r.context.__client = { socket: null, setSocket(s) { this.socket = s }, emit(...args) { events.push(args) } }
+  r.run(`__connect = makeProxyConnect(${JSON.stringify(target)}, 25565, () => {}, 'A')`)
+  r.run('__connect(__client)')
+  const start = Date.now()
+  while (!events.length && Date.now() - start < 4000) await new Promise(res => setTimeout(res, 10))
+  // Close the bot's end of the tunnel too, or the socket outlives the test.
+  r.run('__client.socket && __client.socket.destroy()')
+  return events
+}
+
+test('a per-group HTTP proxy password reaches the CONNECT request', async () => {
+  const proxy = await fakeHttpProxy()
+  try {
+    const r = runtime({
+      PROXY_GROUP_1_BOTS: 'A',
+      PROXY_GROUP_1_HOST: '127.0.0.1',
+      PROXY_GROUP_1_PORT: String(proxy.port),
+      PROXY_GROUP_1_TYPE: 'http',
+      PROXY_GROUP_1_USER: 'alice',
+      PROXY_GROUP_1_PASS: 'group-one-secret'
+    })
+    const events = await driveProxy(r, proxy)
+    assert.equal(events[0][0], 'connect', `expected a tunnel, got ${JSON.stringify(events[0])}`)
+    assert.equal(proxy.requests.length, 1)
+    const expected = 'Basic ' + Buffer.from('alice:group-one-secret').toString('base64')
+    assert.ok(proxy.requests[0].includes(`Proxy-Authorization: ${expected}\r\n`), proxy.requests[0])
+  } finally { proxy.close() }
+})
+
+test('different proxy groups send their own passwords, and a group without one inherits nothing', async () => {
+  const authed = await fakeHttpProxy()
+  const bare = await fakeHttpProxy()
+  try {
+    const shared = {
+      PROXY_USER: 'global', PROXY_PASS: 'global-secret'
+    }
+    // Group 1 has its own password; group 2 has none and must NOT fall back to the
+    // global one — that would hand the global password to a different proxy.
+    const withAuth = runtime({
+      ...shared, PROXY_HOST: '127.0.0.1', PROXY_PORT: String(authed.port), PROXY_TYPE: 'http',
+      PROXY_GROUP_1_BOTS: 'A', PROXY_GROUP_1_HOST: '127.0.0.1', PROXY_GROUP_1_PORT: String(authed.port), PROXY_GROUP_1_TYPE: 'http',
+      PROXY_GROUP_1_USER: 'alice', PROXY_GROUP_1_PASS: 'group-one-secret'
+    })
+    await driveProxy(withAuth, authed)
+    assert.ok(authed.requests[0].includes('Proxy-Authorization'))
+
+    const noAuth = runtime({
+      ...shared, PROXY_HOST: '127.0.0.1', PROXY_PORT: String(bare.port), PROXY_TYPE: 'http',
+      PROXY_GROUP_1_BOTS: 'A', PROXY_GROUP_1_HOST: '127.0.0.1', PROXY_GROUP_1_PORT: String(bare.port), PROXY_GROUP_1_TYPE: 'http'
+    })
+    await driveProxy(noAuth, bare)
+    assert.doesNotMatch(bare.requests[0], /Proxy-Authorization/)
+    assert.ok(!bare.requests[0].includes('global-secret'))
+  } finally { authed.close(); bare.close() }
+})
+
+test('a 407 from the proxy names the exact env vars that need credentials', async () => {
+  const proxy = await fakeHttpProxy(407)
+  try {
+    const r = runtime({
+      PROXY_GROUP_1_BOTS: 'A',
+      PROXY_GROUP_1_HOST: '127.0.0.1',
+      PROXY_GROUP_1_PORT: String(proxy.port),
+      PROXY_GROUP_1_TYPE: 'http'
+    })
+    const events = await driveProxy(r, proxy)
+    assert.equal(events[0][0], 'error')
+    assert.match(String(events[0][1].message), /requires a username and password/)
+    assert.match(String(events[0][1].message), /PROXY_GROUP_1_USER \/ _PASS/)
+  } finally { proxy.close() }
+})
+
+test('/proxy lists each group with its own auth source, without ever printing a password', () => {
+  const r = runtime({
+    PROXY_HOST: '9.9.9.9', PROXY_PORT: '1080', PROXY_TYPE: 'socks5',
+    PROXY_USER: 'globaluser', PROXY_PASS: 'global-secret',
+    PROXY_GROUP_1_BOTS: 'A', PROXY_GROUP_1_HOST: '1.2.3.4', PROXY_GROUP_1_USER: 'alice', PROXY_GROUP_1_PASS: 'group-one-secret',
+    PROXY_GROUP_2_BOTS: 'B', PROXY_GROUP_2_HOST: '5.6.7.8', PROXY_GROUP_2_TYPE: 'http'
+  })
+  r.timers.clear()
+  r.context.__lines = []
+  r.run('subscribeLog((id, line) => __lines.push(String(line)))')
+  r.run(`handleCommand('/proxy')`)
+  const out = r.context.__lines.join('\n')
+
+  // Each group's credentials are named by variable, so the fix for a 407 is visible here.
+  assert.match(out, /\[1\] A → SOCKS5 alice@1\.2\.3\.4:1080 · auth: PROXY_GROUP_1_USER\/_PASS/)
+  // Group 2 has none, and must say so rather than implying it borrows the global pair.
+  assert.match(out, /\[2\] B → HTTP 5\.6\.7\.8:1080 · auth: none/)
+  assert.match(out, /SOCKS5 globaluser@9\.9\.9\.9:1080 \(authenticated\)/)
+  assert.ok(out.includes('never shared with a group'))
+  assert.ok(!out.includes('group-one-secret'), 'group password leaked into /proxy output')
+  assert.ok(!out.includes('global-secret'), 'global password leaked into /proxy output')
 })
 
 test('/play embeds the client once a build exists', async () => {
