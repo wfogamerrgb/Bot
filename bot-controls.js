@@ -356,10 +356,32 @@ function parseProxyGroups(env = process.env) {
     // space, and silently altering it would lock the account out.
     const rawLogin = env[`PROXY_GROUP_${n}_LOGIN_PASSWORD`]
     const loginPassword = rawLogin == null ? '' : String(rawLogin)
-    if (bots.length && host) groups.push({ index: n, bots, host, port, type, user, pass, loginPassword })
+    // A group is defined by its BOT LIST, not by its host. Requiring a host here
+    // used to discard the whole group — including its LOGIN_PASSWORD — for
+    // anyone using a group only to separate accounts, and the only symptom was
+    // bots logging in with the wrong password. `host: ''` now means "no dedicated
+    // proxy": the group exists, its login password applies, and its bots use the
+    // default connection.
+    if (bots.length) groups.push({ index: n, bots, host, port, type, user, pass, loginPassword })
     n++
   }
   return groups
+}
+
+// Any PROXY_GROUP_<N>_* variable whose index has no group is ignored. The loop
+// stops at the first missing PROXY_GROUP_<N>_BOTS, so one typo there silently
+// discards the host, credentials, bot list and login password of every group
+// after it. Returns the offending keys so startup can name them instead of
+// pretending they were applied.
+function findIgnoredProxyGroupVars(env = process.env, groups = []) {
+  const known = new Set((groups || []).map(g => g.index))
+  const ignored = []
+  for (const key of Object.keys(env || {})) {
+    const match = /^PROXY_GROUP_(\d+)_/.exec(key)
+    if (!match) continue
+    if (!known.has(parseInt(match[1], 10))) ignored.push(key)
+  }
+  return ignored.sort()
 }
 
 // Resolves a bot username to its dedicated proxy config, or `fallback` (default
@@ -368,6 +390,9 @@ function resolveBotProxy(username, groups, fallback = null) {
   if (Array.isArray(groups)) {
     for (const group of groups) {
       if (group.bots.includes(username)) {
+        // A group with no host is a bot grouping, not a proxy route: use the
+        // default connection rather than a made-up host:port.
+        if (!group.host) return fallback
         return {
           host: group.host,
           port: group.port,
@@ -568,6 +593,7 @@ module.exports = {
   createSlowBroadcast,
   createSlowBroadcastManager,
   parseProxyGroups,
+  findIgnoredProxyGroupVars,
   resolveBotProxy,
   hasProxyAuth,
   proxyAuthHeader,

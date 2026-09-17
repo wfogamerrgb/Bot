@@ -1,7 +1,7 @@
 'use strict'
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const { readDelayMs, readInt, readNumber, parseDumpMode, parseDataArgs, shuffledCopy, createSlowBroadcast, createSlowBroadcastManager, parseProxyGroups, resolveBotProxy, hasProxyAuth, proxyAuthHeader, buildHttpConnectRequest, describeProxy, resolveLoginPassword, parseBotPasswords, classifyAuthReply, nextAuthFailure, isAuthBlocked } = require('../bot-controls')
+const { readDelayMs, readInt, readNumber, parseDumpMode, parseDataArgs, shuffledCopy, createSlowBroadcast, createSlowBroadcastManager, parseProxyGroups, resolveBotProxy, hasProxyAuth, proxyAuthHeader, buildHttpConnectRequest, describeProxy, resolveLoginPassword, parseBotPasswords, classifyAuthReply, nextAuthFailure, isAuthBlocked, findIgnoredProxyGroupVars } = require('../bot-controls')
 
 function clock() {
   let time = 0, sequence = 0
@@ -127,10 +127,51 @@ test('parseProxyGroups reads indexed PROXY_GROUP_N_* vars and stops at the first
   ])
 })
 
-test('parseProxyGroups skips a group missing bots or host', () => {
+test('parseProxyGroups skips a group with no bots', () => {
   const env = { PROXY_GROUP_1_BOTS: '', PROXY_GROUP_1_HOST: '1.2.3.4' }
   assert.deepEqual(parseProxyGroups(env), [])
   assert.deepEqual(parseProxyGroups({}), [])
+})
+
+test('a group with bots but no HOST still exists, so its login password applies', () => {
+  // This is the shape that used to be dropped in silence: a group used only to
+  // separate accounts, carrying its own /login password and no proxy of its own.
+  const env = { PROXY_GROUP_1_BOTS: 'BotA,BotB', PROXY_GROUP_1_LOGIN_PASSWORD: 'group-pw' }
+  const groups = parseProxyGroups(env)
+  assert.equal(groups.length, 1)
+  assert.equal(groups[0].host, '', 'no dedicated proxy')
+  assert.equal(groups[0].loginPassword, 'group-pw')
+  assert.deepEqual(resolveLoginPassword('BotA', groups, env), { password: 'group-pw', source: 'PROXY_GROUP_1_LOGIN_PASSWORD' })
+  // …and the bots use the default route rather than a made-up host:port.
+  const fallback = { host: 'default-host', port: 1080, type: 'socks5' }
+  assert.deepEqual(resolveBotProxy('BotA', groups, fallback), fallback)
+  assert.equal(resolveBotProxy('BotA', groups, null), null)
+})
+
+test('a group numbered above a gap is never reached, which is why it is reported', () => {
+  // The scan stops at the first missing PROXY_GROUP_<N>_BOTS: this config declares
+  // group 2 only, so nothing is parsed and its password is dead weight.
+  const env = { PROXY_GROUP_2_BOTS: 'BotA', PROXY_GROUP_2_LOGIN_PASSWORD: 'group-pw' }
+  assert.deepEqual(parseProxyGroups(env), [])
+  assert.deepEqual(findIgnoredProxyGroupVars(env, []), ['PROXY_GROUP_2_BOTS', 'PROXY_GROUP_2_LOGIN_PASSWORD'])
+  // Declaring group 1 as well is what makes group 2 reachable.
+  const fixed = { PROXY_GROUP_1_BOTS: 'BotZ', PROXY_GROUP_1_HOST: 'h', ...env }
+  assert.equal(parseProxyGroups(fixed).length, 2)
+})
+
+test('findIgnoredProxyGroupVars names every group variable that belongs to no group', () => {
+  const env = {
+    PROXY_GROUP_1_BOTS: 'A', PROXY_GROUP_1_HOST: 'h',
+    // 2 is missing entirely, so 3 is never reached by the scan
+    PROXY_GROUP_3_BOTS: 'B', PROXY_GROUP_3_HOST: 'h2', PROXY_GROUP_3_LOGIN_PASSWORD: 'pw',
+    PROXY_HOST: 'not-a-group', PROXY_GROUPS: 'not-a-group-either'
+  }
+  const groups = parseProxyGroups(env)
+  assert.equal(groups.length, 1)
+  assert.deepEqual(findIgnoredProxyGroupVars(env, groups), ['PROXY_GROUP_3_BOTS', 'PROXY_GROUP_3_HOST', 'PROXY_GROUP_3_LOGIN_PASSWORD'])
+  // A fully parsed set is reported as nothing ignored.
+  assert.deepEqual(findIgnoredProxyGroupVars(env, [{ index: 1 }, { index: 3 }]), [])
+  assert.deepEqual(findIgnoredProxyGroupVars({}, []), [])
 })
 
 test('resolveBotProxy matches the group containing the bot', () => {

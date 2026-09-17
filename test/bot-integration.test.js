@@ -785,9 +785,9 @@ test('/proxy lists each group with its own auth source, without ever printing a 
   const out = r.context.__lines.join('\n')
 
   // Each group's credentials are named by variable, so the fix for a 407 is visible here.
-  assert.match(out, /\[1\] A → SOCKS5 alice@1\.2\.3\.4:1080 · auth: PROXY_GROUP_1_USER\/_PASS/)
+  assert.match(out, /\[1\] A → SOCKS5 alice@1\.2\.3\.4:1080 · proxy auth: PROXY_GROUP_1_USER\/_PASS/)
   // Group 2 has none, and must say so rather than implying it borrows the global pair.
-  assert.match(out, /\[2\] B → HTTP 5\.6\.7\.8:1080 · auth: none/)
+  assert.match(out, /\[2\] B → HTTP 5\.6\.7\.8:1080 · proxy auth: none/)
   assert.match(out, /SOCKS5 globaluser@9\.9\.9\.9:1080 \(authenticated\)/)
   assert.ok(out.includes('never shared with a group'))
   assert.ok(!out.includes('group-one-secret'), 'group password leaked into /proxy output')
@@ -947,6 +947,45 @@ test('/auth-retry reports a bot with nothing recorded, and refuses a stranger', 
   r.context.__lines = []
   r.run(`handleCommand('/auth-retry ghost')`)
   assert.match(r.context.__lines.join('\n'), /No bot named "ghost"/)
+})
+
+test('/proxy names the login-password source, and reports a group with no proxy', () => {
+  const r = runtime({
+    PROXY_GROUP_1_BOTS: 'A', PROXY_GROUP_1_HOST: '1.2.3.4', PROXY_GROUP_1_LOGIN_PASSWORD: 'pw-one',
+    // Group 2 exists only to group accounts: no HOST, so no dedicated proxy.
+    PROXY_GROUP_2_BOTS: 'B', PROXY_GROUP_2_LOGIN_PASSWORD: 'pw-two'
+  })
+  r.timers.clear()
+  r.context.__lines = []
+  r.run('subscribeLog((id, line) => __lines.push(String(line)))')
+  r.run(`handleCommand('/proxy')`)
+  const out = r.context.__lines.join('\n')
+
+  assert.match(out, /\[1\] A → SOCKS5 1\.2\.3\.4:1080 · proxy auth: none · login: PROXY_GROUP_1_LOGIN_PASSWORD/)
+  // A hostless group must not read as hosting a proxy at :0, and its password still applies.
+  assert.match(out, /\[2\] B → no dedicated proxy \(uses the default connection\) · login: PROXY_GROUP_2_LOGIN_PASSWORD/)
+  assert.doesNotMatch(out, /:0\b/, 'no made-up proxy address')
+  assert.ok(!out.includes('pw-one') && !out.includes('pw-two'))
+})
+
+test('startup names a group variable that no group actually declares', () => {
+  const r = runtime({
+    PROXY_GROUP_1_BOTS: 'A', PROXY_GROUP_1_HOST: '1.2.3.4',
+    // No PROXY_GROUP_2_*, so group 3 is never reached by the scan.
+    PROXY_GROUP_3_BOTS: 'B', PROXY_GROUP_3_LOGIN_PASSWORD: 'orphaned-pw'
+  })
+  r.timers.clear()
+  const out = r.run('systemLogs.map(l => l.text).join("\\n")')
+  assert.match(out, /ignored, no group declares them: PROXY_GROUP_3_BOTS, PROXY_GROUP_3_LOGIN_PASSWORD/)
+  assert.match(out, /Groups start at PROXY_GROUP_1_BOTS/)
+  assert.ok(!out.includes('orphaned-pw'), 'the value is never printed')
+})
+
+test('startup says when a group carries no proxy of its own', () => {
+  const r = runtime({ PROXY_GROUP_1_BOTS: 'A', PROXY_GROUP_1_LOGIN_PASSWORD: 'pw-one' })
+  r.timers.clear()
+  const out = r.run('systemLogs.map(l => l.text).join("\\n")')
+  assert.match(out, /PROXY_GROUP_1 has no HOST — its 1 bot\(s\) use the default route, but its login password still applies/)
 })
 
 test('/play embeds the client once a build exists', async () => {

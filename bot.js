@@ -8,6 +8,7 @@ const {
   createSlowBroadcast,
   createSlowBroadcastManager,
   parseProxyGroups,
+  findIgnoredProxyGroupVars,
   resolveBotProxy,
   hasProxyAuth,
   proxyAuthHeader,
@@ -2910,6 +2911,21 @@ notifyBotsChanged()
 return bot
 }
 
+// ── Group configuration that would otherwise be discovered much later ───────
+// A group with no HOST is legitimate (it groups accounts and carries a login
+// password), but a PROXY_GROUP_<N>_* variable that belongs to no group is always
+// a mistake: the group scan stops at the first missing PROXY_GROUP_<N>_BOTS, so
+// everything after a gap is dropped. Both used to be entirely silent, and the
+// only symptom was bots logging in with the wrong password.
+for (const g of PROXY_GROUPS) {
+if (!g.host) logFor(SYSTEM_ID, `{yellow-fg}⚠ PROXY_GROUP_${g.index} has no HOST — its ${g.bots.length} bot(s) use the default route${g.loginPassword ? `, but its login password still applies` : ''}.{/yellow-fg}`)
+}
+const ignoredGroupVars = findIgnoredProxyGroupVars(process.env, PROXY_GROUPS)
+if (ignoredGroupVars.length) {
+logFor(SYSTEM_ID, `{yellow-fg}⚠ ignored, no group declares them: ${sanitize(ignoredGroupVars.join(', '))}{/yellow-fg}`)
+logFor(SYSTEM_ID, '{yellow-fg}  Groups start at PROXY_GROUP_1_BOTS and stop at the first missing number, so one gap drops every later group.{/yellow-fg}')
+}
+
 // ── Connect all bots with staggered delay ───────────────────────────────────
 let currentConnectDelay = 0
 const initialConnectTimers = []
@@ -4791,8 +4807,10 @@ PROXY_GROUPS.forEach(g => {
 // Credentials belong to the proxy TARGET, not to the bot: a group that sets
 // none sends none, even when the global PROXY_USER/PROXY_PASS is configured.
 // Inheriting would hand the global password to a different proxy operator.
-const auth = hasProxyAuth(g) ? ` · auth: PROXY_GROUP_${g.index}_USER/_PASS` : ' · auth: none'
-logInfo(`  [${g.index}] ${g.bots.join(', ')} → ${describeProxy(g)}${auth}`)
+const auth = hasProxyAuth(g) ? ` · proxy auth: PROXY_GROUP_${g.index}_USER/_PASS` : (g.host ? ' · proxy auth: none' : '')
+const login = g.loginPassword ? ` · login: PROXY_GROUP_${g.index}_LOGIN_PASSWORD` : ''
+const target = g.host ? describeProxy(g) : 'no dedicated proxy (uses the default connection)'
+logInfo(`  [${g.index}] ${g.bots.join(', ')} → ${target}${auth}${login}`)
 })
 logInfo(PROXY_DEFAULT ? `  (other bots) → ${describeProxy(PROXY_DEFAULT)}` : '  (other bots) → direct connection')
 }

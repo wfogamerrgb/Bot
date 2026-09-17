@@ -553,7 +553,7 @@ item matches, the bot falls back to `GUI_SLOT`.
 | `PROXY_STALL_RATIO` | `0.5` | Fraction of stalled bots that triggers proxy restart |
 | `PROXY_RESTART_CMD` | local Tor restart when applicable | Optional proxy restart command |
 | `PROXY_GROUP_<N>_BOTS` | unset | Comma-separated bot usernames dedicated to group `N` (starts at 1, no gaps) |
-| `PROXY_GROUP_<N>_HOST` | unset | Proxy host for group `N` |
+| `PROXY_GROUP_<N>_HOST` | unset | Proxy host for group `N`. Optional — without it the group is an account grouping and its bots use the fallback route |
 | `PROXY_GROUP_<N>_PORT` | `1080` | Proxy port for group `N` |
 | `PROXY_GROUP_<N>_TYPE` | `socks5` | `socks5` or `http` for group `N` |
 | `PROXY_GROUP_<N>_USER` | empty | Username for group `N`'s proxy |
@@ -561,6 +561,25 @@ item matches, the bot falls back to `GUI_SLOT`.
 | `PROXY_GROUP_<N>_LOGIN_PASSWORD` | empty | *Minecraft* password for group `N`'s bots — not a proxy credential |
 
 Bots not listed in any `PROXY_GROUP_<N>_BOTS` fall back to the global `PROXY_HOST` above (or connect directly if it's unset). `/proxy` reports both the configured groups and the fallback.
+
+**A group is defined by its bot list, not by its host.** `PROXY_GROUP_<N>_BOTS` alone is enough, and a group without `PROXY_GROUP_<N>_HOST` is a legitimate *account* grouping: its `LOGIN_PASSWORD` applies and its bots use the default route. This used to be dropped in silence — the whole group, password included — so a group that only separated accounts appeared to work while every bot logged in with the wrong password.
+
+The scan starts at `PROXY_GROUP_1_BOTS` and **stops at the first missing number**, so one gap discards every later group (host, credentials, bot list, password). Startup now says so rather than applying nothing:
+
+```
+⚠ PROXY_GROUP_1 has no HOST — its 11 bot(s) use the default route, but its login password still applies.
+⚠ ignored, no group declares them: PROXY_GROUP_3_BOTS, PROXY_GROUP_3_LOGIN_PASSWORD
+  Groups start at PROXY_GROUP_1_BOTS and stop at the first missing number, so one gap drops every later group.
+```
+
+`/proxy` prints the same facts on demand, naming the variables rather than the values:
+
+```
+Dedicated proxy groups: 2 configured
+  [1] 1evArchUsr2, HyprC0re7 → no dedicated proxy (uses the default connection) · login: PROXY_GROUP_1_LOGIN_PASSWORD
+  [2] DaelinFrostV47, … → SOCKS5 provider-two@5.6.7.8:1080 · proxy auth: PROXY_GROUP_2_USER/_PASS · login: PROXY_GROUP_2_LOGIN_PASSWORD
+  (other bots) → direct connection
+```
 
 Credentials are **per proxy target, not per bot**. Each group sends its own `PROXY_GROUP_<N>_USER` / `PROXY_GROUP_<N>_PASS`, and a group with none sends none — it never borrows the global pair, because that would hand one provider's password to a different provider. A username with no password is valid (some SOCKS5 setups authenticate on the username alone), and so is a password with no username.
 
