@@ -313,6 +313,21 @@ node bot-rtp.js
 `BOT_NAMES` is required by `bot.js`. If it is missing or empty, the process
 exits instead of starting with no managed bots.
 
+Docker is not required. A plain checkout runs the whole app with the same
+settings; only three things differ, all of them handled for you:
+
+- **No Tor.** `PROXY_HOST` defaults to empty, which means bots connect directly.
+  The container's `127.0.0.1:9050` Tor default comes from
+  `docker-entrypoint.sh`, not from the app.
+- **No privileged port.** `WEB_PORT` still defaults to `80`, but a non-root user
+  gets `EACCES` and the server falls back to `81`, `82`, … automatically.
+  Set `WEB_PORT=8080` if you would rather pick the port yourself.
+- **No baked-in Minecraft web client.** `/play` builds it on demand (see
+  [Minecraft web client](#minecraft-web-client-play-tab)).
+
+The plain local run also persists its state next to the checkout
+(`data/`, `cron-jobs.json`, `removed-bots.json`), all of which are gitignored.
+
 ## Docker
 
 The Docker helper uses numbered environment files. Create `.env.docker1`,
@@ -665,9 +680,27 @@ and streams the pack back.
 If the build is missing, `/play` shows a "build not found" page with these
 instructions instead of embedding anything remote.
 
+**Running without Docker builds the client on demand.** The container image
+bakes the client in, so `/play` works immediately there; `npm run start` on a
+bare checkout has no build at all. With `MC_WEB_AUTO_BUILD` on (the default)
+the build starts by itself the first time `/play` is opened — lazily, exactly
+like the client server itself, so nothing is downloaded or compiled unless you
+actually open the tab — and the page shows live build output, refreshing itself
+until the client is ready. A failed build shows the tail of the output plus the
+command to retry. Set `MC_WEB_AUTO_BUILD=false` to keep the old behaviour and
+build by hand.
+
+The build is bash-only (`set -euo pipefail`). Debian and Ubuntu point `/bin/sh`
+at dash, which rejects `pipefail` with `set: Illegal option -o pipefail`, so
+both `npm run web-client:build` and the on-demand build invoke it with `bash`
+(the interpreter the Dockerfile uses). A stray `sh scripts/build-web-client.sh`
+fails immediately on those systems.
+
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `MC_WEB_ENABLED` | `true` | Show the PLAY button and `/play` route |
+| `MC_WEB_ENABLED` | `true` | Show the PLAY button and `/play` route; also gates the on-demand build |
+| `MC_WEB_AUTO_BUILD` | `true` | Build the client automatically on the first `/play` when no build exists (the Docker image already has one, so this only matters outside Docker). `false` = never build; `/play` shows the build-not-found page |
+| `MC_WEB_BUILD_CMD` | *(empty)* | Override the build command run by the on-demand build (default: `bash scripts/build-web-client.sh`), e.g. a wrapper that adds a proxy or a mirror |
 | `MC_WEB_CLIENT_URL` | *(empty)* | Override client page URL (e.g. `https://client.example.com`); empty = serve the local build |
 | `MC_WEB_CLIENT_PORT` | `8090` | Local port serving the client build (bound only while `/play` is open; freed when you leave) |
 | `MC_WEB_CLIENT_PORT_MAX_ATTEMPTS` | `10` | Fallback ports tried if 8090 is taken |

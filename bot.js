@@ -196,6 +196,14 @@ const MC_WEB_CLIENT_PORT = parseInt(process.env.MC_WEB_CLIENT_PORT || '8090', 10
 const MC_WEB_CLIENT_PORT_MAX_ATTEMPTS = parseInt(process.env.MC_WEB_CLIENT_PORT_MAX_ATTEMPTS || '10', 10)
 const MC_WEB_CLIENT_DIR = process.env.MC_WEB_CLIENT_DIR || require('path').join(__dirname, 'web-client', 'dist')
 const MC_WEB_CLIENT_HOST_PORT = process.env.MC_WEB_CLIENT_HOST_PORT || '' // host-side client port when docker maps it (set by run-docker.sh)
+// Non-Docker installs have no baked-in client build (the Dockerfile produces
+// web-client/dist; a plain `npm run start` never has). With this on (default)
+// the build runs automatically the first time /play is opened — lazily, so
+// nothing is downloaded or compiled unless the tab is actually used — and the
+// page shows progress until it is ready. Set MC_WEB_AUTO_BUILD=false to keep
+// the old behaviour (a "build not found" page telling you to build by hand).
+const MC_WEB_AUTO_BUILD = /^(1|true|yes|on)$/i.test(process.env.MC_WEB_AUTO_BUILD ?? 'true')
+const MC_WEB_BUILD_CMD = (process.env.MC_WEB_BUILD_CMD || '').trim() // override the build command (default: sh scripts/build-web-client.sh)
 const MC_WEB_SERVER = process.env.MC_WEB_SERVER || '' // e.g. play.example.com:25565 (prefilled server address)
 const MC_WEB_VERSION = process.env.MC_WEB_VERSION || '1.21.4' // protocol version the client uses
 const MC_WEB_USERNAME = process.env.MC_WEB_USERNAME || '' // offline-mode username prefilled in the client
@@ -336,7 +344,16 @@ const PROXY_STALL_TIMEOUT_MS = parseInt(process.env.PROXY_STALL_TIMEOUT_MS || '9
 const PROXY_STALL_CHECK_MS = parseInt(process.env.PROXY_STALL_CHECK_MS || '20000', 10)
 const PROXY_STALL_RATIO = parseFloat(process.env.PROXY_STALL_RATIO || '0.5')
 const PROXY_IS_LOCAL = /^(127\.0\.0\.1|localhost|::1)$/i.test(PROXY_HOST)
-const PROXY_RESTART_CMD = process.env.PROXY_RESTART_CMD || (PROXY_IS_LOCAL ? 'brew services restart tor' : '')
+// Only a local SOCKS proxy can be restarted from here, and the command to do it
+// differs per platform: Homebrew on macOS, systemd on Linux. It used to assume
+// brew unconditionally, so a Linux host running Tor locally hit "brew: command
+// not found" from the stall watchdog. Unset on anything else — the watchdog
+// then stays quiet instead of spawning a command that cannot work.
+const PROXY_RESTART_CMD = process.env.PROXY_RESTART_CMD || (PROXY_IS_LOCAL
+? (process.platform === 'darwin' ? 'brew services restart tor'
+: process.platform === 'linux' ? 'systemctl restart tor 2>/dev/null || sudo systemctl restart tor'
+: '')
+: '')
 const PROXY_RESTART_COOLDOWN_MS = parseInt(process.env.PROXY_RESTART_COOLDOWN_MS || '120000', 10)
 let lastProxyRestart = 0
 
@@ -1545,7 +1562,43 @@ webClientHandle = { started: false, port: null, reason: "", server: null, dir: M
 webClientReady = null
 webClientLastPing = 0
 }
+// ── On-demand client build (non-Docker installs) ─────────────────────────────
+// Docker bakes web-client/dist into the image, so containers always have it.
+// A plain `npm run start` does not, which made /play useless outside Docker.
+// MC_WEB_AUTO_BUILD (default on) builds it the first time /play is opened.
+function webClientBuildState () {
+  try { return require('./web-client').buildState() } catch (_) { return { running: false, ok: false, error: '', tail: [], logFile: '' } }
+}
+function webClientBuildExists () {
+  try { return require('./web-client').buildExists(MC_WEB_CLIENT_DIR) } catch (_) { return false }
+}
+// Returns true when a build is running now (or already was).
+function ensureWebClientBuild () {
+  let wc
+  try { wc = require('./web-client') } catch (_) { return false }
+  const st = wc.buildState()
+  if (st.running) return true
+  if (wc.buildExists(MC_WEB_CLIENT_DIR)) return false
+  const started = wc.startBuild({
+    dir: MC_WEB_CLIENT_DIR,
+    command: MC_WEB_BUILD_CMD,
+    log: m => logFor(SYSTEM_ID, `{gray-fg}[web-client build] ${sanitize(m)}{/gray-fg}`)
+  })
+  if (started && started.running) {
+    logFor(SYSTEM_ID, '{yellow-fg}⛏ Minecraft web client is not built yet — building it now (the first run clones zardoy/minecraft-web-client and takes a few minutes; /play shows progress). Set MC_WEB_AUTO_BUILD=false to skip this.{/yellow-fg}')
+    return true
+  }
+  return false
+}
+
 function ensureWebClient() {
+// Checked synchronously, before a promise is cached: the build runs in the
+// background, so a later /play request must re-check rather than reuse a
+// "not started" result forever.
+if (!webClientReady && !webClientBuildExists()) {
+if (MC_WEB_AUTO_BUILD) ensureWebClientBuild()
+return { started: false, port: null, reason: 'client build missing', server: null, dir: MC_WEB_CLIENT_DIR }
+}
 if (!webClientReady) {
 webClientReady = (async () => {
 try {
@@ -1588,6 +1641,43 @@ a{color:#2dd4bf}</style></head><body>
 <a href="/">\u2190 back to dashboard</a>
 </body></html>`
 }
+// /play while the on-demand build runs. Auto-refreshes so the tab turns into
+// the client by itself once the build finishes. Safe to leave open — the build
+// continues in the background regardless of what the browser does.
+function clientBuildingHtml(st) {
+  const lines = (st.tail || []).slice(-14).map(l => escHtml(l)).join('\n')
+  const seconds = st.startedAt ? Math.max(0, Math.round((Date.now() - st.startedAt) / 1000)) : 0
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Minecraft — building…</title>
+<meta http-equiv="refresh" content="10">
+<style>html,body{height:100%;margin:0;background:#0a0e13;color:#c7d2dc;font:13px/1.5 ui-monospace,Consolas,monospace;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:24px}
+pre{background:#0d141d;border:1px solid #1d2836;border-radius:8px;padding:12px 14px;color:#8fa3b5;max-width:min(860px,92vw);max-height:38vh;overflow:auto;margin:0;white-space:pre-wrap}
+code{background:#131b25;border:1px solid #1d2836;border-radius:6px;padding:2px 8px;color:#67e8f9}
+a{color:#2dd4bf}.b{color:#2dd4bf;font-weight:bold}.m{color:#5b6b7a}</style></head><body>
+<div><span class="b">⛏ Minecraft Web Client</span> — building… (${seconds}s)</div>
+<div class="m" style="max-width:660px;text-align:center">This build is only needed outside Docker: the container image bakes the client in, a plain <code>npm run start</code> has to build it once. This page refreshes itself every 10s.</div>
+<pre>${lines || '(waiting for output…)'}</pre>
+<div class="m">Full log: <code>${escHtml(st.logFile || 'web-client/build.log')}</code></div>
+<a href="/">← back to dashboard</a>
+</body></html>`
+}
+
+// /play when the on-demand build failed. Shows the tail of the build output and
+// both ways forward, rather than a generic "build not found".
+function clientBuildFailedHtml(st) {
+  const lines = (st.tail || []).slice(-24).map(l => escHtml(l)).join('\n')
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Minecraft — build failed</title>
+<style>html,body{height:100%;margin:0;background:#0a0e13;color:#c7d2dc;font:13px/1.5 ui-monospace,Consolas,monospace;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:24px}
+pre{background:#0d141d;border:1px solid #3b1d22;border-radius:8px;padding:12px 14px;color:#c9a3a8;max-width:min(880px,92vw);max-height:38vh;overflow:auto;margin:0;white-space:pre-wrap}
+code{background:#131b25;border:1px solid #1d2836;border-radius:6px;padding:2px 8px;color:#67e8f9}
+a{color:#2dd4bf}.b{color:#f87171;font-weight:bold}.m{color:#5b6b7a}</style></head><body>
+<div><span class="b">⛏ Minecraft Web Client</span> — build failed</div>
+<div style="color:#fca5a5;max-width:700px;text-align:center">${escHtml(st.error || 'the build did not complete')}</div>
+<pre>${lines || '(no output captured)'}</pre>
+<div class="m" style="max-width:720px;text-align:center;line-height:1.7">Retry with <code>npm run web-client:build</code>, or point <code>MC_WEB_CLIENT_DIR</code> at an existing build. Set <code>MC_WEB_AUTO_BUILD=false</code> to stop building on <code>/play</code>. The build needs <code>git</code>, <code>bash</code>, network access, and ~2 GB of free disk.</div>
+<a href="/">← back to dashboard</a>
+</body></html>`
+}
+
 function newSession() {
 const token = crypto.randomBytes(24).toString('base64url')
 sessions.set(token, Date.now() + SESSION_MS)
@@ -1806,8 +1896,13 @@ if (!MC_WEB_ENABLED) { res.writeHead(404); res.end('not found'); return }
 webClientLastPing = Date.now()
 await ensureWebClient()
 if (!webClientHandle.started && !MC_WEB_CLIENT_URL) {
+// Not serving: either the on-demand build is running, it failed, or
+// auto-build is off and the build was never made.
+const build = webClientBuildState()
 res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' })
-res.end(clientNotBuiltHtml())
+if (build.running) res.end(clientBuildingHtml(build))
+else if (build.finishedAt && !build.ok) res.end(clientBuildFailedHtml(build))
+else res.end(clientNotBuiltHtml())
 return
 }
 webTrace('serving minecraft web client page')
@@ -2026,6 +2121,18 @@ try { process.stdout.write(`[web] listening on ${WEB_BIND}:${port} — open port
 })
 }
 listenFallback(WEB_PORT, WEB_PORT_MAX_ATTEMPTS)
+// Tell the user up front that /play still needs a build, so it is discoverable
+// without clicking PLAY first. Nothing is built here — the build only starts on
+// the first /play request, so an unused tab costs nothing.
+if (webClientBuildExists()) {
+if (MC_WEB_ENABLED) logFor(SYSTEM_ID, `{gray-fg}\u26cf Minecraft web client build found (${MC_WEB_CLIENT_DIR}) \u2014 /play is ready{/gray-fg}`)
+} else if (!MC_WEB_ENABLED) {
+// client disabled entirely — say nothing
+} else if (MC_WEB_AUTO_BUILD) {
+logFor(SYSTEM_ID, '{gray-fg}\u26cf Minecraft web client build not found \u2014 opening /play will build it once (or run npm run web-client:build now){/gray-fg}')
+} else {
+logFor(SYSTEM_ID, `{yellow-fg}\u26cf Minecraft web client build not found in ${MC_WEB_CLIENT_DIR} and MC_WEB_AUTO_BUILD is off \u2014 run npm run web-client:build to enable /play{/yellow-fg}`)
+}
 // Live views of the lazy web-client state (started on first /play request).
 Object.defineProperty(handle, 'webClient', { get: () => webClientHandle, configurable: true })
 Object.defineProperty(handle, 'webClientReady', { get: () => webClientReady, configurable: true })

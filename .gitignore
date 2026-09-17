@@ -10,3 +10,6 @@ node_modules/
 data/*.json
 cron-jobs.json
 removed-bots.json
+# Local web-client build (dist + cloned upstream src + build.log).
+# Built on demand by `npm run web-client:build` or automatically on first /play.
+web-client/

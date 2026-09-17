@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node bot.js",
     "test": "node --test test/*.test.js",
-    "web-client:build": "sh ./scripts/build-web-client.sh",
+    "web-client:build": "bash ./scripts/build-web-client.sh",
     "web-client:serve": "node web-client.js",
     "postinstall": "npx patch-package || echo 'mineflayer patch already included or not applicable'"
   },

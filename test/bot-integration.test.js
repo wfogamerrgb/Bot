@@ -25,7 +25,11 @@ function runtime(env = {}) {
   // shared path would leak jobs between tests (and write into the repo).
   const cronStateFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'bot-cron-')), 'cron-jobs.json')
   const processMock = {
-    env: { BOT_NAMES: 'A,B,C', WEB_GUI: 'true', TUI_GUI: 'false', WEB_PASSWORD: 'test-only', WEB_TERMINAL_LOG: 'false', CRON_STATE_FILE: cronStateFile, ...env },
+    // MC_WEB_AUTO_BUILD is forced off here (the app default is ON): with it on,
+// a /play request for an unbuilt client would clone and build the real
+// multi-GB upstream client from the test suite. Tests that need a build point
+// MC_WEB_CLIENT_DIR at a temp dir instead.
+  env: { BOT_NAMES: 'A,B,C', WEB_GUI: 'true', TUI_GUI: 'false', WEB_PASSWORD: 'test-only', WEB_TERMINAL_LOG: 'false', MC_WEB_AUTO_BUILD: 'false', CRON_STATE_FILE: cronStateFile, ...env },
     stdout: { isTTY: false, write() {} }, stderr: { write() {} },
     on() {}, exit() {}, memoryUsage: () => ({ rss: 0, heapUsed: 0 }), uptime: () => 1
   }
@@ -462,8 +466,11 @@ test('/play shows the build-not-found page when the client build is missing', as
   assert.match(res.body, /npm run web-client:build/)
   assert.doesNotMatch(res.body, /<iframe/)
   assert.doesNotMatch(res.body, /mcraft\.fun/)
-  const h = await r.run('webHandle.webClientReady')
-  assert.equal(h.started, false)
+  // webClientReady is deliberately NOT cached for a missing build (the build
+  // can finish later, so a later request has to re-check) — assert on the live
+  // state instead, which is what "no client server started" really means.
+  assert.equal((await r.run('webHandle.webClient')).started, false)
+  assert.equal(await r.run('webHandle.webClientReady'), null)
 })
 
 test('/play and the PLAY button are disabled when MC_WEB_ENABLED=false', async () => {
@@ -580,4 +587,84 @@ test('handleCommand routes chained commands with &&, ;, sleep, and escaping', as
     ['A', 'step2'],
     ['A', 'step3']
   ])
+})
+
+// ── /play outside Docker ──────────────────────────────────────────────────────
+// The Dockerfile bakes web-client/dist into the image, so containers always have
+// the client; a plain `npm run start` has to build it. These pin the page each
+// state renders, and that turning auto-build off never spawns one.
+const wcModule = require('../web-client')
+function emptyDistDir () {
+  return path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'play-dist-')), 'dist')
+}
+
+async function waitForBuild () {
+  for (let i = 0; i < 200 && wcModule.buildState().running; i++) {
+    await new Promise(resolve => setTimeout(resolve, 25))
+  }
+  assert.equal(wcModule.buildState().running, false, 'build should have finished')
+  return wcModule.buildState()
+}
+
+test('MC_WEB_AUTO_BUILD still defaults on for real installs', () => {
+  // The test harness forces it off (see runtime); the app's own default is on,
+  // which is what makes /play work from a plain `npm run start`.
+  assert.equal(runtime({ MC_WEB_AUTO_BUILD: undefined }).run('MC_WEB_AUTO_BUILD'), true)
+  assert.equal(runtime({ MC_WEB_AUTO_BUILD: 'true' }).run('MC_WEB_AUTO_BUILD'), true)
+  for (const flag of ['false', '0', 'no', 'OFF']) {
+    assert.equal(runtime({ MC_WEB_AUTO_BUILD: flag }).run('MC_WEB_AUTO_BUILD'), false)
+  }
+})
+
+test('/play says the build is missing and spawns nothing when auto-build is off', async () => {
+  const r = runtime({ MC_WEB_AUTO_BUILD: 'false', MC_WEB_CLIENT_DIR: emptyDistDir() })
+  r.timers.clear()
+  const cookie = await r.login()
+  const res = await r.request('/play', '', cookie, 'GET')
+  assert.equal(res.status, 200)
+  assert.match(res.body, /build not found/)
+  assert.match(res.body, /npm run web-client:build/)
+  assert.equal(wcModule.buildState().running, false, 'auto-build=false must not start a build')
+})
+
+test('/play shows live progress while the client build runs, then the failure', async () => {
+  const dist = emptyDistDir()
+  // A build that produces nothing: exits 0 but leaves no index.html.
+  wcModule.startBuild({ dir: dist, command: 'sleep 1' })
+  assert.equal(wcModule.buildState().running, true)
+
+  const r = runtime({ MC_WEB_AUTO_BUILD: 'false', MC_WEB_CLIENT_DIR: dist })
+  r.timers.clear()
+  const cookie = await r.login()
+  const building = await r.request('/play', '', cookie, 'GET')
+  assert.equal(building.status, 200)
+  assert.match(building.body, /building…/)
+  // Self-refreshing, so the tab becomes the client once the build lands.
+  assert.match(building.body, /http-equiv="refresh"/)
+
+  const finished = await waitForBuild()
+  assert.equal(finished.ok, false)
+  const failed = await r.request('/play', '', cookie, 'GET')
+  assert.equal(failed.status, 200)
+  assert.match(failed.body, /build failed/)
+  // The failure page must point at both ways forward.
+  assert.match(failed.body, /npm run web-client:build/)
+  assert.match(failed.body, /MC_WEB_AUTO_BUILD=false/)
+})
+
+test('/play embeds the client once a build exists', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'play-built-'))
+  const dist = path.join(dir, 'dist')
+  fs.mkdirSync(dist, { recursive: true })
+  fs.writeFileSync(path.join(dist, 'index.html'), '<!doctype html><title>built</title>')
+  // An off-the-beaten-path port: the harness mocks bot.js's own http module, but
+  // web-client.js is loaded for real and would otherwise bind the default 8090.
+  const r = runtime({ MC_WEB_AUTO_BUILD: 'false', MC_WEB_CLIENT_DIR: dist, MC_WEB_CLIENT_PORT: '47899' })
+  r.timers.clear()
+  const cookie = await r.login()
+  const res = await r.request('/play', '', cookie, 'GET')
+  assert.equal(res.status, 200)
+  assert.match(res.body, /<iframe/)
+  assert.doesNotMatch(res.body, /build not found/)
+  try { wcModule.stopWebClient(r.run('webHandle.webClient'), () => {}) } catch (_) {}
 })
