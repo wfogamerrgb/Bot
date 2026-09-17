@@ -789,6 +789,30 @@ test('/proxy lists each group with its own auth source, without ever printing a 
   assert.ok(!out.includes('global-secret'), 'global password leaked into /proxy output')
 })
 
+test('/status reports which variable supplies the login password, per bot', () => {
+  const r = runtime({
+    LOGIN_PASSWORD: 'global-pw',
+    PROXY_GROUP_1_BOTS: 'A', PROXY_GROUP_1_HOST: '1.2.3.4', PROXY_GROUP_1_LOGIN_PASSWORD: 'group-pw'
+  })
+  r.timers.clear()
+  r.context.__lines = []
+  r.run('subscribeLog((id, line) => __lines.push(String(line)))')
+
+  r.run(`bots.A.bot.entity = { position: { x: 1, y: 2, z: 3 } }`)
+  r.run(`bots.B.bot.entity = { position: { x: 4, y: 5, z: 6 } }`)
+
+  r.run(`handleCommand('/switch A'); handleCommand('/status')`)
+  r.run(`handleCommand('/switch B'); handleCommand('/status')`)
+  const out = r.context.__lines.join('\n')
+
+  // Bot A is in group 1, so it reports the group's password variable…
+  assert.match(out, /Login password: from PROXY_GROUP_1_LOGIN_PASSWORD/)
+  // …and bot B, in no group, reports the global one. The password itself is never printed.
+  assert.match(out, /Login password: from LOGIN_PASSWORD/)
+  assert.ok(!out.includes('group-pw'))
+  assert.ok(!out.includes('global-pw'))
+})
+
 test('/play embeds the client once a build exists', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'play-built-'))
   const dist = path.join(dir, 'dist')

@@ -499,7 +499,7 @@ check logs before retrying to avoid accidentally executing a command twice.
 | `HOST` | `play.fatalmc.org` | Minecraft server host |
 | `PORT` | `25565` | Minecraft server port |
 | `VERSION` | `1.21.2` | Minecraft protocol version, passed to mineflayer unchanged |
-| `LOGIN_PASSWORD` | `123456` | Password sent to register/login prompts |
+| `LOGIN_PASSWORD` | `123456` | Password sent to register/login prompts. Fallback for bots not covered by a `PROXY_GROUP_<N>_LOGIN_PASSWORD` |
 | `BOT_NAMES` | required | Comma-separated bot usernames |
 | `CONNECT_DELAY_MS` | `39500` | Delay between initial bot connections |
 | `CONNECT_DELAY_RANDOM_MS` | `0` | Additional random delay range |
@@ -552,6 +552,7 @@ item matches, the bot falls back to `GUI_SLOT`.
 | `PROXY_GROUP_<N>_TYPE` | `socks5` | `socks5` or `http` for group `N` |
 | `PROXY_GROUP_<N>_USER` | empty | Username for group `N`'s proxy |
 | `PROXY_GROUP_<N>_PASS` | empty | Password for group `N`'s proxy. `_PASSWORD` also works |
+| `PROXY_GROUP_<N>_LOGIN_PASSWORD` | empty | *Minecraft* password for group `N`'s bots — not a proxy credential |
 
 Bots not listed in any `PROXY_GROUP_<N>_BOTS` fall back to the global `PROXY_HOST` above (or connect directly if it's unset). `/proxy` reports both the configured groups and the fallback.
 
@@ -577,6 +578,42 @@ PROXY_GROUP_2_PASS=secret-two
 ```
 
 SOCKS5 credentials are negotiated per RFC 1929; HTTP proxies get `Proxy-Authorization: Basic …` on the `CONNECT`. A proxy that answers **407** produces a message naming the exact variables to set (`PROXY_GROUP_2_USER / _PASS`) rather than a bare status line. Passwords are never printed — `/proxy` shows the target and the username, and the log/stderr paths show the target only, so credentials cannot reach the console, the browser panel, or Discord.
+
+### Login passwords per group
+
+`LOGIN_PASSWORD` is the password each bot sends to the server's `/register` and `/login`
+prompts. It can be set per group, so a batch of accounts registered with a different
+password still gets in:
+
+```ini
+LOGIN_PASSWORD=shared-password          # everyone not covered below
+
+PROXY_GROUP_1_BOTS=Bot1,Bot2
+PROXY_GROUP_1_HOST=1.2.3.4
+PROXY_GROUP_1_LOGIN_PASSWORD=those-accounts-password
+
+PROXY_GROUP_2_BOTS=Bot3
+PROXY_GROUP_2_HOST=5.6.7.8
+PROXY_GROUP_2_LOGIN_PASSWORD=their-own-password
+```
+
+Precedence is `PROXY_GROUP_<N>_LOGIN_PASSWORD` → `LOGIN_PASSWORD` → the built-in `123456`,
+so a group that sets nothing is unchanged by this feature. `LOGIN_PASSWORD` is *not*
+required when every bot is in a group.
+
+This is the **account** password, unrelated to `PROXY_GROUP_<N>_USER` / `_PASS` (the
+proxy's login) — the group is only used here as "these bots belong together". The group
+is the place to configure it because that is where the bot list already lives.
+
+The password is never logged: `/status` reports which variable supplied it
+(`Login password: from PROXY_GROUP_1_LOGIN_PASSWORD`) and the auth prompt does the same,
+which is what you need to debug a rejected login without putting the value in the
+dashboard, the log file, or Discord.
+
+> Because the password is attached to the group, moving a bot to another group changes
+the password it logs in with. If a bot is registered on the server with its own
+password, keep it in a group whose `LOGIN_PASSWORD` matches. A per-bot map is not
+implemented — ask if you want one.
 
 ### Web dashboard
 

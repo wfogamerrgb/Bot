@@ -13,6 +13,7 @@ const {
   proxyAuthHeader,
   buildHttpConnectRequest,
   describeProxy,
+  resolveLoginPassword,
   parseSleepDuration,
   parseCommandChain,
   executeCommandChain: executeCommandChainBase,
@@ -44,7 +45,9 @@ try { ({ SocksClient } = require('socks')) } catch (_) { /* only needed if PROXY
 const HOST = process.env.HOST || 'play.fatalmc.org'
 const PORT = parseInt(process.env.PORT || '25565', 10)
 const VERSION = process.env.VERSION || '1.21.2'
-const LOGIN_PASSWORD = process.env.LOGIN_PASSWORD || '123456'
+// The /register + /login password is resolved PER BOT (resolveLoginPassword),
+// so each proxy group of accounts can use its own; LOGIN_PASSWORD stays the
+// fallback for every bot not covered by a group. See bot-controls.js.
 const BOT_NAMES = (process.env.BOT_NAMES || '').split(',').map(n => n.trim()).filter(Boolean)
 const CONNECT_DELAY_MS = parseInt(process.env.CONNECT_DELAY_MS || '39500', 10)
 const CONNECT_DELAY_RANDOM_MS = parseInt(process.env.CONNECT_DELAY_RANDOM_MS || '0', 10)
@@ -2482,14 +2485,16 @@ if (requester && bots[id]?.tpautoEnabled) {
 
 // Grep for register prompts (e.g., "Please register using /register <password> <password>")
 if (text.includes('register') && text.includes('/register')) {
-i('Auth prompt detected: sending /register')
-pushT(() => bot.chat(`/register ${LOGIN_PASSWORD} ${LOGIN_PASSWORD}`), 220 + Math.random() * 400)
+const auth = resolveLoginPassword(id, PROXY_GROUPS, process.env)
+i(`Auth prompt detected: sending /register (password from ${auth.source})`)
+pushT(() => bot.chat(`/register ${auth.password} ${auth.password}`), 220 + Math.random() * 400)
 }
 
 // Grep for login prompts (e.g., "Please login using /login <password>")
 else if (text.includes('login') && text.includes('/login')) {
-i('Auth prompt detected: sending /login')
-pushT(() => bot.chat(`/login ${LOGIN_PASSWORD}`), 220 + Math.random() * 400)
+const auth = resolveLoginPassword(id, PROXY_GROUPS, process.env)
+i(`Auth prompt detected: sending /login (password from ${auth.source})`)
+pushT(() => bot.chat(`/login ${auth.password}`), 220 + Math.random() * 400)
 }
 })
 
@@ -3319,7 +3324,12 @@ const pos = bot.entity.position
 const uptimeSec = entry.spawnTime ? Math.floor((Date.now() - entry.spawnTime) / 1000) : 0
 logFor(id, `{cyan-fg}› Status for ${id}:{/cyan-fg}`)
 logFor(id, ` Server: ${entry.host}:${entry.port} (v${entry.version})`)
-logFor(id, ` Proxy: ${PROXY_ENABLED ? describeProxy(PROXY_DEFAULT) : 'Direct (no proxy)'}`)
+// The proxy this bot actually resolved to, group included — not the global one.
+// The login password is reported by SOURCE only: which variable to edit is the
+// whole question when a bot cannot get past /login, and the value itself has no
+// business in the dashboard, the log file, or Discord.
+logFor(id, ` Proxy: ${describeProxy(resolveBotProxy(id, PROXY_GROUPS, PROXY_DEFAULT))}`)
+logFor(id, ` Login password: from ${resolveLoginPassword(id, PROXY_GROUPS, process.env).source}`)
 logFor(id, ` Position: ${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)}`)
 logFor(id, ` Health: ${bot.health ?? 'N/A'} Food: ${bot.food ?? 'N/A'}`)
 logFor(id, ` Ping: ${bot.player?.ping ?? 'N/A'}ms`)

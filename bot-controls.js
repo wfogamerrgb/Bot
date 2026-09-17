@@ -332,6 +332,7 @@ async function executeCommandChain(chain, ctx, { executeSingle = () => {}, sleep
 // PROXY_GROUP_<N>_BOTS = comma-separated usernames
 // PROXY_GROUP_<N>_HOST / _PORT / _TYPE = proxy target for that group
 // PROXY_GROUP_<N>_USER / _PASS = credentials for that group (optional)
+// PROXY_GROUP_<N>_LOGIN_PASSWORD = the Minecraft account password for those bots
 // Unassigned bots fall back to the caller-provided default (global PROXY_* or direct).
 function parseProxyGroups(env = process.env) {
   const groups = []
@@ -350,7 +351,12 @@ function parseProxyGroups(env = process.env) {
       ? env[`PROXY_GROUP_${n}_PASS`]
       : env[`PROXY_GROUP_${n}_PASSWORD`]
     const pass = rawPass == null ? '' : String(rawPass)
-    if (bots.length && host) groups.push({ index: n, bots, host, port, type, user, pass })
+    // The ACCOUNT password these bots log in with — nothing to do with the proxy
+    // login above. Not trimmed: a password may legitimately start or end with a
+    // space, and silently altering it would lock the account out.
+    const rawLogin = env[`PROXY_GROUP_${n}_LOGIN_PASSWORD`]
+    const loginPassword = rawLogin == null ? '' : String(rawLogin)
+    if (bots.length && host) groups.push({ index: n, bots, host, port, type, user, pass, loginPassword })
     n++
   }
   return groups
@@ -374,6 +380,26 @@ function resolveBotProxy(username, groups, fallback = null) {
     }
   }
   return fallback
+}
+
+// The password a bot sends to /register and /login prompts. Resolved per bot so
+// a group of accounts can each use their own, with the global LOGIN_PASSWORD as
+// the fallback every existing setup already relies on.
+//
+// The proxy group is used here purely as "these bots belong together" — this is
+// the Minecraft account password, never the proxy's. Returns the source label as
+// well, so a failed /login can be traced to the variable that supplied it
+// without the password itself ever reaching a log line.
+function resolveLoginPassword(username, groups, env = process.env) {
+  if (Array.isArray(groups)) {
+    for (const group of groups) {
+      if (group.bots.includes(username) && group.loginPassword) {
+        return { password: group.loginPassword, source: `PROXY_GROUP_${group.index}_LOGIN_PASSWORD` }
+      }
+    }
+  }
+  if (env && env.LOGIN_PASSWORD) return { password: String(env.LOGIN_PASSWORD), source: 'LOGIN_PASSWORD' }
+  return { password: '123456', source: 'built-in default' }
 }
 
 // True when a resolved proxy carries credentials worth sending.
@@ -434,6 +460,7 @@ module.exports = {
   proxyAuthHeader,
   buildHttpConnectRequest,
   describeProxy,
+  resolveLoginPassword,
   parseSleepDuration,
   parseCommandChain,
   executeCommandChain

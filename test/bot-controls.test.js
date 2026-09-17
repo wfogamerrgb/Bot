@@ -1,7 +1,7 @@
 'use strict'
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const { readDelayMs, readInt, readNumber, parseDumpMode, parseDataArgs, shuffledCopy, createSlowBroadcast, createSlowBroadcastManager, parseProxyGroups, resolveBotProxy, hasProxyAuth, proxyAuthHeader, buildHttpConnectRequest, describeProxy } = require('../bot-controls')
+const { readDelayMs, readInt, readNumber, parseDumpMode, parseDataArgs, shuffledCopy, createSlowBroadcast, createSlowBroadcastManager, parseProxyGroups, resolveBotProxy, hasProxyAuth, proxyAuthHeader, buildHttpConnectRequest, describeProxy, resolveLoginPassword } = require('../bot-controls')
 
 function clock() {
   let time = 0, sequence = 0
@@ -122,8 +122,8 @@ test('parseProxyGroups reads indexed PROXY_GROUP_N_* vars and stops at the first
   }
   const groups = parseProxyGroups(env)
   assert.deepEqual(groups, [
-    { index: 1, bots: ['Alice', 'Bob'], host: '1.2.3.4', port: 1081, type: 'http', user: '', pass: '' },
-    { index: 2, bots: ['Carol'], host: '5.6.7.8', port: 1080, type: 'socks5', user: '', pass: '' }
+    { index: 1, bots: ['Alice', 'Bob'], host: '1.2.3.4', port: 1081, type: 'http', user: '', pass: '', loginPassword: '' },
+    { index: 2, bots: ['Carol'], host: '5.6.7.8', port: 1080, type: 'socks5', user: '', pass: '', loginPassword: '' }
   ])
 })
 
@@ -156,9 +156,9 @@ test('parseProxyGroups gives each group its own credentials', () => {
     PROXY_GROUP_1_BOTS: 'Alice', PROXY_GROUP_1_HOST: '1.2.3.4', PROXY_GROUP_1_USER: 'alice', PROXY_GROUP_1_PASS: 'group-one-secret',
     PROXY_GROUP_2_BOTS: 'Bob', PROXY_GROUP_2_HOST: '5.6.7.8', PROXY_GROUP_2_PASS: 'password-only'
   })
-  assert.deepEqual(groups[0], { index: 1, bots: ['Alice'], host: '1.2.3.4', port: 1080, type: 'socks5', user: 'alice', pass: 'group-one-secret' })
+  assert.deepEqual(groups[0], { index: 1, bots: ['Alice'], host: '1.2.3.4', port: 1080, type: 'socks5', user: 'alice', pass: 'group-one-secret', loginPassword: '' })
   // A username-less group is legal — some SOCKS5 setups authenticate on the password alone.
-  assert.deepEqual(groups[1], { index: 2, bots: ['Bob'], host: '5.6.7.8', port: 1080, type: 'socks5', user: '', pass: 'password-only' })
+  assert.deepEqual(groups[1], { index: 2, bots: ['Bob'], host: '5.6.7.8', port: 1080, type: 'socks5', user: '', pass: 'password-only', loginPassword: '' })
 })
 
 test('parseProxyGroups accepts _PASSWORD as a spelling of _PASS, and _PASS wins when both are set', () => {
@@ -225,6 +225,54 @@ test('hasProxyAuth is true for a username or a password, false otherwise', () =>
   assert.equal(hasProxyAuth({ user: '', pass: '' }), false)
   assert.equal(hasProxyAuth({ user: 'u' }), true)
   assert.equal(hasProxyAuth({ pass: 'p' }), true)
+})
+
+test('parseProxyGroups reads the per-group Minecraft account password', () => {
+  const groups = parseProxyGroups({
+    PROXY_GROUP_1_BOTS: 'Alice,Bob', PROXY_GROUP_1_HOST: '1.2.3.4', PROXY_GROUP_1_LOGIN_PASSWORD: 'group-one-account-pw',
+    PROXY_GROUP_2_BOTS: 'Carol', PROXY_GROUP_2_HOST: '5.6.7.8'
+  })
+  assert.equal(groups[0].loginPassword, 'group-one-account-pw')
+  assert.equal(groups[1].loginPassword, '')
+  // It is the ACCOUNT password, so it must not be confused with the proxy login.
+  assert.equal(groups[0].user, '')
+  assert.equal(groups[0].pass, '')
+})
+
+test('the account password is not trimmed or otherwise rewritten', () => {
+  // Trimming would silently change a password that legitimately has a space and
+  // lock the account out of its own /login.
+  const groups = parseProxyGroups({ PROXY_GROUP_1_BOTS: 'A', PROXY_GROUP_1_HOST: 'h', PROXY_GROUP_1_LOGIN_PASSWORD: ' pw with spaces ' })
+  assert.equal(groups[0].loginPassword, ' pw with spaces ')
+})
+
+test('resolveLoginPassword prefers the group, then LOGIN_PASSWORD, then the built-in default', () => {
+  const groups = parseProxyGroups({
+    PROXY_GROUP_1_BOTS: 'Alice,Bob', PROXY_GROUP_1_HOST: '1.2.3.4', PROXY_GROUP_1_LOGIN_PASSWORD: 'group-pw',
+    PROXY_GROUP_2_BOTS: 'Carol', PROXY_GROUP_2_HOST: '5.6.7.8'
+  })
+  const env = { LOGIN_PASSWORD: 'global-pw' }
+
+  assert.deepEqual(resolveLoginPassword('Alice', groups, env), { password: 'group-pw', source: 'PROXY_GROUP_1_LOGIN_PASSWORD' })
+  // A group that sets no account password falls back to the global one…
+  assert.deepEqual(resolveLoginPassword('Carol', groups, env), { password: 'global-pw', source: 'LOGIN_PASSWORD' })
+  // …and so does a bot in no group at all.
+  assert.deepEqual(resolveLoginPassword('Zed', groups, env), { password: 'global-pw', source: 'LOGIN_PASSWORD' })
+  // No groups configured and no env: the long-standing default, unchanged.
+  assert.deepEqual(resolveLoginPassword('Alice', [], {}), { password: '123456', source: 'built-in default' })
+  assert.deepEqual(resolveLoginPassword('Alice', undefined, {}), { password: '123456', source: 'built-in default' })
+  // An empty LOGIN_PASSWORD means unset, not "empty password".
+  assert.deepEqual(resolveLoginPassword('Alice', [], { LOGIN_PASSWORD: '' }), { password: '123456', source: 'built-in default' })
+})
+
+test('resolveLoginPassword never returns the proxy password as an account password', () => {
+  const groups = parseProxyGroups({
+    PROXY_GROUP_1_BOTS: 'Alice', PROXY_GROUP_1_HOST: '1.2.3.4',
+    PROXY_GROUP_1_USER: 'proxy-user', PROXY_GROUP_1_PASS: 'proxy-secret'
+  })
+  const result = resolveLoginPassword('Alice', groups, { LOGIN_PASSWORD: 'global-pw' })
+  assert.equal(result.password, 'global-pw')
+  assert.notEqual(result.password, 'proxy-secret')
 })
 
 test('multi-task createSlowBroadcastManager: concurrent tasks, independent timers, selective cancellation, and cancelAll', () => {
