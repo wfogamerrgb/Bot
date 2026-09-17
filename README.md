@@ -107,6 +107,35 @@ rest of the run.
 | `CHEST_SCAN_RADIUS` | `30` | Chest search radius around the bot |
 | `CHEST_SCAN_COUNT` | `50` | Maximum chests considered per dump |
 
+#### `/crates-all` sequence options
+
+`/crates-all` and `/crates-solo` run shardshop → crates → dump. What happens
+after the crate step, and what happens to the bot afterwards, is configurable —
+every value keeps its long-standing default, so an existing `.env` behaves
+exactly as before:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CRATES_ALL_DUMP` | `tpa` | What follows the crate step: `off` skips the dump, `tpa` deposits into chests near the teleport target, `home` uses `DUMP_HOME_COMMAND`, `hidden` arms the randomized hidden dump chain once for the whole roster, and anything else is a player name (`CRATES_ALL_DUMP=Smith`) |
+| `CRATES_ALL_AFK_WARP` | `true` | `false` leaves each bot wherever the sequence finished |
+| `CRATES_ALL_AFK_DELAY_MS` | `15000` | `0` warps to AFK the instant the routine ends |
+
+The same two knobs work as per-run flags — `dump=off|tpa|home|hidden|<player>`
+and `afk=now|off|<seconds>` — so:
+
+```text
+/crates-all 5 purple dump=off afk=now   5 bots, no dump, AFK the moment each finishes
+/crates-solo B dump=Smith                one bot, dump at Smith
+/crates-all dump=home afk=off            dump via /home stash, then stay there
+/crates-all dump=hidden                  arm the hidden chain, stay put
+```
+
+Flags apply to that run only and beat the `.env` values. `dump=hidden` turns the
+AFK warp off unless the run explicitly asks for one (`afk=now`, `afk=30`),
+because staying where the bot teleported to is the point of a hidden dump. A
+flag that cannot be read is reported and the run does not start, rather than
+guessing at a target or a delay.
+
 ### Persistent spawner data and `/data`
 
 Every successful `/spawners` run records one current row per bot/spawner number
@@ -997,8 +1026,8 @@ Any unrecognized input is sent as a Minecraft chat message or command.
 | `/dump` | TPA and deposit inventory into nearby chests |
 | `/crates [color]` | Run one crate collection cycle |
 | `/crates-loop [n] [color]` | Repeat crate collection |
-| `/crates-all [n] [color]` | Run shardshop, crates, and dump across bots |
-| `/crates-solo [bot] [color]` | Run that sequence for one bot |
+| `/crates-all [n] [color] [dump=…] [afk=…]` | Run shardshop, crates, and dump across bots; `dump=`/`afk=` override the sequence defaults for that run |
+| `/crates-solo [bot] [color] [dump=…] [afk=…]` | Run that sequence for one bot, with the same flags |
 | `/drop [count]` | Drop the held stack (or `count` items from it) |
 | `/pickup [all]` | Pathfind to the nearest dropped item and collect it (`all` = sweep the area) |
 | `/gui <server command>` | Open a server GUI and manage it manually (no auto-click/auto-warp) |

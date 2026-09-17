@@ -1,7 +1,7 @@
 'use strict'
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const { readDelayMs, readInt, readNumber, parseDumpMode, parseDataArgs, shuffledCopy, createSlowBroadcast, createSlowBroadcastManager, parseProxyGroups, resolveBotProxy, hasProxyAuth, proxyAuthHeader, buildHttpConnectRequest, describeProxy, resolveLoginPassword, parseBotPasswords, classifyAuthReply, nextAuthFailure, isAuthBlocked, findIgnoredProxyGroupVars } = require('../bot-controls')
+const { readDelayMs, readInt, readNumber, parseDumpMode, parseDataArgs, parseCratesAllDump, parseCratesAllAfk, parseCratesAllFlags, shuffledCopy, createSlowBroadcast, createSlowBroadcastManager, parseProxyGroups, resolveBotProxy, hasProxyAuth, proxyAuthHeader, buildHttpConnectRequest, describeProxy, resolveLoginPassword, parseBotPasswords, classifyAuthReply, nextAuthFailure, isAuthBlocked, findIgnoredProxyGroupVars } = require('../bot-controls')
 
 function clock() {
   let time = 0, sequence = 0
@@ -44,6 +44,43 @@ test('parseDumpMode flags a typo instead of silently starting a TPA dump', () =>
   assert.deepEqual(parseDumpMode('hidden'), { mode: 'hidden', unknown: null })
   assert.deepEqual(parseDumpMode('cancel'), { mode: 'cancel', unknown: null })
   assert.deepEqual(parseDumpMode('hiden'), { mode: 'tpa', unknown: 'hiden' })
+})
+
+test('crates-all dump= picks the dump step, and a bare value is a TPA target', () => {
+  assert.equal(parseCratesAllDump(undefined).dump, 'tpa')
+  assert.equal(parseCratesAllDump('').dump, 'tpa')
+  assert.equal(parseCratesAllDump('OFF').dump, 'off')
+  assert.equal(parseCratesAllDump('none').dump, 'off')
+  assert.equal(parseCratesAllDump('HOME').dump, 'home')
+  assert.equal(parseCratesAllDump('hidden').dump, 'hidden')
+  // `dump=Smith` reads as "dump at Smith" — the same thing `/tpa Smith` does.
+  assert.deepEqual(parseCratesAllDump('Smith'), { dump: 'tpa', target: 'Smith', unknown: null })
+  assert.equal(parseCratesAllDump('player:Jt_2').target, 'Jt_2')
+  // A target that is missing entirely is reported, not run against an empty name.
+  assert.equal(parseCratesAllDump('player:').unknown, 'player:')
+})
+
+test('crates-all afk= understands now/off/seconds and rejects the rest', () => {
+  assert.deepEqual(parseCratesAllAfk('now'), { warp: true, delayMs: 0, unknown: null })
+  assert.deepEqual(parseCratesAllAfk('0'), { warp: true, delayMs: 0, unknown: null })
+  assert.deepEqual(parseCratesAllAfk('off'), { warp: false, delayMs: null, unknown: null })
+  assert.deepEqual(parseCratesAllAfk('false'), { warp: false, delayMs: null, unknown: null })
+  assert.equal(parseCratesAllAfk('30').delayMs, 30000) // a bare number means seconds
+  assert.equal(parseCratesAllAfk('90s').delayMs, 90000)
+  assert.equal(parseCratesAllAfk('1500ms').delayMs, 1500)
+  assert.equal(parseCratesAllAfk('-5').unknown, '-5')
+  assert.equal(parseCratesAllAfk('soon').unknown, 'soon')
+  // Larger than a setTimeout can hold: rejected rather than clamped to 1ms.
+  assert.equal(parseCratesAllAfk('999999999999').unknown, '999999999999')
+})
+
+test('crates-all flags leave unset options null and report unreadable tokens', () => {
+  // Null means "not specified here" so the caller can fall back to .env.
+  assert.deepEqual(parseCratesAllFlags([]), { dump: null, dumpTarget: null, afkWarp: null, afkDelayMs: null, unknown: [] })
+  assert.deepEqual(parseCratesAllFlags(['dump=off', 'afk=now']), { dump: 'off', dumpTarget: null, afkWarp: true, afkDelayMs: 0, unknown: [] })
+  assert.deepEqual(parseCratesAllFlags(['DUMP=Smith', 'AFK=30000ms']), { dump: 'tpa', dumpTarget: 'Smith', afkWarp: true, afkDelayMs: 30000, unknown: [] })
+  // A typo must be reported, never silently treated as a player name or a delay.
+  assert.deepEqual(parseCratesAllFlags(['dump=', 'afk=', 'foo=1', 'dump', '=off']).unknown, ['dump=', 'afk=', 'foo=1', 'dump', '=off'])
 })
 
 test('delay defaults and validation never let Node clamp invalid values to 1ms', () => {

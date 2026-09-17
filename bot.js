@@ -4,6 +4,8 @@ const {
   readInt,
   readNumber,
   parseDumpMode,
+  parseCratesAllDump,
+  parseCratesAllFlags,
   shuffledCopy,
   createSlowBroadcast,
   createSlowBroadcastManager,
@@ -389,6 +391,19 @@ const RANK_COOLDOWN_PATTERN = /you are on cool ?down/i
 const CRATES_ALL_STAGGER_MS = parseInt(process.env.CRATES_ALL_STAGGER_MS || '30000', 10)
 const CRATES_ALL_SHARDSHOP_WAIT_MS = parseInt(process.env.CRATES_ALL_SHARDSHOP_WAIT_MS || '4000', 10)
 const CRATES_ALL_STEP_WAIT_MS = parseInt(process.env.CRATES_ALL_STEP_WAIT_MS || '3000', 10)
+// What /crates-all does once the crates are done. Defaults reproduce the
+// original behaviour exactly (TPA to TPA_MAIN_PLAYER → dump into nearby chests
+// → /warp afk after 15s), so an existing .env keeps working unchanged:
+//   CRATES_ALL_DUMP         off | tpa (default) | home | hidden | <player name>
+//   CRATES_ALL_AFK_WARP     false leaves each bot wherever the sequence ended
+//   CRATES_ALL_AFK_DELAY_MS 0 warps to AFK the instant the routine finishes
+// The same two knobs are available per run as `dump=` / `afk=` flags.
+const CRATES_ALL_DUMP_ENV = parseCratesAllDump(process.env.CRATES_ALL_DUMP)
+const CRATES_ALL_AFK_WARP = /^(1|true|yes|on)$/i.test(process.env.CRATES_ALL_AFK_WARP ?? 'true')
+const CRATES_ALL_AFK_DELAY_MS = readInt(process.env.CRATES_ALL_AFK_DELAY_MS, 15000, 0, 2147483647)
+const CRATES_ALL_FLAGS_USAGE = '[dump=off|tpa|home|hidden|<player>] [afk=now|off|<seconds>]'
+const CRATES_ALL_USAGE = `/crates-all [n] [color] ${CRATES_ALL_FLAGS_USAGE}`
+const CRATES_ALL_SOLO_USAGE = `/crates-solo [bot name or number] [color] ${CRATES_ALL_FLAGS_USAGE}`
 
 // ── /shardshop-loop: keep running /shardshop until the server says there's nothing left ──
 const SHARDSHOP_STOP_PHRASES = (process.env.SHARDSHOP_STOP_PHRASES || 'insufficent fund,not enough,insufficient fund,no more shards,more shards')
@@ -3012,8 +3027,8 @@ const COMMANDS = {
 '/crates [color]': `Warp to crates, find + walk to the nearest shulker box of [color] (default: ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')}, within ${CRATE_SCAN_RADIUS} blocks) and right-click it; falls back to ${WARP_AFK} if not found or unreachable. [color] can be a name like "purple" or a full block id like "purple_shulker_box"`,
 '/crates-loop [n] [color]': 'Run /crates repeatedly (default: until failure). Specify n for a fixed count and/or a crate [color]',
 '/shardshop-loop [slot]': `Repeatedly run ${SHARDSHOP_COMMAND} until the server signals it's empty (grep: SHARDSHOP_STOP_PHRASES) or hits the ${SHARDSHOP_LOOP_MAX_RUNS}-run safety cap; optional [slot] overrides default GUI slot`,
-'/crates-all [n] [color]': `Run shardshop → crates → dump on bots 1 through n (default: all bots) targeting crate [color] (default: ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')}), ${(CRATES_ALL_STAGGER_MS / 1000).toFixed(0)}s apart so they don't hit the server at once`,
-'/crates-solo [bot] [color]': 'Run shardshop → crates → dump on just one bot (default: active bot) targeting crate [color] — not all bots',
+'/crates-all [n] [color] [dump=…] [afk=…]': `Run shardshop → crates → dump on bots 1 through n (default: all bots) targeting crate [color] (default: ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')}), ${(CRATES_ALL_STAGGER_MS / 1000).toFixed(0)}s apart so they don't hit the server at once. dump=off|tpa|home|hidden|<player> chooses the dump step and afk=now|off|<seconds> chooses the AFK warp; both override CRATES_ALL_DUMP / CRATES_ALL_AFK_WARP / CRATES_ALL_AFK_DELAY_MS for that run`,
+'/crates-solo [bot] [color] [dump=…] [afk=…]': 'Run shardshop → crates → dump on just one bot (default: active bot) targeting crate [color] — not all bots. Takes the same dump= / afk= flags as /crates-all',
 '/spawners': `Without moving, right-click every ${SPAWNER_BLOCK.replace(/_/g, ' ')} already within reach (${SPAWNER_REACH} blocks), clicking GUI slot ${SPAWNER_SLOT_FIRST} then slot ${SPAWNER_SLOT_SECOND} on each one`,
 '/data': 'Compile all saved bot/spawner data, save the local JSON snapshot, and push the current snapshot to the Google Sheets Apps Script webhook. Subcommands: /data check (verify the webhook deployment end-to-end), /data status (show webhook config + tracked counts)',
 '/list': 'Compact one-line-per-bot status list (online / offline / last kick)',
@@ -4052,8 +4067,36 @@ logFor(id, `{yellow-fg}⚠ Stopped after ${runs} run(s) — hit the ${(SHARDSHOP
 
 // ── /crates-all: shardshop → crates → dump, staggered across bots ──────────
 let cratesAllRunning = false
+// The hidden dump is a fleet-wide chain, so one /crates-all run arms it once
+// (on the first bot that reaches the dump step) instead of once per bot.
+let cratesAllHiddenStarted = false
 
-async function runCratesAllSequenceForBot(id, blockNameOverride) {
+// Merges the .env defaults with the per-command `dump=` / `afk=` flags into the
+// plan the sequence runs with.
+function cratesAllPlan(flags = {}) {
+const dump = flags.dump || CRATES_ALL_DUMP_ENV.dump
+const target = flags.dumpTarget || CRATES_ALL_DUMP_ENV.target || TPA_MAIN_PLAYER
+const afkDelayMs = flags.afkDelayMs == null ? CRATES_ALL_AFK_DELAY_MS : flags.afkDelayMs
+let afkWarp = flags.afkWarp == null ? CRATES_ALL_AFK_WARP : flags.afkWarp
+// A hidden dump deliberately leaves each bot where it TPA'd to, and the AFK
+// warp would undo exactly that — so hidden turns it off unless this run asked
+// for one explicitly (afk=now / afk=30).
+if (dump === 'hidden' && flags.afkWarp !== true) afkWarp = false
+return { dump, target, afkWarp, afkDelayMs }
+}
+
+function describeCratesAllPlan(plan) {
+const dump = plan.dump === 'off' ? 'no dump'
+: plan.dump === 'home' ? `dump via ${DUMP_HOME_COMMAND}`
+: plan.dump === 'hidden' ? 'hidden dump chain'
+: `dump via /tpa ${plan.target || '(no target configured)'}`
+const afk = !plan.afkWarp ? 'stay put afterwards'
+: plan.afkDelayMs === 0 ? `immediate ${WARP_AFK}`
+: `${WARP_AFK} after ${(plan.afkDelayMs / 1000).toFixed(0)}s`
+return `${dump}, ${afk}`
+}
+
+async function runCratesAllSequenceForBot(id, blockNameOverride, plan = cratesAllPlan()) {
 const entry = bots[id]
 if (entry?.manualMode) { logFor(id, `{yellow-fg}⚠ Stop manual interact (/manual-stop) before running /crates-all on ${id}.{/yellow-fg}`); return }
 if (entry.suppressNextWindowClick) entry.suppressNextWindowClick = false
@@ -4084,19 +4127,39 @@ logFor(id, crateOk
 await new Promise(r => setTimeout(r, CRATES_ALL_STEP_WAIT_MS))
 if (!bots[id]?.bot?.entity) { logFor(id, `{red-fg}✗ ${id} despawned before dump — aborting sequence.{/red-fg}`); return }
 
-// 3. /dump
+// 3. dump — the mode comes from CRATES_ALL_DUMP or this run's `dump=` flag
+if (plan.dump === 'off') {
+logFor(id, `{cyan-fg}› Dump step skipped (dump=off) — leaving the inventory as-is.{/cyan-fg}`)
+} else if (plan.dump === 'hidden') {
+if (cratesAllHiddenStarted) {
+logFor(id, `{cyan-fg}› Hidden dump is already armed — this bot's inventory is left for the chain.{/cyan-fg}`)
+} else {
+logFor(id, `{cyan-fg}› Arming the hidden dump chain for the whole roster (dump=hidden).{/cyan-fg}`)
+cratesAllHiddenStarted = true
+startHiddenDump()
+}
+} else {
 try {
-await tpaAndDump(bot, id)
+await tpaAndDump(bot, id, plan.dump === 'home' ? { home: true } : { target: plan.target })
 logFor(id, `{green-fg}✓ /crates-all: sequence complete for ${id}.{/green-fg}`)
 } catch (err) {
 logFor(id, `{red-fg}✗ Dump step failed: ${sanitize(err.message)}{/red-fg}`)
 }
+}
 
-// 4. Warp back to AFK after 15s
-await new Promise(r => setTimeout(r, 15000))
+// 4. Warp back to AFK — afk=now (or CRATES_ALL_AFK_DELAY_MS=0) skips the wait
+if (!plan.afkWarp) {
+logFor(id, `{cyan-fg}› Staying put (AFK warp off for this run).{/cyan-fg}`)
+} else {
+if (plan.afkDelayMs > 0) {
+logFor(id, `{cyan-fg}› Waiting ${(plan.afkDelayMs / 1000).toFixed(0)}s before warping to AFK…{/cyan-fg}`)
+await new Promise(r => setTimeout(r, plan.afkDelayMs))
+} else {
+logFor(id, `{cyan-fg}› Routine done — warping to AFK now.{/cyan-fg}`)
+}
 if (bots[id]?.bot?.entity) {
-logFor(id, `{cyan-fg}› Warping back to AFK…{/cyan-fg}`)
 try { bot.chat(WARP_AFK) } catch (_) {}
+}
 }
 }
 
@@ -4104,18 +4167,19 @@ try { bot.chat(WARP_AFK) } catch (_) {}
 // order, matching /list and /switch numbering), starting one bot every
 // CRATES_ALL_STAGGER_MS so they don't all warp/click/TPA at the exact same
 // moment. maxBots omitted/Infinity = every bot currently registered.
-async function runCratesAll(maxBots = Infinity, blockNameOverride) {
+async function runCratesAll(maxBots = Infinity, blockNameOverride, plan = cratesAllPlan()) {
 if (cratesAllRunning) { logWarn('/crates-all is already running.'); return }
 const ids = Object.keys(bots).slice(0, maxBots)
 if (ids.length === 0) { logWarn('No bots to run /crates-all on.'); return }
 
 cratesAllRunning = true
-logInfo(`Starting /crates-all for ${ids.length} bot(s) [1–${ids.length}], ${(CRATES_ALL_STAGGER_MS / 1000).toFixed(0)}s apart…`)
+cratesAllHiddenStarted = false
+logInfo(`Starting /crates-all for ${ids.length} bot(s) [1–${ids.length}], ${(CRATES_ALL_STAGGER_MS / 1000).toFixed(0)}s apart — ${describeCratesAllPlan(plan)}…`)
 
 try {
 await Promise.allSettled(
 ids.map((id, idx) => new Promise((resolve) => {
-setTimeout(() => { runCratesAllSequenceForBot(id, blockNameOverride).finally(resolve) }, idx * CRATES_ALL_STAGGER_MS)
+setTimeout(() => { runCratesAllSequenceForBot(id, blockNameOverride, plan).finally(resolve) }, idx * CRATES_ALL_STAGGER_MS)
 }))
 )
 logSuccess(`/crates-all finished for all ${ids.length} bot(s).`)
@@ -4968,19 +5032,22 @@ if (!entry?.bot?.entity) { logWarn(`${activeId} is not currently spawned.`); ret
 return shardshopLoopCommand(activeId, slot)
 }
 
-// ── /crates-all [n] [color] ───
+// ── /crates-all [n] [color] [dump=…] [afk=…] ───
 if (trimmed === '/crates-all' || trimmed.startsWith('/crates-all ')) {
 const parts = trimmed.slice('/crates-all'.length).trim().split(/\s+/).filter(Boolean)
 let maxBots = Infinity
 if (parts.length && /^\d+$/.test(parts[0])) maxBots = parseInt(parts.shift(), 10)
-if (maxBots <= 0) { logWarn('Usage: /crates-all [n] [color] — n must be a positive number'); return }
+if (maxBots <= 0) { logWarn(`Usage: ${CRATES_ALL_USAGE} — n must be a positive number`); return }
 let blockName
-if (parts.length) {
+// Only a token without `=` can be the colour, so `/crates-all afk=now` works
+// without a position for it.
+if (parts.length && !parts[0].includes('=')) {
 blockName = resolveCrateBlockName(parts.shift())
 if (!blockName) { logWarn(`Unknown crate color. Try one of: ${SHULKER_COLORS.join(', ')} — or a full block name like "purple_shulker_box".`); return }
 }
-if (parts.length) { logWarn('Usage: /crates-all [n] [color]'); return }
-return runCratesAll(maxBots, blockName)
+const flags = parseCratesAllFlags(parts)
+if (flags.unknown.length) { logWarn(`Unknown option "${sanitize(flags.unknown[0])}". Usage: ${CRATES_ALL_USAGE}`); return }
+return runCratesAll(maxBots, blockName, cratesAllPlan(flags))
 }
 
 // ── /crates-solo [bot] [color] — same shardshop → crates → dump chain as /crates-all,
@@ -5004,17 +5071,19 @@ targetId = parts.shift()
 }
 
 let blockName
-if (parts.length) {
+if (parts.length && !parts[0].includes('=')) {
 blockName = resolveCrateBlockName(parts.shift())
 if (!blockName) { logWarn(`Unknown crate color. Try one of: ${SHULKER_COLORS.join(', ')} — or a full block name like "purple_shulker_box".`); return }
 }
-if (parts.length) { logWarn('Usage: /crates-solo [bot name or number] [color]'); return }
+const flags = parseCratesAllFlags(parts)
+if (flags.unknown.length) { logWarn(`Unknown option "${sanitize(flags.unknown[0])}". Usage: ${CRATES_ALL_SOLO_USAGE}`); return }
 
-if (!targetId) { logWarn('No active bot. Usage: /crates-solo [bot name or number] [color]'); return }
+if (!targetId) { logWarn(`No active bot. Usage: ${CRATES_ALL_SOLO_USAGE}`); return }
 if (!bots[targetId]) { logWarn(`No bot named "${sanitize(targetId)}".`); return }
 
-logInfo(`Starting /crates-solo (shardshop → crates → dump) for ${targetId}${blockName ? ` targeting ${blockName.replace(/_/g, ' ')}` : ''}…`)
-return runCratesAllSequenceForBot(targetId, blockName)
+const plan = cratesAllPlan(flags)
+logInfo(`Starting /crates-solo (shardshop → crates → dump) for ${targetId}${blockName ? ` targeting ${blockName.replace(/_/g, ' ')}` : ''} — ${describeCratesAllPlan(plan)}…`)
+return runCratesAllSequenceForBot(targetId, blockName, plan)
 }
 
 // ── Manual interaction commands (bot-manual.js) ─────────────

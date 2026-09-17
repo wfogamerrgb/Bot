@@ -44,6 +44,68 @@ function parseDataArgs(args) {
   return { action: 'push', unknown: sub }
 }
 
+// `/crates-all` and `/crates-solo` accept trailing `key=value` flags on top of
+// their positional args. Parsed here — beside the other arg parsers — so the
+// .env defaults and the per-command overrides share one vocabulary:
+//   dump=off | tpa | home | hidden | <player>   what happens after the crates
+//   afk=now | off | <seconds>                   what happens after the dump
+function parseCratesAllDump(value) {
+  const raw = String(value == null ? '' : value).trim()
+  const lower = raw.toLowerCase()
+  if (!lower) return { dump: 'tpa', target: null, unknown: null }
+  if (lower === 'off' || lower === 'none' || lower === 'skip') return { dump: 'off', target: null, unknown: null }
+  if (lower === 'tpa' || lower === 'default') return { dump: 'tpa', target: null, unknown: null }
+  if (lower === 'home') return { dump: 'home', target: null, unknown: null }
+  if (lower === 'hidden') return { dump: 'hidden', target: null, unknown: null }
+  if (lower.startsWith('player:')) {
+    const name = raw.slice('player:'.length).trim()
+    return name ? { dump: 'tpa', target: name, unknown: null } : { dump: 'tpa', target: null, unknown: raw }
+  }
+  // Anything else is a TPA target, so `dump=Smith` reads as "dump at Smith".
+  return { dump: 'tpa', target: raw, unknown: null }
+}
+
+function parseCratesAllAfk(value) {
+  const raw = String(value == null ? '' : value).trim().toLowerCase()
+  if (!raw) return { warp: null, delayMs: null, unknown: null }
+  if (/^(now|immediate|immediately|asap)$/.test(raw)) return { warp: true, delayMs: 0, unknown: null }
+  if (/^(off|none|no|false|never)$/.test(raw)) return { warp: false, delayMs: null, unknown: null }
+  const m = raw.match(/^(\d+)(ms|s)?$/)
+  if (m) {
+    const n = Number(m[1])
+    const ms = m[2] === 'ms' ? n : n * 1000 // a bare number means seconds
+    if (Number.isSafeInteger(ms) && ms <= 2147483647) return { warp: true, delayMs: ms, unknown: null }
+  }
+  return { warp: null, delayMs: null, unknown: raw }
+}
+
+// Nulls mean "not specified here" so the caller can fall back to .env; a token
+// that is not understood is reported back rather than silently ignored.
+function parseCratesAllFlags(tokens) {
+  const out = { dump: null, dumpTarget: null, afkWarp: null, afkDelayMs: null, unknown: [] }
+  for (const token of Array.isArray(tokens) ? tokens : []) {
+    const text = String(token)
+    const eq = text.indexOf('=')
+    if (eq <= 0 || eq === text.length - 1) { out.unknown.push(token); continue }
+    const key = text.slice(0, eq).toLowerCase()
+    const value = text.slice(eq + 1)
+    if (key === 'dump') {
+      const parsed = parseCratesAllDump(value)
+      if (parsed.unknown) { out.unknown.push(token); continue }
+      out.dump = parsed.dump
+      if (parsed.target) out.dumpTarget = parsed.target
+    } else if (key === 'afk') {
+      const parsed = parseCratesAllAfk(value)
+      if (parsed.unknown) { out.unknown.push(token); continue }
+      out.afkWarp = parsed.warp
+      if (parsed.delayMs != null) out.afkDelayMs = parsed.delayMs
+    } else {
+      out.unknown.push(token)
+    }
+  }
+  return out
+}
+
 function shuffledCopy(values, random = Math.random) {
   const result = values.slice()
   for (let i = result.length - 1; i > 0; i--) {
@@ -585,6 +647,9 @@ module.exports = {
   readNumber,
   parseDumpMode,
   parseDataArgs,
+  parseCratesAllDump,
+  parseCratesAllAfk,
+  parseCratesAllFlags,
   shuffledCopy,
   parseNameList,
   hasInventoryItems,

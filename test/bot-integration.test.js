@@ -988,6 +988,131 @@ test('startup says when a group carries no proxy of its own', () => {
   assert.match(out, /PROXY_GROUP_1 has no HOST — its 1 bot\(s\) use the default route, but its login password still applies/)
 })
 
+// Flushes every pending microtask so an awaited sequence has fully settled
+// before the next assertion (the harness's timers are manual).
+const flushMicrotasks = () => new Promise(resolve => setImmediate(resolve))
+
+// Every log line a runtime has produced — the global `log()` helpers write to
+// the active bot's log, while startup warnings go to the system log.
+function logsText (r) {
+  return r.run("Object.keys(bots).map(id => bots[id].logs.map(l => l.text).join('\\n')).join('\\n') + '\\n' + systemLogs.map(l => l.text).join('\\n')")
+}
+
+// Fires every pending mocked timer once (and drops it), the way the real clock
+// would as time passes.
+function runPendingTimers (r) {
+  for (const t of [...r.timers.values()]) { r.timers.delete(t); t.fn() }
+}
+
+// The sequence awaits real (mocked) timers between its steps, so a test driving
+// it has to advance the clock until the promise settles.
+async function driveSequence (r, promise) {
+  let settled = false
+  promise.then(() => { settled = true }, () => { settled = true })
+  for (let i = 0; i < 50 && !settled; i++) {
+    await flushMicrotasks()
+    if (settled) break
+    runPendingTimers(r)
+  }
+  return promise
+}
+
+// The sequence is what actually sends the warp, so it is stubbed out and the
+// real runCratesAll is allowed to stagger + thread the plan through to it.
+function captureSequence (r) {
+  r.run(`
+    captured = []
+    runCratesAllSequenceForBot = (id, color, plan) => {
+      captured.push({ id, color, plan: Object.assign({}, plan) })
+      return Promise.resolve()
+    }
+  `)
+  return () => plain(r.run('captured'))
+}
+
+test('/crates-all options default to the env values and are overridden per run', async () => {
+  const r = runtime({ CRATES_ALL_DUMP: 'home', CRATES_ALL_AFK_DELAY_MS: '0' })
+  const captured = captureSequence(r)
+
+  r.run("handleCommand('/crates-all')")
+  runPendingTimers(r)
+  await flushMicrotasks()
+  const withEnvDefaults = captured()
+  assert.equal(withEnvDefaults.length, 3)
+  assert.deepEqual(withEnvDefaults[0], { id: 'A', plan: { dump: 'home', target: '', afkWarp: true, afkDelayMs: 0 } })
+  assert.match(logsText(r), /Starting \/crates-all for 3 bot\(s\) \[1–3\], 30s apart — dump via \/home stash, immediate \/warp afk…/)
+
+  r.run("captured = []; handleCommand('/crates-all 1 purple dump=Smith afk=off')")
+  runPendingTimers(r)
+  await flushMicrotasks()
+  const withFlags = captured()
+  assert.equal(withFlags.length, 1)
+  assert.equal(withFlags[0].color, 'purple_shulker_box')
+  assert.equal(withFlags[0].plan.dump, 'tpa')
+  assert.equal(withFlags[0].plan.target, 'Smith')
+  assert.equal(withFlags[0].plan.afkWarp, false)
+})
+
+test('/crates-solo takes the same dump=/afk= flags', async () => {
+  const r = runtime()
+  const captured = captureSequence(r)
+
+  r.run("handleCommand('/crates-solo B dump=off afk=now')")
+  await flushMicrotasks()
+  assert.deepEqual(captured(), [{ id: 'B', plan: { dump: 'off', target: '', afkWarp: true, afkDelayMs: 0 } }])
+
+  // A token the parser cannot read must warn and run nothing at all — the
+  // whole point of reporting instead of guessing.
+  r.run("captured = []; handleCommand('/crates-solo B foo=bar')")
+  await flushMicrotasks()
+  assert.deepEqual(captured(), [])
+  assert.match(logsText(r), /Unknown option "foo=bar"\. Usage: \/crates-solo \[bot name or number\] \[color\]/)
+})
+
+test('/crates-all afk=now warps the moment the routine ends, afk=off never warps', async () => {
+  const r = runtime()
+  await r.run(`
+    chats = []
+    bots.A.bot = { entity: {}, chat(msg) { chats.push(msg) } }
+    runShardshopLoop = async () => ({ runs: 1, stopReason: 'message' })
+    runCrateRoutine = async () => true
+  `)
+
+  // dump=off keeps this off the real TPA/chest path.
+  await driveSequence(r, r.run("runCratesAllSequenceForBot('A', null, cratesAllPlan(parseCratesAllFlags(['dump=off', 'afk=now'])))"))
+  assert.deepEqual(plain(r.run('chats')), ['/warp afk'])
+  assert.ok(r.run("bots.A.logs.map(l => l.text).some(line => line.includes('Dump step skipped (dump=off)'))"), 'dump=off must skip the dump step')
+
+  r.run('chats = []')
+  await driveSequence(r, r.run("runCratesAllSequenceForBot('A', null, cratesAllPlan(parseCratesAllFlags(['dump=off', 'afk=off'])))"))
+  assert.deepEqual(plain(r.run('chats')), [], 'afk=off must never warp')
+
+  // The default is unchanged: a 15s wait before the warp, so the warp is not
+  // sent until that timer fires.
+  r.run('chats = []')
+  const pending = r.run("runCratesAllSequenceForBot('A', null, cratesAllPlan(parseCratesAllFlags(['dump=off'])))")
+  await flushMicrotasks()
+  runPendingTimers(r) // the wait between the crate step and the dump step
+  await flushMicrotasks()
+  assert.deepEqual(plain(r.run('chats')), [], 'the default warp waits 15s')
+  assert.ok([...r.timers.values()].some(t => t.delay === 15000), 'a 15s warp timer is pending')
+  await driveSequence(r, pending)
+  assert.deepEqual(plain(r.run('chats')), ['/warp afk'])
+})
+
+test('dump=hidden turns the AFK warp off unless the run asks for one', async () => {
+  const r = runtime()
+  // A hidden dump leaves each bot where it TPA'd to, so warping AFK afterwards
+  // would undo it.
+  assert.equal(r.run("cratesAllPlan(parseCratesAllFlags(['dump=hidden'])).afkWarp"), false)
+  assert.equal(r.run("cratesAllPlan(parseCratesAllFlags(['dump=hidden', 'afk=now'])).afkWarp"), true)
+  // CRATES_ALL_AFK_WARP=true is still overruled by dump=hidden, since the
+  // documented reason for hidden is staying put.
+  const hiddenEnv = runtime({ CRATES_ALL_DUMP: 'hidden', CRATES_ALL_AFK_WARP: 'true' })
+  assert.equal(hiddenEnv.run('cratesAllPlan({}).dump'), 'hidden')
+  assert.equal(hiddenEnv.run('cratesAllPlan({}).afkWarp'), false)
+})
+
 test('/play embeds the client once a build exists', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'play-built-'))
   const dist = path.join(dir, 'dist')
