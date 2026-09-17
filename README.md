@@ -127,18 +127,158 @@ it into an Apps Script project, run `setSpreadsheetId('<id>')` once in the
 editor, then deploy it as a web app with **Execute as: me** and **Who has
 access: Anyone**, and set the resulting `/exec` URL as `DATA_WEBHOOK_URL`.
 
-- `doPost` replaces the `Bots`, `Spawners`, and `Lifetime` tabs on every push.
-  The header row is the union of every row's keys, so rows that differ (a
-  baseline row with no rate yet, a bot with no rank yet) can no longer throw
-  mid-write and leave the sheet stale, and an empty `lifetime` object no longer
-  aborts the run. It answers with JSON — `{ ok, written: { Bots, Spawners,
-  Lifetime }, errors: [ ... ] }` — and the bot logs the row counts it reported,
-  so a push is verifiable from the dashboard log.
+- `doPost` maintains **only its own columns** on the `Bots`, `Spawners`,
+  `Lifetime`, and `Bans` tabs — never the whole tab. The header row is the union of every
+  row's keys, so rows that differ (a baseline row with no rate yet, a bot with no
+  rank yet) can no longer throw mid-write and leave the sheet stale, and an empty
+  `lifetime` object no longer aborts the run. It answers with JSON —
+  `{ ok, written: { Bots, Spawners, Lifetime }, layout, errors: [ ... ] }` — and
+  the bot logs the row counts it reported, so a push is verifiable from the
+  dashboard log.
 - Opening the `/exec` URL in a browser (`doGet`) returns a health JSON with the
   spreadsheet id, tab names, and whether a secret is required. Seeing a Google
   sign-in page instead of JSON means the deployment is not public: that is the
   classic cause of "the bot says it pushed but the spreadsheet never updates".
   The bot now fails loudly when a webhook answers with HTML instead of JSON.
+- HTML does **not** always mean "not public", so the bot reads the page and names
+  the actual fault. Because all four cases arrive as HTML (usually with HTTP
+  200), guessing "permissions" sends you to the wrong fix:
+
+  | What the page says | Real cause | Fix |
+  | --- | --- | --- |
+  | Google sign-in page (`accounts.google.com`, "Sign in") | Deployment is not reachable anonymously | Deploy → Manage deployments → Execute as: Me **and** Who has access: Anyone, then Version: New version |
+  | `Script function not found: doGet` | The live version runs an older `Code.gs` — a public deployment with no `doGet` | Paste the current `Code.gs`, then Version: New version → Deploy |
+  | `Exception: …` / a stack trace | The deployed code threw (e.g. `SPREADSHEET_ID` never set) | Run `setSpreadsheetId('<id>')`, or redeploy the current code |
+  | Any other HTML | Confirm against the quoted page text in the log | Read the `/data check` excerpt before changing permissions |
+
+  `/data check` prints `diagnosis: <kind>` plus the page's own words, and both
+  `/data` and the POST path report the same classification.
+
+#### Your own columns are never touched
+
+Sharing a tab with hand-made content is a supported setup, not an accident. A
+push writes the columns whose headers come from its payload (`bot`, `balance`,
+`coins`, `shards`, `earned`, …) and nothing else:
+
+- **Your columns keep their own headers, values, formulas, notes, and formats.**
+  The script only ever writes the columns it created. Ownership is remembered
+  between pushes (`OWNED_COLUMNS_*`, shown by `listSettings()`), so a column the
+  payload stopped sending is emptied instead of left stale.
+- **A new payload column is appended to the right of yours**, never written over
+  the top of one.
+- **Only `Bots`, `Spawners`, `Lifetime`, and `Bans` are ever opened or created.**
+  Your own tabs are never read, created, or modified.
+- **Fonts, colours, borders, notes, and conditional formatting are never set or
+  cleared.** The script uses `clearContents()`, which preserves formatting, and
+  never calls `clear()`. Setting `NUMBER_FORMATS` to `off` also stops it from
+  touching number formats.
+- **Rename nothing here by hand** — an unrecognised header looks like a new column
+  and gets a duplicate next to it. Run `resetLayout()` in the editor to hand those
+  columns back to you, then rename freely.
+
+Useful when you keep your own totals, lookups, and diffs next to the data:
+
+- **Row order is append-stable and never re-sorted.** A bot keeps its row for as
+  long as it exists; a new bot is appended at the bottom. So `=C3-C2` (this row
+  minus the row above) keeps comparing the same pair of bots, and an adjacent-row
+  diff is a valid diff. A *disappearing* bot still shifts the rows below it up,
+  so for anything that must survive roster changes, key on the `bot` column with
+  `VLOOKUP`/`XLOOKUP` instead of a hard-coded row number.
+- **Your formulas may read our columns** (`=D2+E2+F2`, `=A2&" "&C2`, a `QUERY`
+  over the range). They are never evaluated or rewritten — only our own columns
+  are written, so recalculation is Google's problem, not ours.
+- **Our TOTAL row is one row of our columns.** If you keep your own totals row
+  elsewhere on the tab, nothing collides: yours are in your columns.
+
+#### Totals row
+
+A `TOTAL` row of live `=SUM()` formulas is appended under the data, bolded:
+`balance`, `coins`, and `shards` on **Bots**; `earned` and `lifetimeEarned` on
+**Spawners**. Because they are formulas, they keep working if you edit a value.
+A tab with a single data row (Lifetime) gets no totals row.
+
+| Helper | Effect |
+| --- | --- |
+| `setTotalsRow('bottom' \| 'top' \| 'off')` | Move the totals row (default `bottom`), or switch it off |
+| `setTotalsColumns('balance,coins,shards')` | Choose which columns get a sum |
+
+#### Readable times and number formats
+
+Timestamps are stored as epoch milliseconds internally because production rates
+are differences of two of them — `1758067200000` is a fine number and a terrible
+cell. So they are published as ISO 8601 and converted to real date values on
+write, which means Sheets shows them in your own locale format and `Date`/`Time`
+functions work on them. Derived rates are published rounded to two decimals, so a
+cell reads `33,333.33` instead of `33333.333333333336`.
+
+Our columns get a sensible number format on write — `#,##0.00` for money and
+rates, `#,##0` for counts, nothing for text. Change the map, or turn it off
+entirely and keep your own formatting:
+
+| Helper | Effect |
+| --- | --- |
+| `setNumberFormats({ balance: '#,##0.00' })` | Replace the format map |
+| `setNumberFormats('off')` | Never touch number formats (their values still update) |
+| `setTimestampFormat('yyyy-mm-dd hh:mm')` | Force one date format everywhere |
+| `clearTimestampFormat()` | Go back to the spreadsheet's locale date format |
+| `listSettings()` | Print the webhook, layout, totals, and format settings |
+
+#### What the `Bots` tab contains
+
+One row per bot, written by `/data` (and by `/spawners`, which also fills in the
+spawner columns). Every cell is a plain scalar you can filter, sort, plot, or use
+in a formula:
+
+| Column | Source | Why it is there |
+| --- | --- | --- |
+| `bot` | bot id | The stable key — look everything else up by this |
+| `recordedAt` | snapshot time | Real date, so you can tell a fresh row from a stale one |
+| `rank` | `/rank` | Current rank (`N/A` when the query failed) |
+| `balance` | `/bal` | Money held |
+| `coins` | `/coins` | Coins held |
+| `shards` | `/shards` | Shards held |
+| `x`, `y`, `z` | live entity position | Three numbers, not one `{"x":1,"y":64,"z":-3}` blob — so you can sort by height, or diff positions to spot a bot that has wandered |
+| `dimension` | current world | Coordinates are meaningless without it on a multi-world server |
+| `spawnerCount` | `/spawners` | How many spawners were found on the plot |
+| `successfulSpawners` | `/spawners` | How many of those were fully clicked, so a partial pass is visible instead of implied |
+| `runStartedAt` | `/spawners` | When that pass began |
+| `trackedSpawners` | local state | How many spawner rows the bot has on record for this bot — the count behind the `Spawners` tab |
+| `banned` | kick text | `TRUE`/`FALSE` — see [Ban detection](#ban-detection); survives a restart so a banned bot never reads as merely offline |
+| `bannedAt` | ban time | Real date the current ban started (blank once the bot is back) |
+| `banKind` | kick text | `permanent`, `temporary`, `blacklist`, or `suspected` |
+| `banReason` | kick text | The reason phrase (`Alt Farming (3rd)`), never the raw component tree |
+| `banDuration` | kick text | The stated length (`29 days, 11 hours, 17 minutes`) |
+| `banExpiresAt` | kick text | Real date the hold ends — blank for a permanent ban. This is the number the ban hold compares against |
+| `banCaseId` | kick text | The server's case id (`1129`) when its ban screen carries one |
+
+`spawnerCount` and `trackedSpawners` are deliberately separate columns: they used
+to share one name, so `/data` silently replaced "spawners on your plot" with "rows
+in my local file" depending on which command ran last.
+
+**Migrating an existing sheet:** `botPosition` is gone from the payload, so run
+`resetLayout()` once in the Apps Script editor after redeploying and before the
+next `/data`. That hands the old `botPosition` column back to you (delete it
+whenever you like) and lets the script append `x`, `y`, `z`, and `dimension` at
+the end. Your existing columns are found by header name and keep their place.
+
+#### What the `Lifetime` tab means
+
+`Lifetime` is a one-row running summary of **every spawner the bot has ever
+recorded**, across all bots — not just the ones online now:
+
+| Column | Meaning |
+| --- | --- |
+| `totalEarned` | Sum of each spawner row's `lifetimeEarned` (falling back to `earned` for rows recorded before lifetime tracking existed) |
+| `samples` | How many spawner rows contributed, so you can tell "earned 0" from "never measured" |
+
+Each spawner row's own `lifetimeEarned` is a running total kept in the bot's
+local state file and incremented on every `/spawners` pass, so it survives the
+`Bots` and `Spawners` tabs being rewritten. `earned` is the current pass only;
+`lifetimeEarned` is the accumulate-forever number; `Lifetime.totalEarned` is the
+sum of those across the roster. It is measured in the same unit as `balance` —
+money the spawners produced, not your current holdings — so it will not match a
+balance sum, and a bot that was removed from the roster still counts toward it.
+
 - `setWebhookSecret('<value>')` in the editor plus `DATA_WEBHOOK_SECRET=<value>`
   in `.env` enables the shared-secret check. Apps Script web apps cannot read
   request headers, so the secret is sent as `?secret=...` and in the JSON body.
@@ -151,10 +291,11 @@ access: Anyone**, and set the resulting `/exec` URL as `DATA_WEBHOOK_URL`.
 - `/data check` performs that same public-deployment check from the bot: it
   GETs `DATA_WEBHOOK_URL`, prints the health JSON (spreadsheet id, tabs, whether
   a secret is required), and explains exactly which Apps Script step is missing
-  when it sees an HTML sign-in page, a non-JSON body, or `ok:false`.
+  when it sees an HTML page, a non-JSON body, or `ok:false`.
   `/data status` prints the active webhook URL, secret length, timeout, local
   snapshot file, and how many bots/spawners are tracked — none of it touches the
-  network.
+  network. It also warns when the configured URL is the `/dev` URL (which always
+  requires a Google sign-in) or does not end in `/exec`.
 
 The existing `/cron` command can run `/spawners` on a schedule; run `/data`
 afterward when you want to publish the current snapshot.
@@ -276,19 +417,26 @@ WEB_GUI=true
 These settings apply to `bot.js`, not `bot-rtp.js`. Restart the process after
 editing `.env` and refresh browser tabs after upgrading.
 
-### `/all-slow <command or message>`
+### `/all-slow [delay] <command or message>`
 
 Like `/all`, but dispatches to the first bot immediately and then one bot per
 delay interval (15 seconds by default). For example:
 
 ```text
 /all-slow /status
+/all-slow 30 /spawners        # this run only: 30s apart
+/all-slow 500ms /status       # half a second apart
 /all-slow /crates purple
 /all-slow hello
 ```
 
-- `ALL_SLOW_DELAY_MS` is in milliseconds. It must be an integer from 1 through
-  2147483647; missing, blank, zero, negative, fractional, or invalid values
+- **An optional leading delay overrides the interval for that run**, using the
+  same units as `sleep`: `30` is 30 seconds, `45s`, `500ms`, and `5000` is 5000 ms.
+  The token is only read as a delay when it is a bare number or duration, so a
+  command that starts with a digit is still dispatched intact. Delays below
+  250 ms are raised to 250 ms, since faster dispatch just overlaps the runs.
+- `ALL_SLOW_DELAY_MS` is the default in milliseconds. It must be an integer from 1
+  through 2147483647; missing, blank, zero, negative, fractional, or invalid values
   fall back to 15000 rather than being clamped to a rapid timer by Node.
 - The roster is captured when the command starts. Bots added later are not
   included. Removed bots are skipped; raw chat skips bots that are not spawned
@@ -669,6 +817,8 @@ Any unrecognized input is sent as a Minecraft chat message or command.
 | `/reconnect` | Reconnect the active bot |
 | `/reconnect-all` | Reconnect currently offline bots |
 | `/reconnect-all-slow` | Reconnect all bots with a configurable stagger |
+| `/removed` | List the removed / permanently-banned bots |
+| `/unban <bot>` | Take a bot off the removed list and reconnect it |
 | `/closeBot` | Disconnect and remove the active bot |
 | `/dump` | TPA and deposit inventory into nearby chests |
 | `/crates [color]` | Run one crate collection cycle |
@@ -829,6 +979,12 @@ The RTP variant has additional settings, including:
 | `FOOD_EAT_THRESHOLD` | Hunger threshold for auto-eating |
 | `DISCORD_WEBHOOK_URL` | Discord webhook; empty disables alerts |
 | `DISCORD_USER_ID` | Optional Discord mention target |
+| `BAN_MESSAGE_REGEX` | Extra ban-detection pattern for your server's wording |
+| `DISCORD_BAN_COOLDOWN_MS` | Ban alert repeat suppression (default `900000`) |
+| `BAN_SWEEP_MS` | How often a held ban is checked for expiry (default `60000`) |
+| `BAN_RETRY_MS` | Retry window for a ban with no stated length (default `1800000`) |
+| `PERMANENT_BAN_ACTION` | `remove` (default, leaves the roster) or `hold` (stays visible) |
+| `REMOVED_BOTS_FILE` | Removed / perma-banned list (default `removed-bots.json`) |
 
 ## Keep-Alive Hosting
 
@@ -909,8 +1065,96 @@ authorized to automate.
 
 ## Discord Alerts and Memory Watchdog
 
-The main bot runner can send Discord webhook alerts for 30-second server restart warnings, kicks, unexpected disconnects, successful recovery, exhausted reconnect limits, proxy stalls, dashboard login lockouts, fatal process errors, and host memory pressure. Set `DISCORD_WEBHOOK_URL` and `DISCORD_USER_ID` in `.env`.
+The main bot runner can send Discord webhook alerts for 30-second server restart warnings, kicks, bans, unexpected disconnects, successful recovery, exhausted reconnect limits, proxy stalls, dashboard login lockouts, fatal process errors, and host memory pressure. Set `DISCORD_WEBHOOK_URL` and `DISCORD_USER_ID` in `.env`.
 
 The restart detector requires both the case-insensitive phrase `SERVER WILL RESTART IN` and the standalone number `30` in the same server message. Duplicate alerts are suppressed for the configured cooldown.
+
+### Ban detection
+
+A server ban reaches the bot as an ordinary kick packet — there is no separate "banned" event — so the kick reason text is the only evidence, and it is classified before the generic kick alert is chosen:
+
+| Classified as | Matches | Discord alert |
+| --- | --- | --- |
+| `permanent` | `banned`, `you have been banned`, `permaban`, `ban hammer`, or a ban with no expiry at all | **Bot banned**, red, critical |
+| `temporary` | `temporarily banned`, `banned for 3 days`, `ban expires <date>`, **`Expires in: 29 days, 11 hours, 17 minutes`** | **Bot temporarily banned**, amber, with the duration in its own field |
+| `blacklist` | `blacklisted`, `global ban`, `network-wide ban` | **Bot blacklisted**, dark red, critical |
+| `suspected` | `alt detected`, `anti-bot`, `bot detected`, `automatic banned`, `suspicious activity` | **Possible bot ban**, orange, *not* critical |
+| *(neither)* | anything else (`not whitelisted`, `AFK too long`, `socketClosed`) | the existing **Bot kicked** alert |
+
+#### Why a branded ban screen needs parsing first
+
+The kick reason is **not always a string**. Servers that brand their ban screen send a serialized chat component, and the text you need is buried in nested leaves:
+
+```json
+{"type":"compound","value":{"extra":{"type":"list","value":{"type":"compound","value":[
+  {"color":{"type":"string","value":"gray"},"text":{"type":"string","value":"You have been banned due to "}},
+  {"text":{"type":"string","value":"Expires in: "}},
+  {"text":{"type":"string","value":"29 days, 11 hours, 17 minutes\n"}} ]}}}}
+```
+
+Matching patterns against that raw JSON finds the word `banned` and nothing else — no `Expires in:` — so a **29-day tempban was reported as permanent**. The tree is now walked and its text leaves joined before anything is matched (`test/fixtures/fatalmc-ban-kick.json` is the real thing, verbatim):
+
+```
+FATALMC
+You have been banned due to Alt Farming (3rd) [1129]
+Banned on: 16 Sep 2026, 13:34
+Expires in: 29 days, 11 hours, 17 minutes
+Think there's been a mistake? discord.gg/fatalmc
+```
+
+which yields `kind: temporary`, `duration: 29 days, 11 hours, 17 minutes`, `reason: Alt Farming (3rd)`, `caseId: 1129`. The `reason` is the phrase a human wrote — it is what reaches the spreadsheet cell and the Discord embed, never a 1.5 KB JSON blob.
+
+#### The ban hold (it will not reconnect)
+
+Once a bot is known to be banned it is **held**: no reconnect attempts, no backoff loop, no login storm against a server that has already thrown the account out.
+
+- **A temporary ban is held until its expiry.** The ban is a wall-clock fact, so the absolute time is what is stored — a 29-day ban cannot live in a `setTimeout`, and the number has to outlive the process. It does: it is written to the data file, so a restart does not walk straight back into the ban. A periodic sweep (`BAN_SWEEP_MS`, default 60 s) is what ends the hold, reconnecting the bot when the expiry passes.
+- **A permanent ban is never released**, and the bot is moved onto the **removed list** (see below). Nothing reconnects it, and it is recorded as `permanent` so it is distinguishable forever.
+- **An unstated length is not a permanent ban.** A `temporary` ban with no duration, or a `suspected` one, is retried after `BAN_RETRY_MS` (default 30 min) rather than written off — the server saying "temporarily" is not the same as it saying "forever".
+- **The first detection sets the clock.** Later kicks from the same ban cannot push the release time further out.
+- **The bot stays visible while held** — as `⛔ banned` in the dashboard and `/list` — rather than being silently deleted like `/closeBot`. If you would rather it disappear from the roster entirely, say so.
+- **Startup checks the file first**: a bot still inside its ban window is not connected at all, and says why.
+
+A ban is surfaced in five places, all from the same verdict:
+
+- **Discord** — its own title, colour, and cooldown, so it cannot be mistaken for a disconnect in the feed. Once per bot per ban type: reconnecting against a live ban does not spam the channel.
+- **The `Bots` tab** — `banned` (`TRUE`/`FALSE`), `bannedAt` (a real date, when the ban started), `banKind`, plus `banDuration`/`banExpiresAt`/`banCaseId`/`banReason` once there is a ban to report.
+- **The `Bans` tab** — one row per banned bot, so the bans and the permanent bans are tracked in the spreadsheet: `kind`, `reason`, `caseId`, `duration`, `expiresAt` (a real date, blank when permanent), `permanent` (`TRUE`/`FALSE`), `firstBannedAt`, `lastBannedAt`, and `count` so repeat bans are visible without a second tab.
+- **The dashboard** — a red `⛔ banned` badge on the bot's card, with the kind and kick text in its tooltip, and the offline toast says *was banned* rather than *went offline*.
+- **`/list`** — `⛔ banned (temporary)` next to the offline entry.
+
+The flag clears itself on the next successful spawn, which is how a temporary ban expiring (or a manual unban) stops being reported.
+
+Three settings, all optional:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `BAN_MESSAGE_REGEX` | *(unset)* | Extra case-insensitive pattern for your server's own wording, e.g. `you have been removed from`. An invalid pattern is ignored with a startup warning. |
+| `DISCORD_BAN_COOLDOWN_MS` | `900000` | How long one ban alert suppresses repeats for the same bot and type |
+| `BAN_SWEEP_MS` | `60000` | How often a held ban is checked for expiry |
+| `BAN_RETRY_MS` | `1800000` | Retry window for a ban whose length the server never stated |
+| `PERMANENT_BAN_ACTION` | `remove` | What a permanent ban does to the live roster: `remove` (like `/closeBot`) or `hold` (stays visible with the badge) |
+| `REMOVED_BOTS_FILE` | `removed-bots.json` | The removed / permanently-banned list |
+
+#### The removed / permanently-banned list
+
+A permanent ban means the account is gone, so the bot leaves the roster instead of being retried forever. That fact has to outlive the process and cannot live in `.env` — the bot cannot edit `BOT_NAMES` for you — so it is its own file:
+
+```json
+{ "version": 1, "updatedAt": "...", "bots": [
+  { "bot": "Hypr_7_core", "kind": "permanent", "reason": "cheating", "caseId": "4411",
+    "addedAt": 1758067200000, "addedBy": "ban-detection", "count": 1 } ] }
+```
+
+The list outranks everything: a bot on it is not connected at startup **and** not reconnected, even while it is still named in `BOT_NAMES` — you get a warning saying so rather than silence. It is saved atomically like the other state files and matched case-insensitively, because a name arrives from `.env`, from a kick message, and from whatever you type.
+
+| Command | Effect |
+| --- | --- |
+| `/removed` | List the removed / permanently-banned bots with each reason, case id, and when it was added |
+| `/unban <bot>` | Take one off the list, clear its ban hold, and reconnect it |
+
+With the default `PERMANENT_BAN_ACTION=remove` the bot is also disconnected and dropped from the dashboard exactly like `/closeBot`, leaving the record in the `Bans` tab and Discord. Set `PERMANENT_BAN_ACTION=hold` to keep it visible with the `⛔ banned` badge instead.
+
+A permanent ban still logs `Remove it from BOT_NAMES too`, because `.env` is yours: the file stops the bot connecting, and tidying `BOT_NAMES` is what stops the startup warning.
 
 The memory watchdog uses Linux `/proc/meminfo` where available so container/host memory availability and swap usage can be monitored. It falls back to Node's OS memory counters on other platforms. Alerts are stateful, rate-limited, and followed by a recovery notice once available memory returns above `MEMORY_RECOVERY_PERCENT`.

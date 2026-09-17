@@ -19,7 +19,8 @@ const {
   buildHiddenDumpPlan
 } = require('./bot-controls')
 const os = require('os')
-const { createMonitoring } = require('./monitoring')
+const { createMonitoring, classifyKick } = require('./monitoring')
+const removedBotsStore = require('./removed-bots')
 const net = require('net')
 const fs = require('fs')
 const path = require('path')
@@ -84,6 +85,71 @@ function persistData () {
   dataState.updatedAt = new Date().toISOString()
   dataStore.saveState(DATA_FILE, dataState)
 }
+
+// ── Removed / permanently-banned list ───────────────────────────────────────
+// A permanent ban means the account is gone, so the bot leaves the roster instead
+// of being retried forever. That cannot live in .env (the bot cannot edit
+// BOT_NAMES for you), so it is its own file, loaded at startup and consulted
+// before anything else decides to connect.
+const REMOVED_BOTS_FILE = (process.env.REMOVED_BOTS_FILE || '').trim() || path.join(__dirname, 'removed-bots.json')
+// What a permanent ban does to the live roster: 'remove' mirrors /closeBot,
+// 'hold' keeps the entry visible with the banned badge.
+const PERMANENT_BAN_ACTION = /^(hold|keep|visible)$/i.test(process.env.PERMANENT_BAN_ACTION || '') ? 'hold' : 'remove'
+// How long to wait before retrying a ban whose length the server never stated.
+const BAN_RETRY_MS = readDelayMs(process.env.BAN_RETRY_MS, 1800000)
+let removedBots = removedBotsStore.loadRemovedBots(REMOVED_BOTS_FILE)
+function persistRemovedBots () { removedBots = removedBotsStore.saveRemovedBots(REMOVED_BOTS_FILE, removedBots) }
+function removedEntryFor (id) { return removedBotsStore.findRemovedBot(removedBots, id) }
+// Mirrors /closeBot: disconnect first (which stops the reconnect path dead), then
+// drop the entry so it stops appearing as a bot that might come back.
+function dropFromRoster (id) {
+  try { bots[id]?.disconnectManually() } catch (_) {}
+  if (!bots[id]) return false
+  delete bots[id]
+  if (activeId === id) {
+    const rest = Object.keys(bots)
+    activeId = rest.length ? rest[rest.length - 1] : null
+    if (!activeId && tui) { try { tui.clear() } catch (_) {} }
+  }
+  notifyBotsChanged()
+  return true
+}
+
+// ── Ban hold ────────────────────────────────────────────────────────────────
+// A banned account must stop knocking, and a ban outlives the process: a 29-day
+// ban cannot live in a setTimeout, and a restart must not walk straight back into
+// the server. So the absolute expiry is the number that matters, it is stored in
+// the data file (surviving restarts), and a slow sweep is what ends the hold.
+function activeBan (id) {
+  const row = dataState.bots?.[id]
+  const state = dataStore.isBanActive(row)
+  if (!state.held) return null
+  return { expiresAt: state.expiresAt, permanent: state.permanent, kind: row.banKind || 'permanent' }
+}
+
+// Called on a timer rather than scheduled per ban: one sweep handles every bot,
+// needs no long-lived timer, and re-reads the file state so a restart resumes the
+// hold correctly instead of losing it.
+function releaseExpiredBans () {
+  Object.keys(dataState.bots || {}).forEach(id => {
+    const row = dataState.bots[id]
+    if (!row || !row.banned) return
+    const expiresAt = Number(row.banExpiresAt) || 0
+    // No expiry means permanent — that one is never released automatically.
+    if (!expiresAt || Date.now() < expiresAt) return
+    dataStore.upsertBot(dataState, { bot: id, banned: false, bannedAt: null, banKind: null, banReason: null, banExpiresAt: 0 })
+    persistData()
+    logFor(id, `{green-fg}✓ ${sanitize(id)}'s ban has expired — reconnecting.{/green-fg}`)
+    const { host, port, version } = bots[id] || { host: HOST, port: PORT, version: VERSION }
+    try { bots[id]?.disconnectManually() } catch (_) {}
+    setTimeout(() => createBotInstance(id, host, port, version), 1000)
+    notifyBotsChanged()
+  })
+}
+
+const BAN_SWEEP_MS = readDelayMs(process.env.BAN_SWEEP_MS, 60000)
+const banSweepTimer = setInterval(releaseExpiredBans, BAN_SWEEP_MS)
+if (banSweepTimer.unref) banSweepTimer.unref()
 function botLocation (bot) {
   const p = bot?.entity?.position
   return { x: p?.x ?? null, y: p?.y ?? null, z: p?.z ?? null, dimension: bot?.game?.dimension || null }
@@ -699,6 +765,8 @@ health: b ? (b.health ?? null) : null, food: b ? (b.food ?? null) : null,
 uptimeSec: e.spawnTime ? Math.floor((Date.now() - e.spawnTime) / 1000) : null,
 attempts: e.reconnectAttempts || 0,
 kick: e.lastKickReason ? escHtml(sanitize(e.lastKickReason).slice(0, 140)) : null,
+banned: Boolean(dataState.bots[id]?.banned),
+banKind: dataState.bots[id]?.banKind || null,
 pingHist: histArr,
 manual: manual.snapshotFor(e)
 }
@@ -1308,7 +1376,7 @@ releaseManualKey(control,document.querySelector('.mkey[data-control="'+control+'
 function renderBots(bs){var box=el('botlist');box.innerHTML='';botStates={}
 for(var i=0;i<bs.length;i++){var b=bs[i];botStates[b.id]=b
 var old=prevOnline[b.id]
-if(old===true&&!b.online)toast(b.id+' went offline'+(b.kick?' — '+b.kick:''),'bad')
+if(old===true&&!b.online)toast(b.id+(b.banned?' was banned':' went offline')+(b.kick?' — '+b.kick:''),'bad')
 if(old===false&&b.online)toast(b.id+' is online','good')
 prevOnline[b.id]=b.online
 var d=document.createElement('div')
@@ -1317,12 +1385,14 @@ d.setAttribute('data-id',b.id)
 var up=b.uptimeSec==null?'':fmtUp(b.uptimeSec)
 var manualHtml=b.manual&&b.manual.mode?'<span class="manual-badge">manual</span>':''
 var guiHtml=b.manual&&(b.manual.guiTui||b.manual.session)?'<span class="manual-badge" style="color:var(--cyan);border-color:rgba(103,232,249,.4)">gui</span>':''
+var bannedHtml=b.banned?'<span class="manual-badge" style="color:var(--red);border-color:rgba(248,113,113,.45)">⛔ banned</span>':''
 var viewerHtml=b.manual&&b.manual.viewerPort?'<button class="manual-viewer" type="button" data-port="'+String(b.manual.viewerPort)+'">🌐 viewer</button>':''
-d.innerHTML='<div class="bhead"><div class="dot"></div><div class="bname"></div>'+manualHtml+guiHtml+viewerHtml+(b.attempts?'<div class="batt">↻'+b.attempts+'</div>':'')+'</div>'
+d.innerHTML='<div class="bhead"><div class="dot"></div><div class="bname"></div>'+bannedHtml+manualHtml+guiHtml+viewerHtml+(b.attempts?'<div class="batt">↻'+b.attempts+'</div>':'')+'</div>'
 +'<div class="bmeta"><span>'+(b.ping==null?'—':b.ping)+'ms</span><span>'+(b.health==null?'—':b.health)+'❤</span><span>'+(b.food==null?'—':b.food)+'🍗</span>'+(up?'<span>'+up+'</span>':'')+'</div>'
 +'<canvas width="220" height="16"></canvas>'
 d.querySelector('.bname').textContent=b.id
-if(b.kick)d.title=b.kick
+if(b.banned)d.title='Banned'+(b.banKind?' ('+b.banKind+')':'')+(b.kick?' — '+b.kick:'')
+else if(b.kick)d.title=b.kick
 d.onclick=(function(id){return function(){setView(id)}})(b.id)
 var viewerButton=d.querySelector('.manual-viewer')
 if(viewerButton)viewerButton.onclick=(function(port){return function(e){e.preventDefault();e.stopPropagation();window.open('http://'+location.hostname+':'+port+'/','_blank','noopener')}})(b.manual.viewerHostPort||b.manual.viewerPort)
@@ -2108,6 +2178,27 @@ if (manualDisconnect || bots[id]?.reconnectTimer) {
 return;
 }
 
+// The removed list outranks everything: a permanently banned bot is not yours
+// to reconnect any more, whatever BOT_NAMES still says.
+const removal = removedEntryFor(id)
+if (removal) {
+e(`${id} is on the removed list (${removedBotsStore.describeRemovedBot(removal)}) — not reconnecting. Run /unban ${id} to put it back.`)
+notifyBotsChanged()
+return
+}
+
+// A banned account must stop knocking: repeated logins during a ban look like
+// evasion and are pointless anyway. The expiry is an absolute time in the data
+// file, so this holds across restarts, and the ban sweep reconnects when it
+// lapses. Switching proxy is irrelevant — the ban follows the account.
+const ban = activeBan(id)
+if (ban) {
+if (ban.permanent) e(`${id} is permanently banned (${ban.kind}) — not reconnecting. Remove it from BOT_NAMES, or run /closeBot ${id}.`)
+else w(`${id} is banned (${ban.kind}) — holding off until ${new Date(ban.expiresAt).toLocaleString()}.`)
+notifyBotsChanged()
+return
+}
+
 const proxyCrash = isProxyCrash(rawError || reason)
 const attempt = bots[id]?.reconnectAttempts || 0
 
@@ -2302,6 +2393,13 @@ bot.once('spawn', () => {
 connected = true
 const recoveredAfter = bots[id]?.reconnectAttempts || 0
 if (bots[id]) bots[id].spawnTime = Date.now()
+// Getting back in means the ban is gone (a temporary ban expired, or somebody
+// lifted it), so clear the flag instead of reporting a stale ban forever.
+if (dataState.bots[id]?.banned) {
+dataStore.upsertBot(dataState, { bot: id, banned: false, bannedAt: null, banKind: null })
+persistData()
+logFor(id, `{green-fg}✓ ${sanitize(id)} is no longer banned — cleared the ban flag.{/green-fg}`)
+}
 monitoring?.onRecovered(id, recoveredAfter)
 s(`Spawned on ${host}:${port} (v${version}).`)
 notifyBotsChanged()
@@ -2442,6 +2540,59 @@ bots[id].lastKickReason = text
 bots[id].lastDisconnectReason = text
 }
 e(`Kicked: ${sanitize(text)}`)
+// A ban arrives as an ordinary kick, so the wording is the only evidence. The
+// verdict is written to the persisted data state (not just memory) so a banned
+// bot is still reported as banned after a restart, and /data publishes it.
+const banVerdict = classifyKick(text)
+if (banVerdict.banned) {
+const alreadyBanned = Boolean(dataState.bots[id]?.banned)
+// The FIRST detection sets the clock. Later kicks from the same ban keep it, so a
+// reconnect attempt twenty minutes in cannot push the release time further out.
+const knownExpiry = Number(dataState.bots[id]?.banExpiresAt) || 0
+// A permanent ban never expires. Everything else needs a real expiry or the bot
+// would be held forever: a stated length is authoritative, and when the server
+// says "temporary" (or only "possibly banned") without saying for how long, retry
+// after BAN_RETRY_MS rather than writing the account off.
+const unknownLength = !banVerdict.permanent && !banVerdict.durationMs && !banVerdict.expiresAt
+const expiresAt = knownExpiry || banVerdict.expiresAt ||
+  (banVerdict.durationMs ? Date.now() + banVerdict.durationMs : (unknownLength ? Date.now() + BAN_RETRY_MS : 0))
+const banRow = {
+bot: id,
+banned: true,
+// Keep the original ban time across the reconnect attempts that follow.
+bannedAt: dataState.bots[id]?.bannedAt || Date.now(),
+banKind: banVerdict.kind,
+// The clean phrase, never the raw component tree: this is what lands in the
+// spreadsheet cell and the Discord embed.
+banReason: banVerdict.reason,
+banExpiresAt: expiresAt
+}
+if (banVerdict.duration) banRow.banDuration = banVerdict.duration
+if (banVerdict.caseId) banRow.banCaseId = banVerdict.caseId
+dataStore.upsertBot(dataState, banRow)
+dataStore.recordBan(dataState, {
+bot: id,
+kind: banVerdict.kind,
+reason: banVerdict.reason,
+caseId: banVerdict.caseId,
+duration: banVerdict.duration,
+expiresAt,
+permanent: banVerdict.permanent
+})
+persistData()
+if (!alreadyBanned) {
+const hold = expiresAt ? ` — held until ${new Date(expiresAt).toLocaleString()}` : (banVerdict.permanent ? ' — permanent, will NOT reconnect' : '')
+logFor(id, `{red-fg}⛔ ${sanitize(id)} is ${banVerdict.kind === 'suspected' ? 'possibly ' : ''}banned${banVerdict.duration ? ' for ' + sanitize(banVerdict.duration) : ''} (${sanitize(banVerdict.kind)})${hold}{/red-fg}`)
+if (banVerdict.reason && banVerdict.reason !== text) logFor(id, `{red-fg}   reason: ${sanitize(banVerdict.reason)}${banVerdict.caseId ? ' [case ' + sanitize(banVerdict.caseId) + ']' : ''}{/red-fg}`)
+if (banVerdict.permanent) {
+const moved = removedBotsStore.addRemovedBot(removedBots, { bot: id, kind: banVerdict.kind, reason: banVerdict.reason, caseId: banVerdict.caseId }, { addedBy: 'ban-detection' })
+persistRemovedBots()
+logFor(id, `{red-fg}   This ban does not expire — ${moved.added ? 'moved to' : 'already on'} the removed list (${REMOVED_BOTS_FILE}).{/red-fg}`)
+logFor(id, `{yellow-fg}   Remove it from BOT_NAMES too, or it will just be skipped with a warning at every start. /removed lists them, /unban ${sanitize(id)} puts it back.{/yellow-fg}`)
+if (PERMANENT_BAN_ACTION === 'remove' && dropFromRoster(id)) logFor(id, `{yellow-fg}   Removed from the live roster (PERMANENT_BAN_ACTION=hold keeps it visible instead).{/yellow-fg}`)
+}
+}
+}
 monitoring?.onKick(id, text)
 notifyBotsChanged()
 })
@@ -2545,6 +2696,22 @@ let currentConnectDelay = 0
 const initialConnectTimers = []
 const initialBotOrder = RANDOMIZE_BOT_ORDER ? shuffledCopy(BOT_NAMES) : BOT_NAMES.slice()
 initialBotOrder.forEach((name, index) => {
+// The removed list wins over everything: a permanently banned bot is not yours
+// to reconnect any more, even if it is still named in BOT_NAMES.
+const removal = removedEntryFor(name)
+if (removal) {
+logFor(SYSTEM_ID, `{red-fg}⛔ ${sanitize(name)} is on the removed list (${sanitize(removedBotsStore.describeRemovedBot(removal))}) — not connecting. Run /unban ${sanitize(name)} to put it back.{/red-fg}`)
+return
+}
+
+// A ban outlives the process, so a restart must not walk straight back into it.
+const held = activeBan(name)
+if (held) {
+logFor(SYSTEM_ID, held.permanent
+? `{red-fg}⛔ ${sanitize(name)} is permanently banned (${sanitize(held.kind)}) — not connecting. Remove it from BOT_NAMES to stop this warning.{/red-fg}`
+: `{red-fg}⛔ ${sanitize(name)} is banned (${sanitize(held.kind)}) — not connecting until ${new Date(held.expiresAt).toLocaleString()}.{/red-fg}`)
+return
+}
 const timer = setTimeout(() => {
 createBotInstance(name)
 if (index === 0) switchTo(name)
@@ -2603,7 +2770,7 @@ else entry.bot?.emit('end', 'proxy-watchdog: forced')
 // ── Command registry (original + /stats) ──────────────────────────────────────
 const COMMANDS = {
 '/all <cmd>': 'Run a local command on EVERY bot, or broadcast a raw chat/command to all',
-'/all-slow <cmd>': `Like /all, but starts each bot ${ALL_SLOW_DELAY_MS / 1000}s apart (ALL_SLOW_DELAY_MS)`,
+'/all-slow [delay] <cmd>': `Like /all, but starts each bot ${ALL_SLOW_DELAY_MS / 1000}s apart (ALL_SLOW_DELAY_MS). An optional leading delay overrides it for that run, in the same units as sleep: /all-slow 30 /spawners, /all-slow 500ms /status`,
 '/all-slow-cancel [id]': 'Cancel a specific running /all-slow broadcast task by ID (e.g. /all-slow-cancel 1), or all tasks if no ID is specified',
 '/overview': 'Dashboard of every bot\'s health, food, ping, rank (via /fix + /rank), shards, coins, balance, and inventory slots',
 '/stats': 'Runtime stats: memory, event-loop lag, log rate, web viewers, uptime',
@@ -2615,6 +2782,8 @@ const COMMANDS = {
 '/spawners': `Without moving, right-click every ${SPAWNER_BLOCK.replace(/_/g, ' ')} already within reach (${SPAWNER_REACH} blocks), clicking GUI slot ${SPAWNER_SLOT_FIRST} then slot ${SPAWNER_SLOT_SECOND} on each one`,
 '/data': 'Compile all saved bot/spawner data, save the local JSON snapshot, and push the current snapshot to the Google Sheets Apps Script webhook. Subcommands: /data check (verify the webhook deployment end-to-end), /data status (show webhook config + tracked counts)',
 '/list': 'Compact one-line-per-bot status list (online / offline / last kick)',
+'/removed': 'List the removed / permanently-banned bots (the removed-bots.json roster)',
+'/unban <bot>': 'Take a bot off the removed list and reconnect it',
 '/chat <msg>': 'Send a chat message from the active bot (avoids triggering local commands); /-prefixed server commands open their GUI without auto-clicking',
 '/disconnect': 'Disconnect the active bot (stops auto-reconnect). Alias: /dc',
 '/closeBot': 'Disconnect the active bot and completely remove it from the UI',
@@ -3499,7 +3668,9 @@ dataStore.upsertBot(dataState, {
   bot: id,
   recordedAt: Date.now(),
   balance: await queryBalance(id, 'Balance', '/bal'),
-  botPosition: botLocation(bot),
+  ...dataStore.flattenPosition(botLocation(bot)),
+  // How many spawners were found on this bot's plot — the world truth, owned by
+  // the /spawners pass alone.
   spawnerCount: positions.length,
   successfulSpawners: done,
   runStartedAt
@@ -3841,13 +4012,20 @@ async function compileAndPushData (log = () => {}, onlyIds = null) {
       queryBalance(name, 'Balance', '/bal'),
       queryRank(name)
     ])
+    // spawnerCount is owned by the /spawners pass (spawners found on the plot).
+    // Overwriting it here with the local row count silently changed what that
+    // column meant depending on which command ran last, so the number of spawner
+    // rows being tracked gets its own column instead.
     dataStore.upsertBot(dataState, {
       bot: name,
       recordedAt: Date.now(),
       rank: rank || 'N/A',
       shards, coins, balance: money,
-      botPosition: botLocation(entry.bot),
-      spawnerCount: Object.values(dataState.spawners).filter(row => row.bot === name).length
+      ...dataStore.flattenPosition(botLocation(entry.bot)),
+      trackedSpawners: Object.values(dataState.spawners).filter(row => row.bot === name).length,
+      // Survivors of a ban keep banned:true in the data state, so a bot that is
+      // back online must publish an explicit false rather than a blank cell.
+      banned: Boolean(dataState.bots[name]?.banned)
     })
   }
   persistData()
@@ -3874,6 +4052,17 @@ async function compileAndPushData (log = () => {}, onlyIds = null) {
 function logDataStatus (log = () => {}) {
   log('{bold}── /data status ──{/bold}')
   log(`webhook: ${DATA_WEBHOOK_URL || '(not set — snapshots stay local)'}`)
+  if (DATA_WEBHOOK_URL) {
+    // Only the /exec URL of a public web app accepts anonymous calls. The /dev
+    // URL always demands a Google sign-in, and pasting it is a classic silent
+    // failure — flag the shape before any network call is made.
+    const wrongUrl = /\/exec(?:[?#]|$)/.test(DATA_WEBHOOK_URL)
+      ? null
+      : /\/dev(?:[?#]|$)/.test(DATA_WEBHOOK_URL)
+        ? 'this is the /dev URL, which ALWAYS requires a Google sign-in — use Deploy → Manage deployments → the /exec "Web app" URL instead'
+        : 'this URL does not end in /exec — copy the "Web app" URL from Apps Script → Deploy → Manage deployments'
+    if (wrongUrl) log(`{yellow-fg}⚠ ${wrongUrl}{/yellow-fg}`)
+  }
   log(`secret: ${DATA_WEBHOOK_SECRET ? `set (${DATA_WEBHOOK_SECRET.length} chars)` : 'not set'} · timeout: ${DATA_WEBHOOK_TIMEOUT_MS}ms`)
   log(`local file: ${DATA_FILE}`)
   log(`tracked: ${Object.keys(dataState.bots).length} bot(s) and ${Object.keys(dataState.spawners).length} spawner(s) · connected now: ${Object.keys(bots).length} bot(s)`)
@@ -3917,7 +4106,12 @@ async function checkDataWebhook (log = {}) {
   const body = String(text || '').trim()
 
   if (body.startsWith('<')) {
-    error(`Got an HTML page (HTTP ${response.status}) instead of JSON — this deployment is NOT public, so bot.js can never write to the sheet. Fix it in Apps Script: Deploy → Manage deployments → pencil icon → Execute as: Me, Who has access: Anyone → Version: New version → Deploy.`)
+    // The HTML itself names the fault (sign-in page vs. a missing doGet vs. a
+    // thrown exception), so report what the page actually says instead of
+    // assuming the deployment is private — that guess sent users chasing the
+    // wrong fix while the real problem was a stale deployed version.
+    const verdict = dataStore.diagnoseWebhookBody(body, { url: DATA_WEBHOOK_URL, status: response.status, method: 'GET' })
+    error(`${verdict.message}\n  diagnosis: ${verdict.kind}`)
     return false
   }
   let health = null
@@ -4185,12 +4379,32 @@ const isLocal = LOCAL_COMMANDS.includes(msg.split(/\s+/)[0])
 const ids = Object.keys(bots)
 const dispatch = id => dispatchCommandToBot(msg, id)
 if (command === '/all-slow') {
-const taskId = slowBroadcast.start(ids, ALL_SLOW_DELAY_MS, dispatch, {
-command: msg,
+// An optional leading delay overrides ALL_SLOW_DELAY_MS for this run:
+//   /all-slow 30 /spawners    → 30s apart
+//   /all-slow 500ms /status   → half a second
+// parseSleepDuration gives it exactly the units `sleep` uses, so 30 means 30s and
+// 5000 means 5000ms. The token is only taken as a delay when it is a bare number
+// or duration.
+let delayMs = ALL_SLOW_DELAY_MS
+let body = msg
+const splitAt = msg.search(/\s/)
+const firstToken = splitAt === -1 ? msg : msg.slice(0, splitAt)
+const requested = /^\d+(?:\.\d+)?(?:ms|s)?$/i.test(firstToken) ? parseSleepDuration(firstToken) : null
+if (requested !== null) {
+if (splitAt === -1) { logWarn('Usage: /all-slow [delay] <command> — a delay needs a command after it'); return }
+body = msg.slice(splitAt + 1).trim()
+if (!body) { logWarn('Usage: /all-slow [delay] <command>'); return }
+// Below a quarter second the dispatches overlap and the point is lost.
+delayMs = Math.max(250, requested)
+}
+const slowDispatch = id => dispatchCommandToBot(body, id)
+const taskId = slowBroadcast.start(ids, delayMs, slowDispatch, {
+command: body,
 onError: (err, id) => logWarn(`[Task #${taskId}] ${id}: ${sanitize(err.message)}`),
 onDone: ({ sent, skipped }) => logSuccess(`[Task #${taskId}] Slow broadcast finished: ${sent} dispatched, ${skipped} skipped/failed.`)
 })
-logInfo(`[Task #${taskId}] Slow broadcast to ${ids.length} bot(s), ${ALL_SLOW_DELAY_MS / 1000}s apart: ${sanitize(msg)}`)
+const apart = delayMs % 1000 === 0 ? `${delayMs / 1000}s` : `${(delayMs / 1000).toFixed(1)}s`
+logInfo(`[Task #${taskId}] Slow broadcast to ${ids.length} bot(s), ${apart} apart: ${sanitize(body)}`)
 } else {
 const onError = (err, id) => logWarn(`${id}: ${sanitize(err.message)}`)
 let sent = 0
@@ -4262,6 +4476,33 @@ log(`[${idx + 1}] {cyan-fg}${name}{/cyan-fg} : {gray-fg}Offline / Connecting…{
 return
 }
 
+// ── /removed and /unban ─────────────────────
+if (trimmed === '/removed') {
+const entries = removedBots.bots || []
+if (!entries.length) { logInfo('Nothing on the removed list — no bot has been permanently banned or removed.'); return }
+logInfo(`{bold}── Removed / permanently banned (${entries.length}) ──{/bold}`)
+entries.forEach((entry, idx) => log(` [${idx + 1}] {red-fg}${sanitize(entry.bot)}{/red-fg} — ${sanitize(removedBotsStore.describeRemovedBot(entry))}${entry.addedAt ? ` · added ${new Date(entry.addedAt).toLocaleString()}` : ''}`))
+logInfo(`File: ${REMOVED_BOTS_FILE} · /unban <bot> puts one back`)
+return
+}
+
+if (trimmed === '/unban' || trimmed.startsWith('/unban ')) {
+const target = trimmed.slice('/unban'.length).trim()
+if (!target) { logWarn('Usage: /unban <bot name> — /removed lists them'); return }
+const restored = removedBotsStore.removeRemovedBot(removedBots, target)
+if (!restored) { logWarn(`"${sanitize(target)}" is not on the removed list. Run /removed to see it.`); return }
+persistRemovedBots()
+// Clear the hold as well, or the next reconnect would just be held again.
+dataStore.upsertBot(dataState, { bot: restored.bot, banned: false, bannedAt: null, banKind: null, banReason: null, banExpiresAt: 0 })
+persistData()
+logSuccess(`${restored.bot} is off the removed list — reconnecting. Put it back in BOT_NAMES if you had removed it.`)
+const { host, port, version } = bots[restored.bot] || { host: HOST, port: PORT, version: VERSION }
+try { bots[restored.bot]?.disconnectManually() } catch (_) {}
+setTimeout(() => createBotInstance(restored.bot, host, port, version), 1000)
+notifyBotsChanged()
+return
+}
+
 // ── /list ───────────────────────────────────
 if (trimmed === '/list') {
 const names = Object.keys(bots)
@@ -4272,8 +4513,9 @@ if (b?.bot?.entity) {
 const up = formatUptime(b.spawnTime ? Date.now() - b.spawnTime : 0)
 log(` [${idx + 1}] {cyan-fg}${name}{/cyan-fg} {green-fg}● Online{/green-fg} (${up})`)
 } else {
+const ban = dataState.bots[name]?.banned ? ` {red-fg}⛔ banned${dataState.bots[name].banKind ? ' (' + sanitize(dataState.bots[name].banKind) + ')' : ''}{/red-fg}` : ''
 const kick = b?.lastKickReason ? ` — last kick: ${sanitize(b.lastKickReason).slice(0, 60)}` : ''
-log(` [${idx + 1}] {cyan-fg}${name}{/cyan-fg} {red-fg}○ Offline{/red-fg}${kick}`)
+log(` [${idx + 1}] {cyan-fg}${name}{/cyan-fg} {red-fg}○ Offline{/red-fg}${ban}${kick}`)
 }
 })
 return

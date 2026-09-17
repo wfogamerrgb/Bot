@@ -36,7 +36,7 @@ function runtime(env = {}) {
     setInterval: setTimer, clearInterval: clearTimer, setImmediate: fn => setTimer(fn, 0),
     require(name) {
       if (name === 'dotenv') return { config() {} }
-      if (name === 'fs') return { readFileSync: () => '', writeFileSync() {} }
+      if (name === 'fs') return { readFileSync: () => '', writeFileSync() {}, mkdirSync() {}, renameSync() {}, existsSync: () => false }
       if (name === 'http') return { createServer(fn) { requestHandler = fn; return server } }
       if (name === 'ws') return fakeWs
       if (name === './bot-controls') return {
@@ -45,7 +45,14 @@ function runtime(env = {}) {
         createSlowBroadcastManager: () => controls.createSlowBroadcastManager({ setTimer, clearTimer })
       }
       if (name === './expose-terminal') return { sshConfig: () => ({ enabled: false }) }
-      if (name === './monitoring') return { createMonitoring: () => ({ getMemorySnapshot: () => null, onDisconnect() {}, onKick() {}, onProxyStall() {}, onReconnectExhausted() {}, onFatal() {}, onSecurityLockout() {}, inspectServerMessage() {}, onRecovered() {} }) }
+      if (name === './monitoring') return {
+        // A ban verdict that matches nothing, so the kick path stays exercised
+        // without a live connection.
+        classifyKick: message => ({ banned: false, permanent: false, kind: '', duration: '', durationMs: 0, expiresAt: 0, reason: String(message ?? ''), caseId: '', text: String(message ?? '') }),
+        createMonitoring: () => ({ getMemorySnapshot: () => null, onDisconnect() {}, onKick() {}, onBan() {}, onProxyStall() {}, onReconnectExhausted() {}, onFatal() {}, onSecurityLockout() {}, inspectServerMessage() {}, onRecovered() {} })
+      }
+      // Resolved against this test file, not against bot.js, so it needs an entry.
+      if (name === './removed-bots') return require('../removed-bots')
       if (name === './bot-manual') return () => ({ routeCommand: () => false, key() {}, onWindowOpen: () => false, onWindowClose() {}, stopManualMode() {}, snapshotFor: () => null })
       if (name === 'mineflayer') return { createBot() { throw Error('Live bot connections forbidden in tests') } }
       if (name === 'mineflayer-armor-manager') return () => {}
@@ -164,6 +171,54 @@ test('bare broadcasts give usage; normal /all stays immediate', () => {
   assert.deepEqual(plain(r.context.chats), [])
   r.run(`handleCommand('/all hello')`)
   assert.deepEqual(plain(r.context.chats), [['A', 'hello'], ['B', 'hello'], ['C', 'hello']])
+})
+
+// A permanent ban has to actually leave the roster, and the removed list — not a
+// live connection — is what decides whether a bot may come back.
+test('the removed list gates reconnecting and /unban puts a bot back', () => {
+  const r = runtime()
+  assert.equal(r.run('removedEntryFor("A")'), null, 'nothing is removed by default')
+
+  // What a permanent ban does, minus the live kick event.
+  r.run(`removedBots = removedBotsStore.addRemovedBot(removedBots, { bot: 'A', kind: 'permanent', reason: 'cheating' }, { addedBy: 'ban-detection' }).list`)
+  assert.equal(r.run('removedEntryFor("A").bot'), 'A')
+  assert.equal(r.run('removedEntryFor("a").bot'), 'A', 'a name from .env may not match the kick text casing')
+  assert.equal(r.run('removedEntryFor("B")'), null)
+
+  assert.equal(r.run('dropFromRoster("A")'), true)
+  assert.equal(r.run('Object.keys(bots).includes("A")'), false, 'the bot leaves the live roster')
+  assert.equal(r.run('activeId'), 'C', 'the active bot moves off the removed one')
+  assert.equal(r.run('dropFromRoster("A")'), false, 'dropping it twice is harmless')
+
+  // The commands must survive being called, and /unban must clear both the list
+  // and the ban hold (otherwise the next reconnect is held again).
+  r.run(`handleCommand('/removed')`)
+  r.run(`handleCommand('/unban')`)
+  r.run(`handleCommand('/unban ghost')`)
+  assert.equal(r.run('removedEntryFor("A").bot'), 'A', 'a bare or unknown /unban changes nothing')
+
+  r.run('dataState.bots.A = { banned: true, banKind: "permanent", banExpiresAt: 0 }')
+  r.run(`handleCommand('/unban A')`)
+  assert.equal(r.run('removedEntryFor("A")'), null, 'the bot is off the removed list')
+  assert.equal(r.run('dataState.bots.A.banned'), false, 'and its ban hold is cleared')
+
+  assert.equal(r.run('PERMANENT_BAN_ACTION'), 'remove', 'a permanent ban defaults to leaving the roster')
+})
+
+// activeBan is what both the startup loop and scheduleReconnect ask before
+// dialling, so it is worth pinning down through bot.js rather than only in isolation.
+test('activeBan holds a live ban and releases an expired one', () => {
+  const r = runtime()
+  r.run(`
+    dataState.bots.B = { banned: true, banKind: 'permanent', banExpiresAt: 0 }
+    dataState.bots.C = { banned: true, banKind: 'temporary', banExpiresAt: Date.now() - 1000 }
+    dataState.bots.D = { banned: true, banKind: 'temporary', banExpiresAt: Date.now() + 60000 }
+  `)
+  assert.equal(r.run('activeBan("B").permanent'), true, 'no expiry is a permanent hold')
+  assert.equal(r.run('activeBan("C")'), null, 'an elapsed ban is no longer held')
+  assert.equal(r.run('activeBan("D").permanent'), false)
+  assert.ok(r.run('activeBan("D").expiresAt') > Date.now())
+  assert.equal(r.run('activeBan("A")'), null, 'an unbanned bot is never held')
 })
 
 test('item name helpers prefer anvil custom names and expose the alternative name', () => {
