@@ -42,6 +42,12 @@ const zlib = require('zlib')
 const { exec } = require('child_process')
 const { createTerminal, sshConfig } = require('./expose-terminal')
 const dataStore = require(path.join(__dirname, 'data-store'))
+// Runtime settings (the dashboard .ENV tab: temporary overrides, never written to disk),
+// coinflip data collection, the time-series store, and the read-only analytics pages.
+const settings = require(path.join(__dirname, 'settings'))
+const coinflip = require(path.join(__dirname, 'coinflip'))
+const timeseries = require(path.join(__dirname, 'timeseries'))
+const analytics = require(path.join(__dirname, 'analytics'))
 const mineflayer = require('mineflayer')
 const armorManager = require('mineflayer-armor-manager')
 const { pathfinder, Movements, goals: { GoalNear } } = require('mineflayer-pathfinder')
@@ -89,11 +95,11 @@ function planAuthAction(id, message, now = Date.now()) {
   // A failure reply only counts as one if it answers something we just sent.
   // Without that window, a player typing "wrong password" into chat would stop a
   // bot from ever logging in again.
-  if (state.sentAt && now - state.sentAt <= AUTH_REPLY_WINDOW_MS && !detectPlayerChat(message)) {
+  if (state.sentAt && now - state.sentAt <= settings.get('AUTH_REPLY_WINDOW_MS') && !detectPlayerChat(message)) {
     const verdict = classifyAuthReply(message)
     if (verdict) {
       const next = nextAuthFailure(failure, verdict, now, {
-        throttleMs: AUTH_THROTTLE_MS, alreadyMs: AUTH_ALREADY_MS, maxThrottled: AUTH_MAX_THROTTLED
+        throttleMs: settings.get('AUTH_RETRY_MS'), alreadyMs: settings.get('AUTH_ALREADY_MS'), maxThrottled: settings.get('AUTH_MAX_THROTTLED_RETRIES')
       })
       // Clear sentAt so the same reply cannot be counted twice.
       authState.set(id, { ...state, failure: next, sentAt: 0 })
@@ -712,7 +718,84 @@ return typeof pv.mineflayer === 'function' ? pv.mineflayer : (typeof pv === 'fun
 const manual = createManualControls({ bots, logFor, sanitize, notifyBotsChanged, SYSTEM_ID, WEB_BIND, loadViewerFactory })
 
 // ── Commands known to run locally on a bot rather than sent as raw in-game chat ─
-const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dump-spawners', '/dc', '/reconnect', '/crates', '/crates-loop', '/spawners', '/data', '/shardshop-loop', '/closeBot']
+// ── Coinflip data collection, time series, analytics, and the settings tab ───
+// The registry is what the dashboard's .ENV tab edits. It normally reads
+// process.env itself, but bot.js is loaded under a sandboxed process in the
+// tests, so the value THIS module sees is handed in as the registry default —
+// which keeps a sandbox's environment authoritative while leaving a live
+// override able to beat it.
+function cfDefine (key, spec) {
+  const fromEnv = process.env[key]
+  if (fromEnv !== undefined && fromEnv !== '') {
+    const parsed = settings.coerce(spec.type || 'string', fromEnv)
+    if (parsed !== null) spec = { ...spec, def: parsed }
+  }
+  settings.define(key, spec)
+}
+// Every knob here is registered with the settings registry, which is what makes
+// the dashboard's .ENV tab able to change it without a restart and without ever
+// writing to .env. A value marked live (the default) is read through
+// settings.get(...) at the moment it is used; the few that are read once at
+// boot say so in their description, because pretending otherwise would make the
+// tab lie about what it just did.
+cfDefine('COINFLIP_DEFAULT_FLIPS', { type: 'int', def: 10, min: 1, group: 'Coinflip', desc: 'Flips per bot when /coinflip-data-run gets no count' })
+cfDefine('COINFLIP_WAGER_MIN', { type: 'int', def: 10000, min: 1, group: 'Coinflip', desc: 'Low end of the random wager (used when no PRICE argument is given)' })
+cfDefine('COINFLIP_WAGER_MAX', { type: 'int', def: 1000000, min: 1, group: 'Coinflip', desc: 'High end of the random wager' })
+cfDefine('COINFLIP_STOP_LOSS', { type: 'int', def: 10000000, min: 1, group: 'Coinflip', desc: 'Stop a per-bot run once its net loss reaches this' })
+cfDefine('COINFLIP_BALANCE_FRACTION', { type: 'number', def: 1, min: 0.01, max: 1, group: 'Coinflip', desc: 'Never wager more than this fraction of the balance' })
+cfDefine('COINFLIP_BUSY_WAIT_MS', { type: 'ms', def: 15000, min: 1000, group: 'Coinflip', desc: 'Wait this long when a coinflip is already active, then re-ask (never delete)' })
+cfDefine('COINFLIP_BUSY_MAX_WAIT_MS', { type: 'ms', def: 900000, min: 60000, group: 'Coinflip', desc: 'Give up on an active coinflip after this long' })
+cfDefine('COINFLIP_FLIP_TIMEOUT_MS', { type: 'ms', def: 600000, min: 60000, group: 'Coinflip', desc: 'How long one flip may wait for an opponent and a result' })
+cfDefine('COINFLIP_POLL_MS', { type: 'ms', def: 15000, min: 1000, group: 'Coinflip', desc: 'How often the runner wakes up to re-check a flip' })
+cfDefine('COINFLIP_SETTLE_MS', { type: 'ms', def: 1500, min: 100, group: 'Coinflip', desc: 'Quiet period that closes a multi-line result block' })
+cfDefine('COINFLIP_MIN_SAMPLE', { type: 'int', def: 30, min: 5, group: 'Coinflip', desc: 'Resolved flips needed before a fairness verdict is given' })
+cfDefine('COINFLIP_SUSPICION_P', { type: 'number', def: 0.01, min: 0.0001, max: 0.5, group: 'Coinflip', desc: 'A two-sided p below this is called suspicious' })
+cfDefine('COINFLIP_BALANCE_TIMEOUT_MS', { type: 'ms', def: 2500, min: 500, group: 'Coinflip', desc: 'How long /bal has to answer around a flip' })
+cfDefine('TIMESERIES_ENABLED', { type: 'bool', def: true, group: 'Time series', desc: 'Record samples to the data folder' })
+cfDefine('TIMESERIES_INTERVAL_MS', { type: 'ms', def: 3600000, min: 60000, group: 'Time series', desc: 'How often a sample is taken (default hourly)' })
+cfDefine('TIMESERIES_RANK_INTERVAL_MS', { type: 'ms', def: 21600000, min: 0, group: 'Time series', desc: 'How often ranks are probed (0 disables — each probe costs a /fix)' })
+cfDefine('TIMESERIES_STARTUP_DELAY_MS', { type: 'ms', def: 120000, min: 0, group: 'Time series', desc: 'First sample after boot (0 disables)' })
+cfDefine('TIMESERIES_MAX_RECORDS', { type: 'int', def: 500000, min: 1000, group: 'Time series', desc: 'Samples kept in memory and on disk' })
+cfDefine('ANALYTICS_ENABLED', { type: 'bool', def: true, group: 'Analytics', desc: 'Serve the read-only analytics page' })
+cfDefine('ANALYTICS_PORT', { type: 'int', def: 8080, min: 1, max: 65535, group: 'Analytics', live: false, desc: 'Port for the analytics page — the listener starts at boot, so this one needs a restart' })
+cfDefine('ANALYTICS_OPEN', { type: 'bool', def: false, group: 'Analytics', desc: 'Serve analytics with no login at all (default: the dashboard session is required)' })
+cfDefine('ANALYTICS_BUCKET_MS', { type: 'ms', def: 3600000, min: 60000, group: 'Analytics', desc: 'Bucket size for the charts (also ?bucket=1h)' })
+// Keys that are read once at startup. They are listed so the tab is a complete
+// picture of the configuration rather than only the new half of it.
+cfDefine('ALL_SLOW_DELAY_MS', { type: 'ms', def: 15000, min: 0, group: 'Timing', desc: 'Default gap between bots in /all-slow (live)' })
+cfDefine('AUTH_RETRY_MS', { type: 'ms', def: 300000, min: 1000, group: 'Auth', desc: 'Wait before retrying a throttled login (live)' })
+cfDefine('AUTH_ALREADY_MS', { type: 'ms', def: 60000, min: 0, group: 'Auth', desc: 'Wait when the server says "already logged in" (live)' })
+cfDefine('AUTH_MAX_THROTTLED_RETRIES', { type: 'int', def: 2, min: 1, group: 'Auth', desc: 'Throttled retries before it becomes a wrong-password failure (live)' })
+cfDefine('AUTH_REPLY_WINDOW_MS', { type: 'ms', def: 30000, min: 1000, group: 'Auth', desc: 'How long a reply counts as an answer to our auth command (live)' })
+cfDefine('LOGIN_PASSWORD', { type: 'string', def: '123456', group: 'Auth', desc: 'Global /register + /login password. Resolved at each auth attempt, so a change applies to the next /auth-retry — a per-bot or group password is read at boot and still wins for those bots' })
+cfDefine('HOST', { type: 'string', def: 'play.fatalmc.org', group: 'Server', live: false, desc: 'Default server host (startup-only)' })
+cfDefine('PORT', { type: 'int', def: 25565, group: 'Server', live: false, desc: 'Default server port (startup-only)' })
+cfDefine('VERSION', { type: 'string', def: '1.21.2', group: 'Server', live: false, desc: 'Minecraft version to connect with (startup-only)' })
+cfDefine('BOT_NAMES', { type: 'list', group: 'Server', live: false, desc: 'The roster (startup-only — edit the file and restart to change it)' })
+cfDefine('CONNECT_DELAY_MS', { type: 'ms', def: 39500, min: 0, group: 'Timing', live: false, desc: 'Gap between initial bot connects (startup-only)' })
+// These six are read once while bot.js loads, so they are registered as
+// startup-only. The .ENV tab still shows and sets them, but it says plainly
+// that the running process keeps its old value — claiming otherwise is exactly
+// the lie this registry exists to prevent. Both /crates-all flags override the
+// Crates defaults per run, so the common change needs no restart at all.
+cfDefine('CRATES_ALL_DUMP', { type: 'string', def: 'tpa', group: 'Crates', live: false, desc: 'Default dump step for /crates-all (off|tpa|home|hidden|player:<name>). Startup-only; the per-run dump= flag overrides it' })
+cfDefine('CRATES_ALL_AFK_WARP', { type: 'bool', def: true, group: 'Crates', live: false, desc: 'Whether /crates-all warps back to AFK. Startup-only; afk=off overrides it per run' })
+cfDefine('CRATES_ALL_AFK_DELAY_MS', { type: 'ms', def: 15000, min: 0, group: 'Crates', live: false, desc: 'Delay before that AFK warp (0 = immediately). Startup-only; afk=now overrides it per run' })
+cfDefine('DUMP_HOME_COMMAND', { type: 'string', def: '/home stash', group: 'Dump', live: false, desc: 'The /home command used by dump=home (startup-only)' })
+cfDefine('TPA_MAIN_PLAYER', { type: 'string', def: (process.env.TPA_MAIN_PLAYER || process.env.TPA_TARGET_PLAYER || '').trim(), group: 'Dump', live: false, desc: 'Default /tpa target for the dump step (startup-only; TPA_TARGET_PLAYER is still read as an alias)' })
+cfDefine('WARP_COMMAND', { type: 'string', def: '/warp afk', group: 'Dump', live: false, desc: 'The AFK warp command (startup-only)' })
+cfDefine('WEB_PORT', { type: 'int', def: 80, min: 1, max: 65535, group: 'Dashboard', live: false, desc: 'Dashboard port (startup-only)' })
+cfDefine('WEB_PASSWORD', { type: 'string', group: 'Dashboard', live: false, desc: 'Dashboard login (startup-only; leave empty for a generated one)' })
+
+const COINFLIP_FILE = process.env.COINFLIP_FILE || path.join(__dirname, 'data', 'coinflip-history.jsonl')
+const COINFLIP_SUMMARY_FILE = process.env.COINFLIP_SUMMARY_FILE || path.join(__dirname, 'data', 'coinflip-stats.json')
+const TIMESERIES_FILE = process.env.TIMESERIES_FILE || path.join(__dirname, 'data', 'timeseries.jsonl')
+const TIMESERIES_SUMMARY_FILE = process.env.TIMESERIES_SUMMARY_FILE || path.join(__dirname, 'data', 'timeseries-summary.json')
+const coinflipStore = coinflip.createCoinflipStore({ file: COINFLIP_FILE, maxRecords: 200000 })
+const timeseriesStore = timeseries.createTimeseriesStore({ file: TIMESERIES_FILE })
+
+
+const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dump-spawners', '/dc', '/reconnect', '/crates', '/crates-loop', '/spawners', '/data', '/shardshop-loop', '/closeBot', '/coinflip-data-run']
 
 const logSubscribers = new Set()
 function subscribeLog(fn) { logSubscribers.add(fn); return () => logSubscribers.delete(fn) }
@@ -900,6 +983,7 @@ banKind: dataState.bots[id]?.banKind || null,
 authFailed: Boolean(authState.get(id)?.failure),
 authKind: authState.get(id)?.failure ? escHtml(sanitize(authState.get(id).failure.kind)) : null,
 authReason: authState.get(id)?.failure ? escHtml(sanitize(authState.get(id).failure.reason)) : null,
+coinflip: coinflipSessions.get(id) || coinflipLastRun.get(id) || null,
 pingHist: histArr,
 manual: manual.snapshotFor(e)
 }
@@ -1198,6 +1282,25 @@ button.tb:hover{color:var(--txt);border-color:var(--acc)}
 .manual-badge{color:var(--yel);border:1px solid rgba(251,191,36,.4);border-radius:5px;padding:1px 5px;font-size:9px}
 #manualbar{position:fixed;left:250px;right:0;bottom:56px;z-index:29;display:none;align-items:center;justify-content:center;gap:18px;padding:8px 12px;background:var(--panel2);border-top:1px solid var(--line);box-shadow:0 -5px 14px rgba(0,0,0,.18)}
 #manualbar.on{display:flex}
+#envbtn.on{color:var(--acc);border-color:var(--acc)}
+#envpanel{position:fixed;inset:0;z-index:40;background:rgba(6,9,13,.74);display:flex;align-items:flex-start;justify-content:center;overflow:auto;padding:36px 16px}
+#envpanel[hidden]{display:none}
+#envbox{background:var(--panel);border:1px solid var(--line);border-radius:12px;width:min(1000px,100%);padding:14px 18px 24px;box-shadow:0 18px 60px rgba(0,0,0,.5)}
+#envbox .ehead{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:4px}
+#envbox .ehead b{color:var(--acc);letter-spacing:.5px}
+#envbox .enote{color:var(--dim);font-size:11px;margin-right:auto}
+#envbox h4{color:var(--cyan);font-size:11px;text-transform:uppercase;letter-spacing:.8px;margin:16px 0 4px;border-bottom:1px solid var(--line);padding-bottom:4px}
+.eitem{display:flex;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid rgba(29,40,54,.5)}
+.eitem .ekey{width:280px;flex:none;color:#dbe6ee;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.eitem .edesc{flex:1;min-width:0;color:var(--dim);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.eitem input{flex:none;width:150px;background:var(--bg);border:1px solid var(--line);border-radius:5px;color:var(--txt);font:inherit;font-size:11px;padding:2px 6px}
+.eitem input:focus{outline:none;border-color:var(--acc)}
+.eitem .temp{flex:none;color:var(--yel);font-size:10px}
+.eitem .startup{flex:none;color:var(--dim);font-size:10px}
+.eitem button{flex:none;background:none;border:1px solid var(--line);color:var(--dim);border-radius:5px;font:inherit;font-size:10px;padding:2px 7px;cursor:pointer}
+.eitem button:hover{color:var(--acc);border-color:var(--acc)}
+.eitem button.set{color:var(--acc);border-color:rgba(45,212,191,.45)}
+@media(max-width:760px){.eitem{flex-wrap:wrap}.eitem .ekey{width:100%}.eitem .edesc{display:none}}
 .manual-group{display:flex;align-items:center;gap:6px}
 .manual-label{color:var(--dim);font-size:10px;text-transform:uppercase}
 .move-pad{display:grid;grid-template-columns:34px 34px 34px;grid-template-rows:28px 28px;gap:4px}
@@ -1250,7 +1353,7 @@ button.tb:hover{color:var(--txt);border-color:var(--acc)}
 </style></head><body>
 <div id="app">
 <header><div class="logo">⛏ AFK<b>CONSOLE</b></div><div id="chips"></div><div id="wsstate" class="wsstate down">offline</div><button id="logout">sign out</button></header>
-<aside><div class="views"><div class="vchip on" data-view="all">ALL</div><div class="vchip" data-view="system">SYSTEM</div><button class="vchip" id="terminalbtn" type="button">TERMINAL</button><!--PLAYBTN--></div><div id="botlist"></div></aside>
+<aside><div class="views"><div class="vchip on" data-view="all">ALL</div><div class="vchip" data-view="system">SYSTEM</div><button class="vchip" id="terminalbtn" type="button">TERMINAL</button><button class="vchip" id="envbtn" type="button" title="Temporary .env overrides — nothing is written to disk">.ENV</button><!--PLAYBTN--></div><div id="botlist"></div></aside>
 <main>
 <div id="loghead"><span id="channame">ALL CHANNELS</span><span id="newchip"></span>
 <input id="search" placeholder="filter logs…"><button class="tb" id="topbtn" type="button" title="scroll to top">↑ top</button><button class="tb" id="bottombtn" type="button" title="scroll to newest">↓ bottom</button><button class="tb" id="followbtn" type="button">⏸ pause</button>
@@ -1287,6 +1390,7 @@ button.tb:hover{color:var(--txt);border-color:var(--acc)}
 <button class="tb" id="sendbtn">send</button>
 </form>
 <div id="help" hidden></div>
+<div id="envpanel" hidden><div id="envbox"><div class="ehead"><b>.ENV</b><span class="enote">temporary — applied to this running process only, and forgotten on the next restart (edit the file for a permanent change)</span><button class="tb" id="envresetall" type="button">reset all</button><button class="tb" id="envclose" type="button">close</button></div><div id="envbody">loading…</div></div></div>
 <div id="terminal" hidden><div class="terminal-head"><b>bash</b><button class="tb" id="terminalclose" type="button">close</button></div><pre id="terminalout"></pre><form id="terminalform"><span class="prompt">$</span><input id="terminalinput" autocomplete="off" spellcheck="false"><button class="tb" type="submit">run</button></form></div>
 </main>
 </div>
@@ -1521,12 +1625,14 @@ var guiHtml=b.manual&&(b.manual.guiTui||b.manual.session)?'<span class="manual-b
 var bannedHtml=b.banned?'<span class="manual-badge" style="color:var(--red);border-color:rgba(248,113,113,.45)">⛔ banned</span>':''
 var authHtml=b.authFailed?'<span class="manual-badge" style="color:var(--red);border-color:rgba(248,113,113,.45)">🔑 '+b.authKind+'</span>':''
 var viewerHtml=b.manual&&b.manual.viewerPort?'<button class="manual-viewer" type="button" data-port="'+String(b.manual.viewerPort)+'">🌐 viewer</button>':''
-d.innerHTML='<div class="bhead"><div class="dot"></div><div class="bname"></div>'+bannedHtml+authHtml+manualHtml+guiHtml+viewerHtml+(b.attempts?'<div class="batt">↻'+b.attempts+'</div>':'')+'</div>'
+var cfHtml=b.coinflip?'<span class="manual-badge" style="color:var(--cyan);border-color:rgba(103,232,249,.4)">🎲 '+b.coinflip.flips+'/'+b.coinflip.planned+'</span>':''
+d.innerHTML='<div class="bhead"><div class="dot"></div><div class="bname"></div>'+bannedHtml+authHtml+cfHtml+manualHtml+guiHtml+viewerHtml+(b.attempts?'<div class="batt">↻'+b.attempts+'</div>':'')+'</div>'
 +'<div class="bmeta"><span>'+(b.ping==null?'—':b.ping)+'ms</span><span>'+(b.health==null?'—':b.health)+'❤</span><span>'+(b.food==null?'—':b.food)+'🍗</span>'+(up?'<span>'+up+'</span>':'')+'</div>'
 +'<canvas width="220" height="16"></canvas>'
 d.querySelector('.bname').textContent=b.id
 if(b.banned)d.title='Banned'+(b.banKind?' ('+b.banKind+')':'')+(b.kick?' — '+b.kick:'')
 else if(b.authFailed)d.title='Login rejected: '+b.authReason+' — fix the password and run /auth-retry '+b.id
+else if(b.coinflip)d.title='Coinflip run: '+b.coinflip.flips+' of '+b.coinflip.planned+' flips, net '+(b.coinflip.net>=0?'+':'')+b.coinflip.net+' — '+b.coinflip.stopped
 else if(b.kick)d.title=b.kick
 d.onclick=(function(id){return function(){setView(id)}})(b.id)
 var viewerButton=d.querySelector('.manual-viewer')
@@ -1583,6 +1689,56 @@ el('cmdbar').addEventListener('submit',function(e){e.preventDefault();var v=cinp
 el('topbtn').onclick=function(){follow=false;scrollOnNextLog=false;el('followbtn').textContent='▶ follow';el('logwrap').scrollTop=0}
 el('bottombtn').onclick=function(){setFollow(true)}
 el('terminalbtn').onclick=openTerminal
+function envRow(r,box){
+var row=document.createElement('div');row.className='eitem'
+var k=document.createElement('div');k.className='ekey';k.textContent=r.key
+k.title=new Date().toISOString()+' '+r.key
+if(r.desc)k.title=r.key+' — '+r.desc
+var d=document.createElement('div');d.className='edesc';d.textContent=r.desc||'(no description)'
+var input=document.createElement('input')
+input.type=r.secret?'password':'text'
+input.placeholder=r.secret?(r.configured?'(set)':'(unset)'):(r.configured?'':'not set')
+if(!r.secret&&r.value!=null&&r.value!=='')input.value=Array.isArray(r.value)?r.value.join(','):String(r.value)
+var setBtn=document.createElement('button');setBtn.type='button';setBtn.className='set';setBtn.textContent='set'
+setBtn.onclick=(function(key,field){return function(){envSave(key,field.value)}})(r.key,input)
+var resetBtn=document.createElement('button');resetBtn.type='button';resetBtn.textContent='reset'
+resetBtn.onclick=(function(key){return function(){envReset(key)}})(r.key)
+var mark=document.createElement('span')
+mark.className=r.overridden?'temp':'startup'
+mark.textContent=r.overridden?'* temporary':(r.live?'':'startup-only')
+if(r.source==='default')mark.title='using the built-in default ('+(r.default==null?'':String(r.default))+')'
+row.appendChild(k);row.appendChild(d);row.appendChild(input);row.appendChild(setBtn);row.appendChild(resetBtn);row.appendChild(mark)
+box.appendChild(row)
+}
+function envRender(groups){
+var box=el('envbody');box.innerHTML=''
+if(!groups||!groups.length){box.textContent='No settings to show.';return}
+for(var i=0;i<groups.length;i++){
+var h=document.createElement('h4');h.textContent=groups[i].group;box.appendChild(h)
+var rows=groups[i].rows||[]
+for(var j=0;j<rows.length;j++)envRow(rows[j],box)
+}
+}
+function envLoad(){
+el('envpanel').hidden=false;el('envbody').textContent='loading…'
+fetch('/api/settings',{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.json()}).then(function(m){envRender(m.groups||[])}).catch(function(){el('envbody').textContent='could not load the settings'})
+}
+function envSave(key,value){
+fetch('/api/settings',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:key,value:value})}).then(function(r){return r.json()}).then(function(m){
+if(!m.ok){toast(m.error||('could not set '+key),'bad');return}
+toast(key+(m.value==null?' updated (temporary)':(' = '+m.value+' (temporary)')),'good');envLoad()
+}).catch(function(){toast('could not reach the console','bad')})
+}
+function envReset(key){
+fetch('/api/settings/reset',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:key})}).then(function(r){return r.json()}).then(function(m){
+toast(m.ok?(key+' reset'):(m.error||'not overridden'),m.ok?'good':'bad');envLoad()
+}).catch(function(){})
+}
+function envResetAll(){
+fetch('/api/settings/reset',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({all:true})}).then(function(r){return r.json()}).then(function(m){
+toast('cleared '+((m.cleared==null)?0:m.cleared)+' override(s)','good');envLoad()
+}).catch(function(){})
+}
 var pb=el('playbtn');if(pb)pb.onclick=function(){window.open('/play','_blank','noopener')}
 el('terminalclose').onclick=closeTerminal
 window.addEventListener('resize',function(){
@@ -1823,6 +1979,9 @@ const A = Buffer.from(String(a)), B = Buffer.from(String(b))
 if (A.length !== B.length) { crypto.timingSafeEqual(A, A); return false }
 return crypto.timingSafeEqual(A, B)
 }
+// The analytics listener is a separate server outside this closure, so it is
+// handed the session check it needs here.
+webAuth = { sessionValid, tokenFromReq }
 function readBody(req, cap) {
 cap = cap || 16384
 return new Promise(resolve => {
@@ -1948,6 +2107,32 @@ webTrace(`browser error: ${sanitize(report.message).slice(0, 500)}`)
 if (report.stack) webTrace(`browser stack: ${sanitize(String(report.stack)).slice(0, 1200)}`)
 }
 res.writeHead(204); res.end(); return
+}
+if (p === '/api/settings' && req.method === 'GET') {
+// The .ENV tab: the registry's current values, grouped, with secrets withheld.
+res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
+res.end(JSON.stringify({ groups: settings.grouped(), overrides: settings.overrideCount() }))
+return
+}
+if (p === '/api/settings' && req.method === 'POST') {
+const body = await readBody(req, 8192)
+let msg
+try { msg = JSON.parse(body || '{}') } catch (_) { msg = null }
+const result = msg && msg.key ? settings.set(msg.key, msg.value) : { ok: false, error: 'a setting name is required' }
+res.writeHead(result.ok ? 200 : 400, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
+res.end(JSON.stringify(result))
+if (result.ok) logFor(SYSTEM_ID, `{cyan-fg}› .ENV tab: ${sanitize(String(msg.key))} set for this run only${result.live ? '' : ' (startup-only key — the running process keeps its old value)'}{/cyan-fg}`)
+else logFor(SYSTEM_ID, `{yellow-fg}⚠ .ENV tab rejected ${sanitize(String(msg && msg.key))}: ${sanitize(result.error)}{/yellow-fg}`)
+return
+}
+if (p === '/api/settings/reset' && req.method === 'POST') {
+const body = await readBody(req, 8192)
+let msg
+try { msg = JSON.parse(body || '{}') } catch (_) { msg = null }
+const result = msg && msg.all ? { ok: true, cleared: settings.resetAll().length } : settings.reset(msg && msg.key)
+res.writeHead(result.ok ? 200 : 400, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
+res.end(JSON.stringify(result))
+return
 }
 if (p === '/api/state' && req.method === 'GET') {
 const view = normalizeView(url.searchParams.get('view') || 'all') || 'all'
@@ -2562,6 +2747,7 @@ i('Connected to server socket. Awaiting chat auth prompts…')
 bot.on('messagestr', (message) => {
 const text = message.toLowerCase()
 monitoring?.inspectServerMessage(id, message)
+feedCoinflipLine(id, message)
 
 const requester = detectTpaRequester(message)
 if (requester && bots[id]?.tpautoEnabled) {
@@ -3029,6 +3215,12 @@ const COMMANDS = {
 '/shardshop-loop [slot]': `Repeatedly run ${SHARDSHOP_COMMAND} until the server signals it's empty (grep: SHARDSHOP_STOP_PHRASES) or hits the ${SHARDSHOP_LOOP_MAX_RUNS}-run safety cap; optional [slot] overrides default GUI slot`,
 '/crates-all [n] [color] [dump=…] [afk=…]': `Run shardshop → crates → dump on bots 1 through n (default: all bots) targeting crate [color] (default: ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')}), ${(CRATES_ALL_STAGGER_MS / 1000).toFixed(0)}s apart so they don't hit the server at once. dump=off|tpa|home|hidden|player:<name> chooses the dump step and afk=now|off|<seconds> chooses the AFK warp; both override CRATES_ALL_DUMP / CRATES_ALL_AFK_WARP / CRATES_ALL_AFK_DELAY_MS for that run`,
 '/crates-solo [bot] [color] [dump=…] [afk=…]': 'Run shardshop → crates → dump on just one bot (default: active bot) targeting crate [color] — not all bots. Takes the same dump= / afk= flags as /crates-all',
+  '/coinflip-data-run [PRICE] [AMOUNT] [BOT]': `Play AMOUNT coinflips (default ${settings.get('COINFLIP_DEFAULT_FLIPS')}) on BOT (default: the active bot, or every spawned bot with \`all\`) and record every one of them. PRICE is a fixed wager (500000) or a random range (10k-1m — the COINFLIP_WAGER_MIN–MAX defaults). The result messages, the balance either side, and the next accepted create are all used to settle each flip; a coinflip that is already active is waited for, never deleted. Stops at COINFLIP_STOP_LOSS. Works with /all-slow: /all-slow /coinflip-data-run 10k-1m 20`,
+  '/coinflip-stats [BOT]': 'Win/loss counts, net, streaks, drawdown, per-opponent and per-bot breakdowns, and the fairness verdict (binomial p-value, runs test, net-per-flip confidence interval) for one bot or the whole fleet',
+  '/coinflip-history [n|clear confirm]': 'The last n recorded flips (default 20) with the detection method and any message/balance mismatch; \`clear confirm\` wipes the history file',
+  '/timeseries [sample [ranks]|series <metric> [bucket] [bot]|events|clear confirm|status]': 'The recorded samples of shards, coins, balance, rank and bans over time — a sparkline, the last buckets, and where the JSON lives. \`sample\` records one right now',
+  '/analytics': 'Where the read-only analytics page is, plus the JSON endpoints behind it (/api/analytics, /api/coinflip, /api/timeseries, /api/export)',
+  '/env [list [filter]|get KEY|set KEY VALUE|reset KEY|reset-all]': 'Show or change a configuration value for THIS run only — nothing is ever written to the .env file and a restart forgets it. Keys marked startup-only were read once at boot. The dashboard has the same thing as the .ENV tab',
 '/spawners': `Without moving, right-click every ${SPAWNER_BLOCK.replace(/_/g, ' ')} already within reach (${SPAWNER_REACH} blocks), clicking GUI slot ${SPAWNER_SLOT_FIRST} then slot ${SPAWNER_SLOT_SECOND} on each one`,
 '/data': 'Compile all saved bot/spawner data, save the local JSON snapshot, and push the current snapshot to the Google Sheets Apps Script webhook. Subcommands: /data check (verify the webhook deployment end-to-end), /data status (show webhook config + tracked counts)',
 '/list': 'Compact one-line-per-bot status list (online / offline / last kick)',
@@ -4224,6 +4416,447 @@ cratesAllRunning = false
 }
 }
 
+// ── Coinflip data run ────────────────────────────────────────────────────────
+// /coinflip-data-run plays N coinflips on one bot and records every one of them.
+// The rules it follows, and why:
+//   • A busy flip is never deleted and remade — remaking cannot succeed while a
+//     flip is open, so the run waits and re-asks instead.
+//   • A result message is the truth; a balance that moved by exactly the wager
+//     is the fallback; a *successful new create* proves the previous one ended,
+//     and since the server announces wins, that means it was a loss.
+//   • Nothing is inferred from the absence of a message alone — an unreadable
+//     flip stays pending and is settled by the next accepted create.
+const COINFLIP_USAGE = '/coinflip-data-run [PRICE] [AMOUNT] [BOT] — PRICE is a fixed amount (500000) or a random range (10k-1m), AMOUNT is how many flips per bot (default COINFLIP_DEFAULT_FLIPS), BOT defaults to the current bot (or `all` for every spawned bot). Named forms work too: wager=10k-1m flips=5 bot=BotA'
+const coinflipObservers = new Map()
+const coinflipSessions = new Map() // bot -> session in flight (guards against a second run)
+const coinflipLastRun = new Map() // bot -> the finished session, for the bot card
+
+function cfMoney (value) {
+  if (value == null || !Number.isFinite(Number(value))) return 'N/A'
+  return '$' + Number(value).toLocaleString(undefined, { maximumFractionDigits: 2 })
+}
+
+function cfDuration (ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return '0s'
+  const days = Math.floor(ms / 86400000)
+  const hours = Math.floor((ms % 86400000) / 3600000)
+  const mins = Math.floor((ms % 3600000) / 60000)
+  const secs = Math.floor((ms % 60000) / 1000)
+  if (days) return `${days}d ${hours}h`
+  if (hours) return `${hours}h ${mins}m`
+  if (mins) return `${mins}m ${secs}s`
+  return `${secs}s`
+}
+
+// One observer per bot. It is created the first time that bot plays a coinflip
+// and lives for the process, so a result block that started before a session
+// still lands in the right place.
+function coinflipObserverFor (id) {
+  let observer = coinflipObservers.get(id)
+  if (!observer) {
+    observer = coinflip.createCoinflipObserver({
+      botName: id,
+      settleMs: settings.get('COINFLIP_SETTLE_MS'),
+      now: () => Date.now()
+    })
+    coinflipObservers.set(id, observer)
+  }
+  return observer
+}
+
+function feedCoinflipLine (id, message) {
+  try { coinflipObserverFor(id).feed(message) } catch (_) {}
+}
+
+function describeWagerSpec (spec) {
+  if (!spec) return 'the configured random range'
+  if (spec.kind === 'fixed') return cfMoney(spec.amount)
+  return `${cfMoney(spec.min)}–${cfMoney(spec.max)} at random`
+}
+
+function logCoinflipEvent (id, event) {
+  if (event.kind === 'create') {
+    logFor(id, `{cyan-fg}› /coinflip create ${cfMoney(event.wager)}{/cyan-fg}`)
+    return
+  }
+  if (event.kind === 'busy') {
+    logFor(id, `{yellow-fg}⚠ An active coinflip is still open — waiting ${cfDuration(settings.get('COINFLIP_BUSY_WAIT_MS'))}, then asking again (never deleting it).{/yellow-fg}`)
+    return
+  }
+  if (event.kind === 'unresolved') {
+    logFor(id, `{yellow-fg}⚠ No result and no balance change for a ${cfMoney(event.wager)} flip — leaving it pending; the next accepted create records it as a loss.{/yellow-fg}`)
+    return
+  }
+  if (!event.id) return
+  const colour = event.result === 'won' ? 'green-fg' : event.result === 'lost' ? 'red-fg' : 'yellow-fg'
+  const mark = event.result === 'won' ? '✓' : event.result === 'lost' ? '✗' : '•'
+  const opponent = event.opponent ? ` vs ${sanitize(event.opponent)}` : ''
+  const method = event.method !== 'message' ? ` (by ${event.method})` : ''
+  logFor(id, `{${colour}}${mark} flip ${event.index}: ${event.result} ${cfMoney(event.wager)}${opponent} — Δ ${cfMoney(event.delta)}${method}{/${colour}}`)
+  if (event.mismatched) logFor(id, `{yellow-fg}⚠ ${sanitize(event.note)}{/yellow-fg}`)
+}
+
+function persistCoinflipSummary () {
+  try {
+    const summary = coinflipStore.summary({
+      recent: 200,
+      minSample: settings.get('COINFLIP_MIN_SAMPLE'),
+      suspicionP: settings.get('COINFLIP_SUSPICION_P')
+    })
+    fs.mkdirSync(path.dirname(COINFLIP_SUMMARY_FILE), { recursive: true })
+    fs.writeFileSync(COINFLIP_SUMMARY_FILE, JSON.stringify(summary, null, 2))
+  } catch (_) {}
+}
+
+// Plays `flips` coinflips on one bot and records every outcome. Returns the
+// session result, or null when it could not start.
+async function runCoinflipForBot (id, opts = {}) {
+  const entry = bots[id]
+  if (!entry) { logFor(activeId || SYSTEM_ID, `{red-fg}✗ No bot named "${sanitize(id)}".{/red-fg}`); return null }
+  if (!entry.bot?.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not spawned — nothing to run.{/yellow-fg}`); return null }
+  if (coinflipSessions.has(id)) { logFor(id, `{yellow-fg}⚠ ${id} already has a /coinflip-data-run going (${coinflipSessions.get(id).flips} flip(s) so far).{/yellow-fg}`); return null }
+  if (entry.manualMode) { logFor(id, `{yellow-fg}⚠ Stop manual interact (/manual-stop) before running /coinflip-data-run on ${id}.{/yellow-fg}`); return null }
+  if (entry.crateRoutineRunning || entry.crateLoopRunning) { logFor(id, `{yellow-fg}⚠ ${id} is busy with a crate routine — skipping /coinflip-data-run.{/yellow-fg}`); return null }
+
+  const planned = opts.flips == null ? settings.get('COINFLIP_DEFAULT_FLIPS') : opts.flips
+  const stopLoss = settings.get('COINFLIP_STOP_LOSS')
+  const spec = opts.wagerSpec || coinflip.parseWagerSpec('', { min: settings.get('COINFLIP_WAGER_MIN'), max: settings.get('COINFLIP_WAGER_MAX') })
+  const session = { startedAt: Date.now(), planned, flips: 0, wins: 0, losses: 0, unresolved: 0, net: 0, stopped: 'running', sessionId: `cf-${Date.now().toString(36)}` }
+  coinflipSessions.set(id, session)
+  notifyBotsChanged()
+
+  const observer = coinflipObserverFor(id)
+  observer.reset()
+  logFor(id, `{cyan-fg}› /coinflip-data-run: up to ${planned} flip(s) at ${describeWagerSpec(spec)}, stop loss ${cfMoney(stopLoss)}{/cyan-fg}`)
+
+  let result = null
+  try {
+    result = await coinflip.runCoinflipSession({
+      bot: id,
+      botName: id,
+      flips: planned,
+      wagerSpec: spec,
+      stopLoss,
+      balanceFraction: settings.get('COINFLIP_BALANCE_FRACTION'),
+      sessionId: session.sessionId
+    }, {
+      send: (cmd) => {
+        const live = bots[id]?.bot
+        if (!live?.entity) throw new Error(`${id} despawned`)
+        live.chat(cmd)
+      },
+      balance: () => queryBalance(id, 'Balance', '/bal', settings.get('COINFLIP_BALANCE_TIMEOUT_MS')),
+      sleep: (ms) => new Promise(resolve => setTimeout(resolve, ms)),
+      observer,
+      log: (event) => logCoinflipEvent(id, event),
+      now: () => Date.now(),
+      rand: Math.random,
+      busyWaitMs: settings.get('COINFLIP_BUSY_WAIT_MS'),
+      busyMaxWaitMs: settings.get('COINFLIP_BUSY_MAX_WAIT_MS'),
+      flipTimeoutMs: settings.get('COINFLIP_FLIP_TIMEOUT_MS'),
+      pollMs: settings.get('COINFLIP_POLL_MS')
+    })
+  } catch (err) {
+    result = { bot: id, records: [], net: 0, stopped: 'disconnected', reason: sanitize(err.message || String(err)) }
+  }
+
+  coinflipStore.appendAll(result.records || [])
+  const stats = coinflip.computeStats(result.records || [])
+  session.flips = stats.resolved
+  session.wins = stats.wins
+  session.losses = stats.losses
+  session.unresolved = stats.unresolved
+  session.net = stats.net
+  session.stopped = result.stopped
+
+  logFor(id, `{cyan-fg}› ${sanitize(coinflip.describeSession({ ...result, records: result.records || [] }))}{/cyan-fg}`)
+  // The whole point of recording is the verdict, so it is printed here rather
+  // than only being visible on a page nobody opens until something looks odd.
+  const botRecords = coinflipStore.all().filter(row => row.bot === id)
+  const fairness = coinflip.analyzeFairness(botRecords, {
+    minSample: settings.get('COINFLIP_MIN_SAMPLE'),
+    suspicionP: settings.get('COINFLIP_SUSPICION_P')
+  })
+  const colour = fairness.verdict === 'suspicious' ? 'red-fg' : fairness.verdict === 'watch' ? 'yellow-fg' : 'gray-fg'
+  const pText = fairness.p == null ? '' : `, p=${fairness.p.toFixed(4)}`
+  const flagText = fairness.flags.length ? ` — ${sanitize(fairness.flags[0])}` : ''
+  logFor(id, `{${colour}}› Coinflip fairness for ${id}: ${fairness.verdict} — ${stats.wins}W/${stats.losses}L lifetime${pText}${flagText}{/${colour}}`)
+  if (stats.mismatches) logFor(id, `{red-fg}✗ ${stats.mismatches} flip(s) where the message and the balance disagreed — see /coinflip-history.{/red-fg}`)
+  if (result.stopped === 'no-opponent') logFor(id, `{yellow-fg}⚠ The flip is still open and will not be remade. Remove it by hand if you want the run to continue, then start it again.{/yellow-fg}`)
+
+  // The session stops being "in flight" the moment it ends — otherwise the next
+  // /coinflip-data-run on this bot would be refused as a duplicate forever. The
+  // summary stays on the card as the last run instead.
+  coinflipSessions.delete(id)
+  coinflipLastRun.set(id, { ...session, finishedAt: Date.now() })
+  persistCoinflipSummary()
+  notifyBotsChanged()
+  return { ...result, stats, fairness, session }
+}
+
+// `all` (or no bot at all) fans out across the roster, staggered like /all-slow
+// so the server does not see a burst of coinflip commands.
+async function runCoinflipAcrossBots (ids, opts) {
+  const stagger = settings.get('ALL_SLOW_DELAY_MS')
+  logFor(SYSTEM_ID, `{cyan-fg}› Starting /coinflip-data-run for ${ids.length} bot(s), ${cfDuration(stagger)} apart…{/cyan-fg}`)
+  await Promise.allSettled(ids.map((id, idx) => new Promise(resolve => {
+    setTimeout(() => { runCoinflipForBot(id, opts).finally(resolve) }, idx * stagger)
+  })))
+  logFor(SYSTEM_ID, `{green-fg}✓ /coinflip-data-run finished for ${ids.length} bot(s).{/green-fg}`)
+}
+
+// ── Time series ──────────────────────────────────────────────────────────────
+// Samples are taken on an interval, on demand, and after the routines that
+// already queried the server (so a shard count is never asked for twice).
+const lastSampleByBot = new Map()
+let timeseriesSampling = false
+
+function recordTimeseriesSample (id, sample, source) {
+  if (!settings.get('TIMESERIES_ENABLED')) return null
+  const row = timeseries.botSample({
+    bot: id,
+    ...sample,
+    // A ban is tracked in the data state; putting it on every sample is what
+    // makes "banned bots over time" a chart instead of a guess.
+    banned: Boolean(dataState.bots[id]?.banned),
+    bannedKind: dataState.bots[id]?.banKind || null,
+    source
+  }, Date.now())
+  timeseriesStore.append(row)
+  lastSampleByBot.set(id, { ...row, bot: id })
+  return row
+}
+
+function recordFleetSample (source) {
+  if (!settings.get('TIMESERIES_ENABLED')) return null
+  if (!lastSampleByBot.size) return null
+  const row = timeseries.fleetSample([...lastSampleByBot.values()], Date.now(), source)
+  timeseriesStore.append(row)
+  return row
+}
+
+function persistTimeseriesSnapshot () {
+  try {
+    const snapshot = timeseriesStore.snapshot({ bucketMs: settings.get('ANALYTICS_BUCKET_MS') })
+    fs.mkdirSync(path.dirname(TIMESERIES_SUMMARY_FILE), { recursive: true })
+    fs.writeFileSync(TIMESERIES_SUMMARY_FILE, JSON.stringify(snapshot, null, 2))
+  } catch (_) {}
+}
+
+async function sampleTimeseriesNow (opts = {}) {
+  const source = opts.source || 'manual'
+  if (!settings.get('TIMESERIES_ENABLED')) { logFor(SYSTEM_ID, '{yellow-fg}⚠ Time-series sampling is off (TIMESERIES_ENABLED).{/yellow-fg}'); return 0 }
+  if (timeseriesSampling) { logFor(SYSTEM_ID, '{yellow-fg}⚠ A time-series sample is already running.{/yellow-fg}'); return 0 }
+  timeseriesSampling = true
+  try {
+    const names = (opts.ids || Object.keys(bots)).filter(id => bots[id]?.bot?.entity)
+    if (!names.length) { logFor(SYSTEM_ID, '{yellow-fg}⚠ No spawned bots to sample.{/yellow-fg}'); return 0 }
+    logFor(SYSTEM_ID, `{cyan-fg}› Sampling ${names.length} bot(s) for the time series (${source})…{/cyan-fg}`)
+    let sampled = 0
+    let skipped = 0
+    // Sequential on purpose: eleven bots hammering /shards /coins /bal at once
+    // is exactly the burst the server rate-limits. Each bot is isolated as well:
+    // a bot that is mid-reconnect would otherwise reject its balance queries and
+    // throw away every other bot's samples with it, so a bad bot is skipped and
+    // the rest are still recorded.
+    for (const id of names) {
+      if (!bots[id]?.bot?.entity) continue
+      try {
+        const [shards, coins, money] = await Promise.all([
+          queryBalance(id, 'Shards', '/shards'),
+          queryBalance(id, 'Coins', '/coins'),
+          queryBalance(id, 'Balance', '/bal')
+        ])
+        const inv = inventorySlotUsage(bots[id].bot)
+        recordTimeseriesSample(id, {
+          shards,
+          coins,
+          balance: money,
+          rank: dataState.bots[id]?.rank || undefined,
+          invUsed: inv.used,
+          invFree: inv.free,
+          invTotal: inv.total
+        }, source)
+        sampled++
+      } catch (err) {
+        skipped++
+        logFor(SYSTEM_ID, `{yellow-fg}⚠ Skipped ${sanitize(id)} in the time-series sample: ${sanitize(err.message)}{/yellow-fg}`)
+      }
+    }
+    if (opts.ranks) {
+      for (const id of names) {
+        if (!bots[id]?.bot?.entity) continue
+        try {
+          const rank = await queryRank(id)
+          if (rank) recordTimeseriesSample(id, { rank }, `${source}:rank`)
+        } catch (err) {
+          logFor(SYSTEM_ID, `{yellow-fg}⚠ Rank sample for ${sanitize(id)} failed: ${sanitize(err.message)}{/yellow-fg}`)
+        }
+      }
+    }
+    recordFleetSample(source)
+    persistTimeseriesSnapshot()
+    logFor(SYSTEM_ID, `{green-fg}✓ Time-series sample written (${sampled} bot(s)${skipped ? `, ${skipped} skipped` : ''} → ${TIMESERIES_FILE}){/green-fg}`)
+    return sampled
+  } catch (err) {
+    logFor(SYSTEM_ID, `{red-fg}✗ Time-series sample failed: ${sanitize(err.message)}{/red-fg}`)
+    return 0
+  } finally {
+    timeseriesSampling = false
+  }
+}
+
+function startTimeseriesSampler () {
+  if (!settings.get('TIMESERIES_ENABLED')) {
+    logFor(SYSTEM_ID, '{cyan-fg}› Time-series sampling is off (TIMESERIES_ENABLED=false in the .ENV tab).{/cyan-fg}')
+    return
+  }
+  const intervalMs = settings.get('TIMESERIES_INTERVAL_MS')
+  const intervalTimer = setInterval(() => { sampleTimeseriesNow({ source: 'interval' }).catch(() => {}) }, intervalMs)
+  if (intervalTimer.unref) intervalTimer.unref()
+  const rankMs = settings.get('TIMESERIES_RANK_INTERVAL_MS')
+  if (rankMs > 0) {
+    const rankTimer = setInterval(() => { sampleTimeseriesNow({ source: 'rank-interval', ranks: true }).catch(() => {}) }, rankMs)
+    if (rankTimer.unref) rankTimer.unref()
+  }
+  const startupDelay = settings.get('TIMESERIES_STARTUP_DELAY_MS')
+  if (startupDelay > 0) {
+    const firstTimer = setTimeout(() => { sampleTimeseriesNow({ source: 'startup', ranks: true }).catch(() => {}) }, startupDelay)
+    if (firstTimer.unref) firstTimer.unref()
+  }
+  const rankText = rankMs > 0 ? ` · ranks every ${cfDuration(rankMs)}` : ' · rank sampling off'
+  logFor(SYSTEM_ID, `{cyan-fg}› Time-series sampling every ${cfDuration(intervalMs)} → ${TIMESERIES_FILE}${rankText}{/cyan-fg}`)
+}
+
+// ── Analytics (read-only) ────────────────────────────────────────────────────
+function buildAnalyticsReport (opts = {}) {
+  const coinflipSummary = coinflipStore.summary({
+    recent: opts.recent == null ? 25 : opts.recent,
+    minSample: settings.get('COINFLIP_MIN_SAMPLE'),
+    suspicionP: settings.get('COINFLIP_SUSPICION_P')
+  })
+  const tsSnapshot = timeseriesStore.snapshot({ bucketMs: settings.get('ANALYTICS_BUCKET_MS'), bot: opts.bot || null })
+  return analytics.buildReport({
+    coinflip: coinflipSummary,
+    timeseries: tsSnapshot,
+    config: {
+      coinflipFile: COINFLIP_FILE,
+      timeseriesFile: TIMESERIES_FILE,
+      coinflipSummaryFile: COINFLIP_SUMMARY_FILE,
+      timeseriesSummaryFile: TIMESERIES_SUMMARY_FILE,
+      sampleIntervalMs: settings.get('TIMESERIES_INTERVAL_MS'),
+      bucketMs: settings.get('ANALYTICS_BUCKET_MS'),
+      minSample: settings.get('COINFLIP_MIN_SAMPLE')
+    },
+    generatedAt: Date.now()
+  })
+}
+
+function sendJson (res, body, code = 200) {
+  const text = JSON.stringify(body)
+  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Length': Buffer.byteLength(text) })
+  res.end(text)
+}
+
+function hostForLink () {
+  return (process.env.ANALYTICS_HOST || process.env.WEB_HOST || '').trim() || 'localhost'
+}
+
+// The listening port, or null when the server has not bound yet (or is a stub).
+function listeningPort () {
+  try {
+    return typeof analyticsServer?.address === 'function' ? (analyticsServer.address()?.port || null) : null
+  } catch (_) { return null }
+}
+
+function analyticsSignInPage (port) {
+  const host = escHtml(hostForLink())
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AFK Analytics — sign in</title>
+<style>body{background:#0a0e13;color:#c7d2dc;font:14px ui-monospace,Menlo,Consolas,monospace;display:grid;place-items:center;height:100vh;margin:0}
+.card{background:#0f151d;border:1px solid #1d2836;border-radius:12px;padding:28px 32px;max-width:470px}
+h1{font-size:15px;margin:0 0 8px;color:#e8f0f6}h1 b{color:#2dd4bf}p{color:#5b6b7a;font-size:12px;line-height:1.7;margin:8px 0}a{color:#67e8f9}code{background:#131b25;border:1px solid #1d2836;border-radius:4px;padding:0 5px}</style></head><body>
+<div class="card"><h1>⛏ AFK <b>ANALYTICS</b></h1>
+<p>This page is read-only, but it is still your data, so it needs the dashboard session.</p>
+<p>1. Sign in at <a href="http://${host}/">the dashboard</a>.<br>2. Come back to <a href="http://${host}:${port}/">port ${port}</a> — the cookie is shared across ports on the same host.</p>
+<p>Set <code>ANALYTICS_OPEN=true</code> in the .ENV tab to serve it with no login.</p></div></body></html>`
+}
+
+function handleAnalyticsRequest (req, res, url) {
+  const p = url.pathname
+  if (p === '/health') { res.writeHead(200); res.end('ok'); return }
+  const authorised = settings.get('ANALYTICS_OPEN') || Boolean(webAuth && webAuth.sessionValid(webAuth.tokenFromReq(req, url)))
+  if (!authorised) {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' })
+    res.end(analyticsSignInPage(listeningPort() || settings.get('ANALYTICS_PORT')))
+    return
+  }
+  if (p === '/' || p === '/index.html') {
+    const html = analytics.renderHtml(buildAnalyticsReport())
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' })
+    res.end(html)
+    return
+  }
+  if (p === '/api/analytics') { sendJson(res, buildAnalyticsReport({ recent: 100 })); return }
+  if (p === '/api/coinflip') {
+    sendJson(res, coinflipStore.summary({
+      recent: Math.max(1, Math.min(1000, Number(url.searchParams.get('recent')) || 50)),
+      minSample: settings.get('COINFLIP_MIN_SAMPLE'),
+      suspicionP: settings.get('COINFLIP_SUSPICION_P')
+    }))
+    return
+  }
+  if (p === '/api/timeseries') {
+    const metric = url.searchParams.get('metric') || 'shards'
+    const bot = url.searchParams.get('bot') || null
+    const bucketMs = analytics.parseBucket(url.searchParams.get('bucket'), settings.get('ANALYTICS_BUCKET_MS'))
+    const since = Number(url.searchParams.get('since')) || 0
+    sendJson(res, {
+      metric,
+      bot,
+      bucketMs,
+      since,
+      points: timeseriesStore.bucket(metric, { bucketMs, since, bot, kind: bot ? 'bot' : 'fleet' }),
+      summary: timeseriesStore.summarize(metric, { bot, since })
+    })
+    return
+  }
+  if (p === '/api/export') {
+    // Everything at once, for whoever wants to do the analysis elsewhere.
+    sendJson(res, { generatedAt: Date.now(), coinflips: coinflipStore.all(), timeseries: timeseriesStore.all() })
+    return
+  }
+  res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' })
+  res.end('not found — try /, /api/analytics, /api/coinflip, /api/timeseries?metric=shards&bucket=1h, /api/export')
+}
+
+// The dashboard's session check lives inside startWebGUI's closure, so the
+// dashboard hands it out here for the separate analytics listener to use.
+let webAuth = null
+let analyticsServer = null
+function startAnalyticsServer () {
+  if (!settings.get('ANALYTICS_ENABLED')) return null
+  const preferred = settings.get('ANALYTICS_PORT')
+  analyticsServer = http.createServer((req, res) => {
+    let url
+    try { url = new URL(req.url, 'http://localhost') } catch (_) { res.writeHead(400); res.end(); return }
+    try {
+      handleAnalyticsRequest(req, res, url)
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' })
+      res.end('analytics error: ' + err.message)
+    }
+  })
+  analyticsServer.on('error', (err) => {
+    logFor(SYSTEM_ID, `{yellow-fg}⚠ Analytics server could not listen on ${preferred}: ${sanitize(err.message)} — change ANALYTICS_PORT in the .ENV tab.{/yellow-fg}`)
+  })
+  analyticsServer.listen(preferred, WEB_BIND, () => {
+    const port = listeningPort() || preferred
+    const open = settings.get('ANALYTICS_OPEN')
+    logFor(SYSTEM_ID, `{green-fg}✓ Analytics on http://${hostForLink()}:${port}/ (read-only${open ? ', unauthenticated' : ', dashboard sign-in required'}){/green-fg}`)
+  })
+  return analyticsServer
+}
+
 // Generalized balance query — works for "/shards" ("Shards | Balance: 1,234"),
 // "/coins" ("Coins | Balance: 10 🪙."), and the money command "/bal" (which
 // replies with a bare "Balance: $0.40" — no "Shards"/"Coins" label in front,
@@ -4385,7 +5018,9 @@ async function compileAndPushData (log = () => {}, onlyIds = null) {
       // back online must publish an explicit false rather than a blank cell.
       banned: Boolean(dataState.bots[name]?.banned)
     })
+    recordTimeseriesSample(name, { shards, coins, balance: money, rank: rank || undefined }, 'data')
   }
+  recordFleetSample('data')
   persistData()
   const snapshot = dataStore.buildSnapshot(dataState)
   try {
@@ -4743,7 +5378,7 @@ if (command === '/all-slow') {
 // parseSleepDuration gives it exactly the units `sleep` uses, so 30 means 30s and
 // 5000 means 5000ms. The token is only taken as a delay when it is a bare number
 // or duration.
-let delayMs = ALL_SLOW_DELAY_MS
+let delayMs = settings.get('ALL_SLOW_DELAY_MS')
 let body = msg
 const splitAt = msg.search(/\s/)
 const firstToken = splitAt === -1 ? msg : msg.slice(0, splitAt)
@@ -4814,6 +5449,7 @@ queryRank(name).then(rank => ({ name, shards, coins, money, rank }))
 )
 })).then(results => {
 results.forEach(({ name, shards, coins, money, rank }, idx) => {
+recordTimeseriesSample(name, { shards, coins, balance: money, rank: rank || undefined }, 'overview')
 const b = bots[name]
 if (b?.bot?.entity) {
 const hp = Math.round(b.bot.health || 0)
@@ -4831,6 +5467,7 @@ log(`[${idx + 1}] {cyan-fg}${name}{/cyan-fg} : {gray-fg}Offline / Connecting…{
 }
 })
 }).catch(err => logError(`Overview failed: ${sanitize(err.message)}`))
+recordFleetSample('overview')
 return
 }
 
@@ -5132,6 +5769,213 @@ logInfo(`Starting /crates-solo (shardshop → crates → dump) for ${targetId}${
 return runCratesAllSequenceForBot(targetId, blockName, plan)
 }
 
+// ── /coinflip-data-run, /coinflip-stats, /coinflip-history, /timeseries, /analytics, /env ──
+function textSpark (values) {
+  const blocks = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█']
+  const numbers = values.filter(v => typeof v === 'number' && Number.isFinite(v))
+  if (numbers.length < 2) return '(not enough points to draw)'
+  const min = Math.min(...numbers)
+  const max = Math.max(...numbers)
+  const span = max - min || 1
+  return numbers.map(v => blocks[Math.max(0, Math.min(7, Math.round(((v - min) / span) * 7)))]).join('')
+}
+
+if (trimmed === '/coinflip-data-run' || trimmed.startsWith('/coinflip-data-run ')) {
+  const parsed = coinflip.parseCoinflipRunArgs(trimmed.slice('/coinflip-data-run'.length).trim().split(/\s+/).filter(Boolean))
+  if (parsed.errors.length) { logWarn(`Unknown option "${sanitize(parsed.errors[0])}". Usage: ${COINFLIP_USAGE}`); return }
+  const wagerSpec = parsed.wager || coinflip.parseWagerSpec('', { min: settings.get('COINFLIP_WAGER_MIN'), max: settings.get('COINFLIP_WAGER_MAX') })
+  const flips = parsed.flips || settings.get('COINFLIP_DEFAULT_FLIPS')
+  let target = parsed.bot || null
+  if (target) {
+    const match = bots[target] ? target : matchBotName(target, Object.keys(bots))
+    if (!match) { logWarn(`No bot named "${sanitize(target)}". Known bots: ${Object.keys(bots).join(', ') || 'none'}`); return }
+    target = match
+  }
+  // A per-bot dispatch (e.g. `/all-slow /coinflip-data-run …`) arrives with that
+  // bot selected and no BOT argument — it must act on that bot, not on all of them.
+  if (!target && !parsed.all && activeId) target = activeId
+  if (target) return runCoinflipForBot(target, { flips, wagerSpec })
+  const ids = Object.keys(bots).filter(id => bots[id]?.bot?.entity)
+  if (!ids.length) { logWarn('No spawned bots to run /coinflip-data-run on.'); return }
+  return runCoinflipAcrossBots(ids, { flips, wagerSpec })
+}
+
+if (trimmed === '/coinflip-stats' || trimmed.startsWith('/coinflip-stats ')) {
+  const wanted = trimmed.slice('/coinflip-stats'.length).trim()
+  let rows = coinflipStore.all()
+  let label = 'the whole fleet'
+  if (wanted) {
+    const match = bots[wanted] ? wanted : (matchBotName(wanted, Object.keys(bots)) || wanted)
+    rows = rows.filter(row => row.bot === match)
+    label = match
+  }
+  if (!rows.length) { logInfo(`No coinflip history for ${sanitize(label)} yet — run /coinflip-data-run${wanted ? ` ${sanitize(wanted)}` : ''}.`); return }
+  const stats = coinflip.computeStats(rows)
+  const fairness = coinflip.analyzeFairness(rows, { minSample: settings.get('COINFLIP_MIN_SAMPLE'), suspicionP: settings.get('COINFLIP_SUSPICION_P') })
+  const verdictColour = fairness.verdict === 'suspicious' ? 'red-fg' : fairness.verdict === 'watch' ? 'yellow-fg' : fairness.verdict === 'within-noise' ? 'green-fg' : 'gray-fg'
+  logInfo(`{bold}── Coinflip statistics (${sanitize(label)}) ──{/bold}`)
+  log(` flips: ${stats.resolved} resolved (${stats.wins}W/${stats.losses}L)${stats.unresolved ? `, ${stats.unresolved} unresolved` : ''}`)
+  log(` win rate: ${stats.winRate == null ? 'N/A' : `${(stats.winRate * 100).toFixed(2)}%`} · 95% CI ${(fairness.ci.low * 100).toFixed(1)}–${(fairness.ci.high * 100).toFixed(1)}% (a fair coin is 50%)`)
+  log(` net: ${cfMoney(stats.net)} on ${cfMoney(stats.wagered)} wagered · average wager ${cfMoney(stats.avgWager)}`)
+  log(` streaks: now ${stats.currentStreak.length} ${stats.currentStreak.kind || '-'} · longest ${stats.longestWinStreak}W / ${stats.longestLossStreak}L · worst drawdown ${cfMoney(stats.maxDrawdown)}`)
+  if (fairness.p != null) log(` two-sided p: ${fairness.p.toExponential(3)}${fairness.runs && fairness.runs.z != null ? ` · runs test: ${fairness.runs.runs} runs vs ${fairness.runs.expected.toFixed(1)} expected (p=${fairness.runs.p.toFixed(4)})` : ''}`)
+  if (stats.mismatches) log(`{red-fg} ✗ ${stats.mismatches} flip(s) where the result message and the balance disagreed{/red-fg}`)
+  log(`{${verdictColour}} fairness verdict: ${fairness.verdict}{/${verdictColour}}`)
+  fairness.flags.forEach(flag => log(`   {gray-fg}• ${sanitize(flag)}{/gray-fg}`))
+  if (stats.opponents.length) {
+    log(' {gray-fg}per opponent:{/gray-fg}')
+    stats.opponents.slice(0, 10).forEach(opp => log(`   ${sanitize(opp.opponent)}: ${opp.flips} flips · ${opp.wins}W/${opp.losses}L · net ${cfMoney(opp.net)}`))
+  }
+  if (stats.bots.length > 1) {
+    log(' {gray-fg}per bot:{/gray-fg}')
+    stats.bots.slice(0, 12).forEach(row => log(`   ${sanitize(row.bot)}: ${row.flips} flips · ${row.wins}W/${row.losses}L · net ${cfMoney(row.net)}`))
+  }
+  log(` history: ${COINFLIP_FILE} · full page: http://${hostForLink()}:${settings.get('ANALYTICS_PORT')}/`)
+  return
+}
+
+if (trimmed === '/coinflip-history' || trimmed.startsWith('/coinflip-history ')) {
+  const parts = trimmed.slice('/coinflip-history'.length).trim().split(/\s+/).filter(Boolean)
+  if (parts[0] === 'clear') {
+    if (parts[1] !== 'confirm') { logWarn(`This deletes ${coinflipStore.all().length} recorded flip(s) from ${COINFLIP_FILE}. Run /coinflip-history clear confirm to do it.`); return }
+    const count = coinflipStore.all().length
+    coinflipStore.clear()
+    persistCoinflipSummary()
+    logSuccess(`Cleared ${count} recorded flip(s). The file is gone; future flips start a new history.`)
+    return
+  }
+  const wanted = Number(parts[0]) || 20
+  const rows = coinflipStore.all().slice(-Math.max(1, Math.min(500, wanted))).reverse()
+  if (!rows.length) { logInfo('No coinflip history yet — run /coinflip-data-run.'); return }
+  logInfo(`{bold}── Last ${rows.length} coinflip(s) ──{/bold}`)
+  rows.forEach(row => {
+    const colour = row.result === 'won' ? 'green-fg' : row.result === 'lost' ? 'red-fg' : 'yellow-fg'
+    const when = new Date(row.ts).toISOString().replace('T', ' ').slice(0, 19)
+    log(`{${colour}} ${when} ${sanitize(row.bot)} ${row.result} ${cfMoney(row.wager)}${row.opponent ? ` vs ${sanitize(row.opponent)}` : ''} — Δ ${cfMoney(row.delta)} (${row.method})${row.mismatched ? ' ⚠ mismatch' : ''}{/${colour}}`)
+  })
+  log(` {gray-fg}${COINFLIP_FILE} · /coinflip-stats for the numbers{/gray-fg}`)
+  return
+}
+
+if (trimmed === '/timeseries' || trimmed.startsWith('/timeseries ')) {
+  const parts = trimmed.slice('/timeseries'.length).trim().split(/\s+/).filter(Boolean)
+  const sub = parts[0] || 'status'
+  if (sub === 'sample') return sampleTimeseriesNow({ source: 'command', ranks: parts.includes('ranks') })
+  if (sub === 'clear') {
+    if (parts[1] !== 'confirm') { logWarn(`This deletes every time-series sample in ${TIMESERIES_FILE}. Run /timeseries clear confirm to do it.`); return }
+    const count = timeseriesStore.all().length
+    timeseriesStore.clear()
+    logSuccess(`Cleared ${count} sample(s).`)
+    return
+  }
+  if (sub === 'series') {
+    const metric = parts[1] || 'shards'
+    const bucketMs = analytics.parseBucket(parts[2], settings.get('ANALYTICS_BUCKET_MS'))
+    const bot = parts[3] && bots[parts[3]] ? parts[3] : null
+    const points = timeseriesStore.bucket(metric, { bucketMs, bot, kind: bot ? 'bot' : 'fleet' })
+    if (!points.length) { logWarn(`No ${sanitize(metric)} samples yet${bot ? ` for ${sanitize(bot)}` : ''} — /timeseries sample records one now.`); return }
+    const nums = points.map(p => (typeof p.last === 'number' ? p.last : 0))
+    logInfo(`{bold}── ${sanitize(metric)}${bot ? ` · ${sanitize(bot)}` : ' (fleet)'} · ${cfDuration(bucketMs)} buckets ──{/bold}`)
+    log(` ${textSpark(nums)}`)
+    points.slice(-12).forEach(p => log(`  ${new Date(p.t).toISOString().replace('T', ' ').slice(0, 16)}  ${typeof p.last === 'number' ? p.last.toLocaleString() : sanitize(p.last)}`))
+    log(` {gray-fg}JSON: /api/timeseries?metric=${sanitize(metric)}&bucket=${Math.round(bucketMs / 1000)}s${bot ? `&bot=${sanitize(bot)}` : ''}{/gray-fg}`)
+    return
+  }
+  if (sub === 'events') {
+    const events = timeseriesStore.events()
+    logInfo(`{bold}── Time-series events ──{/bold}`)
+    log(` bans: ${events.bans.length} · rank changes: ${events.ranks.length}`)
+    events.bans.slice(-12).forEach(e => log(`  ${new Date(e.t).toISOString().replace('T', ' ').slice(0, 16)} ${sanitize(e.bot)} ${e.banned ? '{red-fg}banned{/red-fg}' : '{green-fg}unbanned{/green-fg}'}`))
+    events.ranks.slice(-12).forEach(e => log(`  ${new Date(e.t).toISOString().replace('T', ' ').slice(0, 16)} ${sanitize(e.bot)} ${sanitize(e.previous || '-')} → {cyan-fg}${sanitize(e.rank)}{/cyan-fg}`))
+    return
+  }
+  const samples = timeseriesStore.all()
+  logInfo('{bold}── Time series ──{/bold}')
+  log(` file: ${TIMESERIES_FILE}`)
+  log(` sampling: ${settings.get('TIMESERIES_ENABLED') ? 'on' : 'off'} · every ${cfDuration(settings.get('TIMESERIES_INTERVAL_MS'))} · ranks ${settings.get('TIMESERIES_RANK_INTERVAL_MS') > 0 ? `every ${cfDuration(settings.get('TIMESERIES_RANK_INTERVAL_MS'))}` : 'off'}`)
+  log(` samples: ${samples.length} · bots sampled: ${new Set(samples.filter(s => s.kind === 'bot').map(s => s.bot)).size}`)
+  for (const metric of ['shards', 'coins', 'balance', 'regents', 'banned']) {
+    const summary = timeseriesStore.summarize(metric)
+    log(summary
+      ? `  ${metric}: ${typeof summary.last === 'number' ? summary.last.toLocaleString() : sanitize(summary.last)} over ${summary.samples} sample(s)${summary.delta == null ? '' : ` · Δ ${summary.delta.toLocaleString()} since ${new Date(summary.from).toISOString().slice(0, 16)}`}`
+      : `  ${metric}: no data yet`)
+  }
+  log(` {gray-fg}/timeseries sample [ranks] | series <metric> [bucket] [bot] | events | clear confirm{/gray-fg}`)
+  log(` {gray-fg}page: http://${hostForLink()}:${settings.get('ANALYTICS_PORT')}/ · snapshot: ${TIMESERIES_SUMMARY_FILE}{/gray-fg}`)
+  return
+}
+
+if (trimmed === '/analytics' || trimmed === '/analytics open') {
+  const port = settings.get('ANALYTICS_PORT')
+  const summary = coinflipStore.summary({ recent: 0, minSample: settings.get('COINFLIP_MIN_SAMPLE'), suspicionP: settings.get('COINFLIP_SUSPICION_P') })
+  const stats = summary.stats
+  const fairness = summary.fairness
+  logInfo('{bold}── Analytics ──{/bold}')
+  log(` page: http://${hostForLink()}:${port}/  (read-only${settings.get('ANALYTICS_OPEN') ? ', no login' : ' — sign in at the dashboard first'})`)
+  log(` coinflips: ${stats.resolved} resolved (${stats.wins}W/${stats.losses}L) · net ${cfMoney(stats.net)} · verdict ${fairness.verdict}`)
+  log(` time series: ${timeseriesStore.all().length} sample(s) → ${TIMESERIES_FILE}`)
+  log(` coinflip history: ${coinflipStore.all().length} flip(s) → ${COINFLIP_FILE}`)
+  log(' {gray-fg}JSON: /api/analytics · /api/coinflip · /api/timeseries?metric=shards&bucket=1h · /api/export (everything){/gray-fg}')
+  return
+}
+
+if (trimmed === '/env' || trimmed.startsWith('/env ')) {
+  const rest = trimmed.slice('/env'.length).trim()
+  const parts = rest.split(/\s+/).filter(Boolean)
+  const sub = parts[0] || 'list'
+  if (sub === 'list') {
+    const filter = (parts[1] || '').toLowerCase()
+    const groups = settings.grouped()
+    logInfo(`{bold}── Settings ──{/bold} {gray-fg}${settings.overrideCount()} temporary override(s); nothing here is written to .env{/gray-fg}`)
+    for (const group of groups) {
+      const rows = group.rows.filter(row => !filter || row.key.toLowerCase().includes(filter) || group.group.toLowerCase().includes(filter))
+      if (!rows.length) continue
+      log(`{cyan-fg}${group.group}{/cyan-fg}`)
+      for (const row of rows) {
+        const value = row.secret ? (row.configured ? '(set)' : '(unset)') : (row.value == null || row.value === '' ? '(unset)' : String(row.value))
+        const marks = `${row.overridden ? ' {yellow-fg}*temporary{/yellow-fg}' : ''}${row.live ? '' : ' {gray-fg}(startup-only){/gray-fg}'}`
+        log(`  ${row.key} = ${value}${marks}`)
+      }
+    }
+    log(` {gray-fg}/env set KEY VALUE · /env reset KEY · /env reset-all · the dashboard .ENV tab is the same thing with inputs{/gray-fg}`)
+    return
+  }
+  if (sub === 'get') {
+    const key = parts[1]
+    if (!key) { logWarn('Usage: /env get KEY'); return }
+    const row = settings.list().find(entry => entry.key.toLowerCase() === key.toLowerCase())
+    if (!row) { logWarn(`No setting named "${sanitize(key)}". /env list shows them all.`); return }
+    logInfo(`${row.key}: ${row.secret ? (row.configured ? '(set — value withheld)' : '(unset)') : (row.value == null || row.value === '' ? '(unset)' : String(row.value))} {gray-fg}(${row.source}${row.live ? '' : ', startup-only'}){/gray-fg}`)
+    return
+  }
+  if (sub === 'set') {
+    const key = parts[1]
+    const value = parts.slice(2).join(' ')
+    if (!key || !value) { logWarn('Usage: /env set KEY VALUE'); return }
+    const result = settings.set(key, value)
+    if (!result.ok) { logError(`Could not set ${sanitize(key)}: ${sanitize(result.error)}`); return }
+    logSuccess(result.secret ? `${key} updated (temporary — not saved; value withheld)` : `${key} = ${String(result.value)} {gray-fg}(temporary — not saved){/gray-fg}`)
+    if (!result.live) logWarn(`${key} is read once at startup, so the running process keeps its old value. Edit the file and restart for that one.`)
+    return
+  }
+  if (sub === 'reset') {
+    const key = parts[1]
+    if (!key) { logWarn('Usage: /env reset KEY — or /env reset-all'); return }
+    const result = settings.reset(key)
+    if (!result.ok) { logWarn(`${sanitize(key)}: ${sanitize(result.error || 'not overridden')}`); return }
+    logSuccess(`${key} is back to ${result.secret ? '(set)' : String(result.value)} {gray-fg}(${result.source}){/gray-fg}`)
+    return
+  }
+  if (sub === 'reset-all') {
+    const cleared = settings.resetAll()
+    logSuccess(`Cleared ${cleared.length} temporary override(s)${cleared.length ? `: ${cleared.join(', ')}` : ''}.`)
+    return
+  }
+  logWarn('Usage: /env [list [filter] | get KEY | set KEY VALUE | reset KEY | reset-all]')
+  return
+}
+
+
 // ── Manual interaction commands (bot-manual.js) ─────────────
 // After the crate/shardshop parsing above but before the local-command switch
 // and the raw Minecraft chat fallback, so /walk, /window-*, /key etc. never
@@ -5197,6 +6041,8 @@ if (CHAT_WATCHDOG_ENABLED) {
 // ── Interface startup ─────────────────────────────────────────────────────────
 tui = startTUI()
 webHandle = startWebGUI()
+startTimeseriesSampler()
+analyticsServer = startAnalyticsServer()
 
 if (tui || webHandle) {
 installConsolePlumbing()

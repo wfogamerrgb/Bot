@@ -466,6 +466,10 @@ The Docker helper adds the Linux host-gateway mapping when the default
 
 ### Browser dashboard
 
+The `.ENV` button in the sidebar opens the settings panel described under
+[Coinflip data collection, time series and analytics](#coinflip-data-collection-time-series-and-analytics):
+every tunable value, editable for the current run only, nothing written to disk.
+
 The web dashboard is enabled by default. It provides:
 
 - Bot cards with online state, health, food, ping, uptime, and ping history.
@@ -1082,6 +1086,12 @@ Any unrecognized input is sent as a Minecraft chat message or command.
 | `/pos` | Show the active bot's position, facing, and dimension |
 | `/gui-tui` | Toggle the clickable ASCII GUI overlay for the open window |
 | `/exit` | Disconnect all bots and exit |
+| `/coinflip-data-run [PRICE] [AMOUNT] [BOT]` | Play `AMOUNT` coinflips (default 10) on `BOT` (default: the selected bot) and record every one. `PRICE` is a fixed wager (`500000`) or a random range (`10k-1m`, the `COINFLIP_WAGER_MIN`-`MAX` defaults), and `all` targets the whole roster. Works with `/all-slow`: `/all-slow /coinflip-data-run 10k-1m 20` |
+| `/coinflip-stats [BOT]` | Win/loss counts, net, streaks, drawdown, per-opponent and per-bot breakdowns, and the fairness verdict for one bot or the fleet |
+| `/coinflip-history [n\|clear confirm]` | The last `n` recorded flips (default 20), with how each result was detected and any message/balance mismatch |
+| `/timeseries [sample [ranks]\|series <metric> [bucket] [bot]\|events\|clear confirm]` | Shards, coins, balance, rank and ban counts over time - a sparkline, the last buckets, and where the JSON lives |
+| `/analytics` | Where the read-only analytics page and its JSON endpoints are |
+| `/env [list [filter]\|get KEY\|set KEY VALUE\|reset KEY\|reset-all]` | Show or change a configuration value for this run only - never written to `.env` |
 
 Valid crate colors include `white`, `orange`, `magenta`, `light_blue`,
 `yellow`, `lime`, `pink`, `gray`, `light_gray`, `cyan`, `purple`, `blue`,
@@ -1291,6 +1301,124 @@ Confirm `GUI_SLOT` is zero-indexed and inspect the opened inventory. Enable
 Check `DISCORD_WEBHOOK_URL`, verify that the webhook is active, and inspect the
 RTP log for webhook errors. Node.js 18+ is required for the built-in `fetch`.
 
+## Coinflip data collection, time series and analytics
+
+`/coinflip-data-run` exists to answer one question with evidence: **is the coinflip
+fair?** It plays a series of flips, records every one of them, and then does the
+statistics on the records rather than on a running tally.
+
+### How one flip is detected
+
+The server announces results as ordinary chat lines, so every available signal is
+used - and each record says which one settled it:
+
+| Signal | Meaning | Recorded as |
+| --- | --- | --- |
+| `Result: Won` / `Result: Lost` together with `Amount Bet:`, `Winner:`, `Loser:` | the block the server prints, arriving as four separate lines | `method: message` |
+| the balance moved by exactly the wager | no usable message, but `/bal` either side of the flip settles it | `method: balance` |
+| a **new create was accepted** | the server announces wins, so silence plus a new create means the previous flip ended in a loss | `method: recreate` |
+| nothing at all | the flip stays pending and the next accepted create settles it | - |
+
+Those lines have to be the whole line, so a player typing `Loser: how about that
+coinflip` into chat cannot forge a result.
+
+`You already have an active coinflip! Please use /coinflip delete first...` is
+**never** answered with a delete and remake: remaking cannot succeed while a flip
+is open, so the run waits `COINFLIP_BUSY_WAIT_MS` and re-asks, and gives up after
+`COINFLIP_BUSY_MAX_WAIT_MS` without touching the flip. If nobody joins, the flip
+is left open and the run stops with `no-opponent` rather than piling up new ones.
+A wager above the balance is never sent at all.
+
+A flip whose result message and balance movement disagree is flagged `mismatched`
+and printed in red - that is precisely the evidence a rigged game would produce,
+and averaging it away would destroy it.
+
+### The fairness verdict
+
+`/coinflip-stats` (and the last line of every run) reports:
+
+- **win rate** with a 95% Wilson confidence interval, against the 50% a fair coin gives;
+- a **two-sided binomial p-value** over the resolved flips;
+- a **runs test** for independence - a fair coin is not an alternating coin, and an implausibly streaky sequence is suspicious in a different way from a biased rate;
+- **net per flip** with its confidence interval: a fair even-money game averages exactly 0, so an edge shows up here even when the win rate looks about right;
+- **streaks, maximum drawdown, and per-bot / per-opponent breakdowns.**
+
+A verdict is only given after `COINFLIP_MIN_SAMPLE` resolved flips (default 30);
+below that it says `insufficient-data`, because a verdict from eight flips is
+noise with a label. A p-value below `COINFLIP_SUSPICION_P` (default 0.01) is
+`suspicious`; below 0.05 is `watch`.
+
+### Where the data lives
+
+| File | Contents |
+| --- | --- |
+| `data/coinflip-history.jsonl` | Append-only, one JSON object per flip: bot, timestamp, wager, opponent, result, balance before/after, delta, detection method, contradiction flag |
+| `data/coinflip-stats.json` | The derived summary (statistics, fairness verdict, recent flips) written after every run |
+| `data/timeseries.jsonl` | One sample per bot per interval (`kind: bot`) plus a fleet total (`kind: fleet`): shards, coins, balance, rank, ban state, inventory usage |
+| `data/timeseries-summary.json` | Bucketed series and the derived ban/rank events, ready to drop into a spreadsheet or a chart |
+
+These are generated files (git-ignored), and nothing here writes to `.env`.
+
+### Sampling cadence
+
+Samples are recorded on `TIMESERIES_INTERVAL_MS` (default hourly), after every
+`/data` and `/overview` pass (which already query the server, so nothing is asked
+twice), on `/timeseries sample`, and shortly after boot
+(`TIMESERIES_STARTUP_DELAY_MS`). Ranks cost a `/fix` probe each, so they have
+their own slower interval (`TIMESERIES_RANK_INTERVAL_MS`; `0` disables). Ban and
+rank *changes* are derived from the samples themselves, so there is no second
+event log to drift out of sync with the first.
+
+### The analytics page
+
+`ANALYTICS_PORT` (default **8080**) serves a read-only report built from those
+files - no chart library, no CDN, and nothing leaving the machine:
+
+| Route | Contents |
+| --- | --- |
+| `/` | Coinflip statistics with the fairness verdict and confidence interval, fleet charts for shards / coins / balance / regent ranks / bans, the latest value per bot, and the ban and rank-change tables |
+| `/api/analytics` | The whole report as JSON |
+| `/api/coinflip` | Coinflip statistics, fairness analysis and recent flips |
+| `/api/timeseries?metric=shards&bucket=1h[&bot=Name]` | Bucketed points (last / min / max / mean per window) plus the summary |
+| `/api/export` | Every recorded flip and sample, for analysis elsewhere |
+
+It requires the dashboard session cookie (cookies are shared across ports on the
+same host, so signing in on the dashboard is enough). `ANALYTICS_OPEN=true`
+serves it with no login at all; `ANALYTICS_ENABLED=false` turns it off. The port
+itself is read at boot, so changing it needs a restart - the `.ENV` tab says so.
+
+### `.ENV` tab - temporary settings
+
+The dashboard's `.ENV` tab lists every tunable value with its description and
+current value and changes one **for this run only**:
+
+- nothing is ever written to the `.env` file, and a restart forgets every override - edit the file for a permanent change;
+- values marked `startup-only` were read once at boot, so the tab says so instead of pretending the change took effect;
+- secrets are settable but never displayed: the tab shows `(set)` or `(unset)`, never the value;
+- `/env set KEY VALUE`, `/env get KEY`, `/env reset KEY` and `/env reset-all` do the same from the console, and a value that cannot be parsed is refused rather than silently becoming the default.
+
+### Settings
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `COINFLIP_DEFAULT_FLIPS` | `10` | Flips per bot when `/coinflip-data-run` is given no count |
+| `COINFLIP_WAGER_MIN` / `COINFLIP_WAGER_MAX` | `10000` / `1000000` | The random wager range (`10k-1m`) |
+| `COINFLIP_STOP_LOSS` | `10000000` | Stop a per-bot run once its net loss reaches this |
+| `COINFLIP_BALANCE_FRACTION` | `1` | Never wager more than this fraction of the balance |
+| `COINFLIP_BUSY_WAIT_MS` / `COINFLIP_BUSY_MAX_WAIT_MS` | `15000` / `900000` | How long to wait on an active coinflip before re-asking / giving up |
+| `COINFLIP_FLIP_TIMEOUT_MS` | `600000` | How long one flip may wait for an opponent and a result |
+| `COINFLIP_POLL_MS` | `15000` | How often the runner wakes to re-check |
+| `COINFLIP_SETTLE_MS` | `1500` | Quiet period that closes a multi-line result block |
+| `COINFLIP_MIN_SAMPLE` / `COINFLIP_SUSPICION_P` | `30` / `0.01` | Flips needed for a verdict / the p-value called suspicious |
+| `COINFLIP_FILE` / `COINFLIP_SUMMARY_FILE` | `data/coinflip-history.jsonl` / `data/coinflip-stats.json` | Where the history and the summary are written |
+| `TIMESERIES_ENABLED` | `true` | Record samples at all |
+| `TIMESERIES_INTERVAL_MS` | `3600000` | Sampling interval (durations accept `30s`, `15m`, `1h`) |
+| `TIMESERIES_RANK_INTERVAL_MS` | `21600000` | Rank probe interval; `0` disables it |
+| `TIMESERIES_STARTUP_DELAY_MS` | `120000` | First sample after boot; `0` disables it |
+| `TIMESERIES_FILE` / `TIMESERIES_SUMMARY_FILE` | `data/timeseries.jsonl` / `data/timeseries-summary.json` | Where the samples and the snapshot are written |
+| `ANALYTICS_ENABLED` / `ANALYTICS_PORT` | `true` / `8080` | The read-only report and the port it listens on |
+| `ANALYTICS_OPEN` | `false` | Serve the report with no dashboard login |
+| `ANALYTICS_BUCKET_MS` | `3600000` | Chart bucket size (the API also takes `?bucket=30m`) |
 ## Project Files
 
 | File | Role |
@@ -1305,6 +1433,10 @@ RTP log for webhook errors. Node.js 18+ is required for the built-in `fetch`.
 | `patches/` | Mineflayer compatibility patches |
 | `google-apps-script/Code.gs` | Apps Script webhook behind `DATA_WEBHOOK_URL` (`/data` → Google Sheets) |
 | `api.md` | Mineflayer API reference used by the project |
+| `settings.js` | The runtime settings registry behind `/env` and the `.ENV` tab: temporary overrides, secret masking |
+| `coinflip.js` | Coinflip line parsing, the session runner, statistics, and the fairness analysis |
+| `timeseries.js` | The append-only time-series store: samples, buckets, summaries, derived ban and rank events |
+| `analytics.js` | The read-only analytics report, page, and SVG charts |
 
 ## License
 

@@ -14,7 +14,11 @@ const plain = value => JSON.parse(JSON.stringify(value))
 function runtime(env = {}) {
   const timers = new Map()
   const authAlerts = []
-  let requestHandler
+  // Two HTTP servers run in production (dashboard, analytics) on different
+  // ports, so handlers are routed by the port each one listens on. "Last
+  // created" would let startAnalyticsServer() shadow the dashboard.
+  const handlers = new Map()
+  let dashboardHandler
   const wss = new EventEmitter()
   const server = new EventEmitter()
   server.listen = (_port, _bind, cb) => cb()
@@ -42,7 +46,16 @@ function runtime(env = {}) {
     require(name) {
       if (name === 'dotenv') return { config() {} }
       if (name === 'fs') return { readFileSync: () => '', writeFileSync() {}, mkdirSync() {}, renameSync() {}, existsSync: () => false }
-      if (name === 'http') return { createServer(fn) { requestHandler = fn; return server } }
+      if (name === 'http') {
+        return {
+          createServer(fn) {
+            if (!dashboardHandler) dashboardHandler = fn
+            return Object.assign(server, {
+              listen(port, _bind, cb) { handlers.set(String(port), fn); if (cb) cb() }
+            })
+          }
+        }
+      }
       if (name === 'ws') return fakeWs
       if (name === './bot-controls') return {
         ...controls,
@@ -90,11 +103,15 @@ function runtime(env = {}) {
   `)
   context.chats = []
   run('webHandle = startWebGUI()')
-  async function request(url, body = '', cookie = '', method = 'POST') {
+  // `port` selects the server to talk to: by default the dashboard, or the
+  // analytics port for the analytics routes.
+  async function request(url, body = '', cookie = '', method = 'POST', port = null) {
+    const handler = port == null ? dashboardHandler : handlers.get(String(port))
+    if (!handler) throw new Error(`No test HTTP handler listening on ${port}`)
     const req = new EventEmitter()
     Object.assign(req, { url, method, headers: { cookie }, socket: { remoteAddress: '127.0.0.1' } })
     const response = { status: 0, headers: {}, body: '', writeHead(s, h = {}) { this.status = s; this.headers = h }, end(b = '') { this.body = b } }
-    const done = requestHandler(req, response)
+    const done = handler(req, response)
     if (body) req.emit('data', Buffer.from(body))
     req.emit('end')
     await done
@@ -844,6 +861,37 @@ test('an auth prompt is answered with that bot\'s own password', () => {
   assert.deepEqual(plan(r, 'C', 'Welcome to FATALMC!', 1000), {})
 })
 
+// The .ENV tab is only worth having if its "live" claim is true, and that is not
+// visible from a registry entry: a value is live when it is read at the point of
+// use, and startup-only when bot.js copies it into a const while it loads. Both
+// halves are pinned here, so moving a read from one to the other without moving
+// the flag fails the suite instead of quietly turning the tab into a lie.
+test('the registry calls a value live only when it is read where it is used', () => {
+  const r = runtime(dataEnv())
+  const live = plain(r.run(`(() => {
+    const want = ['CRATES_ALL_DUMP', 'CRATES_ALL_AFK_WARP', 'CRATES_ALL_AFK_DELAY_MS', 'DUMP_HOME_COMMAND', 'TPA_MAIN_PLAYER', 'WARP_COMMAND', 'BOT_NAMES', 'ANALYTICS_PORT', 'LOGIN_PASSWORD', 'ALL_SLOW_DELAY_MS', 'AUTH_RETRY_MS']
+    const out = {}
+    settings.list().forEach(row => { if (want.includes(row.key)) out[row.key] = row.live })
+    return out
+  })()`))
+
+  // Read once while bot.js loads, so the tab has to ask for a restart.
+  for (const key of ['CRATES_ALL_DUMP', 'CRATES_ALL_AFK_WARP', 'CRATES_ALL_AFK_DELAY_MS', 'DUMP_HOME_COMMAND', 'TPA_MAIN_PLAYER', 'WARP_COMMAND', 'BOT_NAMES', 'ANALYTICS_PORT']) {
+    assert.equal(live[key], false, key + ' is captured at boot, so the tab must not call it live')
+  }
+  // Read where they are used, so an override applies immediately.
+  for (const key of ['LOGIN_PASSWORD', 'ALL_SLOW_DELAY_MS', 'AUTH_RETRY_MS']) {
+    assert.equal(live[key], true, key + ' is read at the point of use, so the tab may call it live')
+  }
+
+  // The live half is not just a label. The auth path resolves the password out of
+  // process.env at every attempt - which is what /env set and the .ENV tab write -
+  // so a change reaches the next /auth-retry rather than the next restart.
+  assert.deepEqual(plan(r, 'B', LOGIN_PROMPT, 1000), { command: '/login 123456', source: 'built-in default', kind: 'login' })
+  r.run("process.env.LOGIN_PASSWORD = 'hunter2'")
+  assert.deepEqual(plan(r, 'B', LOGIN_PROMPT, 2000), { command: '/login hunter2', source: 'LOGIN_PASSWORD', kind: 'login' })
+})
+
 test('a rejected login stops the bot answering prompts and alerts once', () => {
   const r = runtime({ LOGIN_PASSWORD: 'wrong-pw' })
   assert.equal(plan(r, 'A', LOGIN_PROMPT, 1000).command, '/login wrong-pw')
@@ -1192,4 +1240,349 @@ test('/spawners accumulates earnings on the bot row and publishes inventory usag
   await driveSequence(r, r.run("runSpawnerRoutine('A')"))
   assert.equal(r.run('dataState.bots.A.lifetimeEarned'), 220 + (300 - 200) + (400 - 250))
   assert.equal(r.run('dataState.bots.A.lifetimeEarned'), 470)
+})
+
+// ── Coinflip data runs, time series, analytics and the .ENV settings tab ─────
+
+// Its own history files per runtime: these commands write records, and the
+// repo's data folder is not a test fixture.
+function dataEnv (env = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bot-data-'))
+  return {
+    COINFLIP_FILE: path.join(dir, 'coinflip-history.jsonl'),
+    TIMESERIES_FILE: path.join(dir, 'timeseries.jsonl'),
+    // Short enough that a run in a test gets as far as sending the create.
+    COINFLIP_POLL_MS: '1000',
+    ...env
+  }
+}
+
+// A bot whose balance queries get real answers. `queryBalance` waits for a reply
+// that *parses* — the shard and coin replies are labelled, the money reply is
+// not (and deliberately ignores the labelled ones) — so the fake has to answer
+// the command it was sent. Replying to every message at once would leave
+// /shards and /coins waiting on a timer this harness never fires.
+function payingBot (id, balance, extra = {}) {
+  const shards = extra.shards == null ? 1234 : extra.shards
+  const coins = extra.coins == null ? 567 : extra.coins
+  return `(() => {
+    const listeners = bots.__payingListeners || (bots.__payingListeners = [])
+    bots.${id}.bot = {
+      entity: {}, health: 20, food: 20,
+      chat(msg) {
+        chats.push(['${id}', msg])
+        const reply = msg === '/shards' ? 'Shards | Balance: ${shards}'
+          : msg === '/coins' ? 'Coins | Balance: ${coins}'
+            : /^\\/bal\\b/.test(msg) ? 'Balance: $${balance}'
+              : null
+        if (reply == null) return
+        listeners.slice().forEach(fn => fn({ toString: () => reply }))
+      },
+      once() {}, removeListener() {},
+      on(event, fn) { if (event === 'message') listeners.push(fn) }
+    }
+  })()`
+}
+
+// The coinflip commands only; a balance query is also chat traffic.
+const coinflipChats = (r) => plain(r.run("chats.filter(c => /coinflip/.test(c[1]))"))
+
+const channelLogs = (r, ...ids) => ids
+  .map(id => (id === 'system' ? r.run('systemLogs.map(l => l.text)') : r.run(`bots.${id}.logs.map(l => l.text)`)))
+  .flat()
+  .join('\n')
+
+test('/coinflip-data-run sends one create for the requested wager and remembers the session', async () => {
+  const r = runtime(dataEnv())
+  r.run(payingBot('A', 50000))
+  r.run("handleCommand('/coinflip-data-run 1000 2 A', { selectedId: 'A' })")
+  await new Promise(resolve => setTimeout(resolve, 40))
+  assert.deepEqual(coinflipChats(r), [['A', '/coinflip create 1000']])
+  assert.equal(r.run('coinflipSessions.get("A").planned'), 2)
+  assert.equal(r.run('coinflipSessions.get("A").stopped'), 'running')
+  // Nothing about a busy or unanswered flip may ever delete it.
+  assert.equal(r.run("chats.some(c => /delete/.test(c[1]))"), false)
+
+  // A refusal from the server ends the run, and the bot is then free to run again.
+  r.run("coinflipObserverFor('A').feed('You do not have enough money for this coinflip bet')")
+  await new Promise(resolve => setTimeout(resolve, 1300))
+  assert.match(channelLogs(r, 'A'), /stopped: insufficient-balance/)
+  assert.equal(r.run('coinflipSessions.has("A")'), false)
+  assert.equal(r.run('coinflipLastRun.get("A").stopped'), 'insufficient-balance')
+})
+
+test('/coinflip-data-run takes a named bot, and an unknown name is reported rather than guessed at', async () => {
+  const r = runtime(dataEnv())
+  r.run(payingBot('B', 50000))
+  r.run("handleCommand('/coinflip-data-run 500 1 B')")
+  await new Promise(resolve => setTimeout(resolve, 40))
+  assert.deepEqual(coinflipChats(r), [['B', '/coinflip create 500']])
+  r.run("coinflipObserverFor('B').feed('You do not have enough money for this coinflip bet')")
+  await new Promise(resolve => setTimeout(resolve, 1300))
+
+  r.run('chats = []')
+  r.run("handleCommand('/coinflip-data-run 500 1 Ghost')")
+  assert.deepEqual(plain(r.run('chats')), [])
+  assert.match(channelLogs(r, 'A', 'B', 'system'), /No bot named/)
+})
+
+test('an unreadable PRICE is refused and no coinflip is sent', () => {
+  const r = runtime(dataEnv())
+  r.run("handleCommand('/coinflip-data-run 5x 2 A', { selectedId: 'A' })")
+  assert.deepEqual(plain(r.run('chats')), [])
+  assert.match(channelLogs(r, 'A', 'system'), /Unknown option/)
+})
+
+test('/coinflip-data-run is dispatched per bot, which is what /all-slow needs', async () => {
+  const r = runtime(dataEnv())
+  r.run(payingBot('B', 50000))
+  r.run("dispatchCommandToBot('/coinflip-data-run 250 1', 'B')")
+  await new Promise(resolve => setTimeout(resolve, 40))
+  assert.deepEqual(coinflipChats(r), [['B', '/coinflip create 250']])
+  assert.equal(r.run('coinflipSessions.has("A")'), false, 'the selected bot is not the target here')
+  r.run("coinflipObserverFor('B').feed('You do not have enough money for this coinflip bet')")
+  await new Promise(resolve => setTimeout(resolve, 1300))
+})
+
+test('/coinflip-stats reports the recorded numbers, the streak and the fairness verdict', () => {
+  const r = runtime(dataEnv())
+  r.run("coinflipStore.append({ id: 'x1', bot: 'A', ts: 1700000000000, wager: 1000, result: 'won', delta: 1000, opponent: 'Rival', method: 'message' })")
+  r.run("coinflipStore.append({ id: 'x2', bot: 'A', ts: 1700000001000, wager: 1000, result: 'lost', delta: -1000, opponent: 'Rival', method: 'message' })")
+  r.run("handleCommand('/coinflip-stats A', { selectedId: 'A' })")
+  const logs = channelLogs(r, 'A')
+  assert.match(logs, /2 resolved \(1W\/1L\)/)
+  assert.match(logs, /net: \$0/)
+  assert.match(logs, /fairness verdict: insufficient-data/)
+  assert.match(logs, /per opponent:/)
+  assert.match(logs, /Rival: 2 flips/)
+})
+
+test('/coinflip-stats on an empty history says how to fill it instead of printing zeros', () => {
+  const r = runtime(dataEnv())
+  r.run("handleCommand('/coinflip-stats', { selectedId: 'A' })")
+  assert.match(channelLogs(r, 'A'), /No coinflip history for the whole fleet yet/)
+  assert.match(channelLogs(r, 'A'), /run \/coinflip-data-run/)
+})
+
+test('/coinflip-history lists the flips and needs a confirmation to erase them', () => {
+  const r = runtime(dataEnv())
+  r.run("coinflipStore.append({ id: 'x1', bot: 'A', ts: 1700000000000, wager: 2000, result: 'lost', delta: -2000, opponent: 'Rival', method: 'message' })")
+  r.run("handleCommand('/coinflip-history', { selectedId: 'A' })")
+  let logs = channelLogs(r, 'A')
+  assert.match(logs, /Last 1 coinflip\(s\)/)
+  assert.match(logs, /\$2,000/)
+
+  r.run("handleCommand('/coinflip-history clear', { selectedId: 'A' })")
+  assert.equal(r.run('coinflipStore.all().length'), 1, 'clear without confirm changes nothing')
+  assert.match(channelLogs(r, 'A'), /clear confirm/)
+
+  r.run("handleCommand('/coinflip-history clear confirm', { selectedId: 'A' })")
+  assert.equal(r.run('coinflipStore.all().length'), 0)
+})
+
+test('/timeseries status shows the cadence, the file and the metrics', () => {
+  const r = runtime(dataEnv())
+  r.run("handleCommand('/timeseries status', { selectedId: 'A' })")
+  const logs = channelLogs(r, 'A')
+  assert.match(logs, /Time series/)
+  assert.match(logs, /sampling: on/)
+  assert.match(logs, /samples: 0/)
+  assert.match(logs, /shards: no data yet/)
+})
+
+test('/timeseries series reports the recorded samples and where the JSON is', () => {
+  const r = runtime(dataEnv())
+  r.run("recordTimeseriesSample('A', { shards: 10 }, 'test')")
+  r.run("recordTimeseriesSample('A', { shards: 40 }, 'test')")
+  r.run("recordFleetSample('test')")
+  r.run("handleCommand('/timeseries series shards', { selectedId: 'A' })")
+  const logs = channelLogs(r, 'A')
+  assert.match(logs, /shards \(fleet\)/)
+  assert.match(logs, /\/api\/timeseries\?metric=shards/)
+  // The last bucket is printed even when there are too few points for a line.
+  assert.match(logs, /40/)
+
+  // Per bot, the same metric is scoped to that bot's own samples.
+  r.run("handleCommand('/timeseries series shards 1h A', { selectedId: 'A' })")
+  assert.match(channelLogs(r, 'A'), /shards · A/)
+})
+
+test('the analytics report is built from the same history and samples the page reads', () => {
+  const r = runtime(dataEnv())
+  r.run("coinflipStore.append({ id: 'x1', bot: 'A', ts: 1700000000000, wager: 1000, result: 'won', delta: 1000, method: 'message' })")
+  r.run("recordTimeseriesSample('A', { shards: 10, coins: 1, balance: 100 }, 'test')")
+  const report = plain(r.run('buildAnalyticsReport()'))
+  assert.equal(report.headline.coinflips, 1)
+  assert.equal(report.headline.shardsNow, 10)
+  assert.equal(report.coinflip.stats.wins, 1)
+  assert.ok(report.timeseries.bots.includes('A'))
+  assert.match(r.run('analytics.renderHtml(buildAnalyticsReport())'), /Fairness verdict/)
+})
+
+test('the time-series sampler records a bot sample and a fleet total', async () => {
+  const r = runtime(dataEnv())
+  r.run(payingBot('A', 50000))
+  r.run('startTimeseriesSampler()')
+  assert.ok(r.run('cfDuration(settings.get("TIMESERIES_INTERVAL_MS"))') === '1h 0m')
+
+  const sampled = await r.run("sampleTimeseriesNow({ source: 'test' })")
+  assert.equal(sampled, 1)
+  const rows = plain(r.run('timeseriesStore.all()'))
+  assert.equal(rows.length, 2, 'the bot sample and the fleet total')
+  assert.equal(rows[0].kind, 'bot')
+  assert.equal(rows[0].balance, 50000)
+  assert.equal(rows[0].source, 'test')
+  assert.equal(rows[1].kind, 'fleet')
+  assert.equal(rows[1].balance, 50000)
+  assert.equal(rows[1].bots, 1)
+})
+
+test('time-series sampling records nothing when it is switched off', async () => {
+  const r = runtime(dataEnv({ TIMESERIES_ENABLED: 'false' }))
+  r.run(payingBot('A', 50000))
+  await r.run("sampleTimeseriesNow({ source: 'test' })")
+  assert.equal(r.run('timeseriesStore.all().length'), 0)
+  assert.equal(r.run("recordTimeseriesSample('A', { shards: 1 }, 'test')"), null)
+})
+
+test('the analytics server serves the page and the JSON, and needs a session', async () => {
+  const r = runtime(dataEnv())
+  r.run("coinflipStore.append({ id: 'x1', bot: 'A', ts: 1700000000000, wager: 1000, result: 'won', delta: 1000, method: 'message' })")
+  // Sign in through the dashboard first: the cookie is shared across ports.
+  const cookie = await r.login()
+  r.run('startAnalyticsServer()')
+
+  const port = r.run("settings.get('ANALYTICS_PORT')")
+  const page = await r.request('/', '', cookie, 'GET', port)
+  assert.equal(page.status, 200, page.body)
+  assert.match(page.body, /AFK <b>ANALYTICS<\/b>/)
+  assert.match(page.body, /Fleet over time|No samples yet/)
+  assert.match(page.body, /Fairness verdict/)
+
+  const json = JSON.parse((await r.request('/api/analytics', '', cookie, 'GET', port)).body)
+  assert.ok(json.generatedAt > 0)
+  assert.ok(json.coinflip && json.timeseries && json.headline)
+  assert.equal(json.headline.coinflips, 1)
+  assert.equal(json.headline.coinflipNet, 1000)
+
+  const series = JSON.parse((await r.request('/api/timeseries?metric=shards&bucket=1h', '', cookie, 'GET', port)).body)
+  assert.equal(series.metric, 'shards')
+  assert.equal(series.bucketMs, 3600000)
+
+  // Without the session it explains how to get in rather than leaking the data.
+  const denied = await r.request('/api/analytics', '', '', 'GET', port)
+  assert.equal(/generatedAt/.test(denied.body), false)
+  assert.match(denied.body, /dashboard session/)
+
+  assert.equal((await r.request('/health', '', '', 'GET', port)).body, 'ok')
+
+  // The dashboard runs on its own server and must still be the one on its port.
+  assert.equal((await r.request('/health', '', '', 'GET')).body, 'ok')
+  assert.equal((await r.request('/api/settings', '', '', 'GET')).status, 303)
+})
+
+test('analytics can be switched off entirely', () => {
+  const r = runtime(dataEnv({ ANALYTICS_ENABLED: 'false' }))
+  assert.equal(r.run('startAnalyticsServer()'), null)
+})
+
+test('/analytics points at the page and at the JSON behind it', () => {
+  const r = runtime(dataEnv())
+  r.run("handleCommand('/analytics', { selectedId: 'A' })")
+  const logs = channelLogs(r, 'A')
+  assert.match(logs, /http:\/\/localhost:8080\//)
+  assert.match(logs, /\/api\/analytics/)
+  assert.match(logs, /\/api\/export/)
+})
+
+test('/env lists the registry and marks the keys a restart is needed for', () => {
+  const r = runtime(dataEnv())
+  r.run("handleCommand('/env list coinflip', { selectedId: 'A' })")
+  const logs = channelLogs(r, 'A')
+  assert.match(logs, /Coinflip/)
+  assert.match(logs, /COINFLIP_WAGER_MIN = 10000/)
+  assert.match(logs, /COINFLIP_STOP_LOSS = 10000000/)
+  assert.match(logs, /temporary override\(s\)/)
+})
+
+test('/env set applies immediately and /env reset removes it', () => {
+  const r = runtime(dataEnv())
+  r.run("handleCommand('/env set COINFLIP_WAGER_MIN 5000', { selectedId: 'A' })")
+  assert.equal(r.run("settings.get('COINFLIP_WAGER_MIN')"), 5000)
+  assert.match(channelLogs(r, 'A'), /temporary — not saved/)
+
+  r.run("handleCommand('/env get COINFLIP_WAGER_MIN', { selectedId: 'A' })")
+  assert.match(channelLogs(r, 'A'), /COINFLIP_WAGER_MIN: 5000/)
+  assert.match(channelLogs(r, 'A'), /\(override\)/)
+
+  r.run("handleCommand('/env reset COINFLIP_WAGER_MIN', { selectedId: 'A' })")
+  assert.equal(r.run("settings.get('COINFLIP_WAGER_MIN')"), 10000)
+})
+
+test('a value that cannot be parsed is refused by /env instead of silently reverting', () => {
+  const r = runtime(dataEnv())
+  r.run("handleCommand('/env set COINFLIP_STOP_LOSS lots', { selectedId: 'A' })")
+  assert.equal(r.run("settings.get('COINFLIP_STOP_LOSS')"), 10000000)
+  assert.match(channelLogs(r, 'A'), /not a valid int/)
+})
+
+test('a startup-only key says so rather than pretending the change took effect', () => {
+  const r = runtime(dataEnv())
+  r.run("handleCommand('/env set BOT_NAMES A,B,C,D', { selectedId: 'A' })")
+  assert.match(channelLogs(r, 'A'), /read once at startup/)
+})
+
+test('/env reset-all clears every temporary override', () => {
+  const r = runtime(dataEnv())
+  // Overrides live in the settings module, not in this runtime, so start clean.
+  r.run('settings.resetAll()')
+  r.run("handleCommand('/env set COINFLIP_WAGER_MIN 5000', { selectedId: 'A' })")
+  r.run("handleCommand('/env set COINFLIP_WAGER_MAX 6000', { selectedId: 'A' })")
+  assert.equal(r.run('settings.overrideCount()'), 2)
+  r.run("handleCommand('/env reset-all', { selectedId: 'A' })")
+  assert.equal(r.run('settings.overrideCount()'), 0)
+  assert.match(channelLogs(r, 'A'), /Cleared 2 temporary override/)
+})
+
+test('the dashboard .ENV tab reads and writes the same registry, and rejects bad input', async () => {
+  const r = runtime(dataEnv())
+  r.run('settings.resetAll()')
+  const cookie = await r.login()
+  const list = await r.request('/api/settings', '', cookie, 'GET')
+  assert.equal(list.status, 200)
+  const groups = JSON.parse(list.body).groups
+  assert.ok(groups.some(group => group.group === 'Coinflip' && group.rows.some(row => row.key === 'COINFLIP_STOP_LOSS')))
+
+  const set = await r.request('/api/settings', JSON.stringify({ key: 'COINFLIP_STOP_LOSS', value: '250000' }), cookie, 'POST')
+  assert.equal(set.status, 200)
+  assert.equal(JSON.parse(set.body).ok, true)
+  assert.equal(r.run("settings.get('COINFLIP_STOP_LOSS')"), 250000)
+
+  const bad = await r.request('/api/settings', JSON.stringify({ key: 'COINFLIP_STOP_LOSS', value: 'lots' }), cookie, 'POST')
+  assert.equal(bad.status, 400)
+  assert.match(JSON.parse(bad.body).error, /not a valid int/)
+
+  const reset = await r.request('/api/settings/reset', JSON.stringify({ all: true }), cookie, 'POST')
+  assert.equal(JSON.parse(reset.body).cleared, 1)
+  assert.equal(r.run("settings.get('COINFLIP_STOP_LOSS')"), 10000000)
+})
+
+test('the settings API needs the session, like every other dashboard route', async () => {
+  const r = runtime(dataEnv())
+  const res = await r.request('/api/settings', '', '', 'GET')
+  assert.equal(res.status, 303)
+})
+
+test('a secret is listed as set, never echoed back to the dashboard', async () => {
+  const r = runtime(dataEnv())
+  const cookie = await r.login()
+  const res = await r.request('/api/settings', JSON.stringify({ key: 'WEB_PASSWORD', value: 'a-new-secret' }), cookie, 'POST')
+  assert.equal(JSON.parse(res.body).secret, true)
+  assert.equal(JSON.parse(res.body).value, null)
+  const list = JSON.parse((await r.request('/api/settings', '', cookie, 'GET')).body)
+  const row = list.groups.flatMap(group => group.rows).find(entry => entry.key === 'WEB_PASSWORD')
+  assert.equal(row.value, null)
+  assert.equal(row.secret, true)
+  assert.equal(r.run("settings.list().find(r => r.key === 'WEB_PASSWORD').value"), null)
+  await r.request('/api/settings/reset', JSON.stringify({ all: true }), cookie, 'POST')
 })

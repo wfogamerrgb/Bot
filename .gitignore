@@ -8,6 +8,9 @@ bannana
 node_modules/
 .env*
 data/*.json
+# Append-only measurement history (coinflips, time series) — generated, not source.
+data/*.jsonl
+data/*.jsonl.*
 cron-jobs.json
 removed-bots.json
 # Local web-client build (dist + cloned upstream src + build.log).
