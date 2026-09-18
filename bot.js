@@ -46,6 +46,7 @@ const dataStore = require(path.join(__dirname, 'data-store'))
 // coinflip data collection, the time-series store, and the read-only analytics pages.
 const settings = require(path.join(__dirname, 'settings'))
 const coinflip = require(path.join(__dirname, 'coinflip'))
+const analysis = require(path.join(__dirname, 'analysis'))
 const timeseries = require(path.join(__dirname, 'timeseries'))
 const analytics = require(path.join(__dirname, 'analytics'))
 const mineflayer = require('mineflayer')
@@ -751,6 +752,11 @@ cfDefine('COINFLIP_SETTLE_MS', { type: 'ms', def: 1500, min: 100, group: 'Coinfl
 cfDefine('COINFLIP_MIN_SAMPLE', { type: 'int', def: 30, min: 5, group: 'Coinflip', desc: 'Resolved flips needed before a fairness verdict is given' })
 cfDefine('COINFLIP_SUSPICION_P', { type: 'number', def: 0.01, min: 0.0001, max: 0.5, group: 'Coinflip', desc: 'A two-sided p below this is called suspicious' })
 cfDefine('COINFLIP_BALANCE_TIMEOUT_MS', { type: 'ms', def: 2500, min: 500, group: 'Coinflip', desc: 'How long /bal has to answer around a flip' })
+cfDefine('COINFLIP_CREATE_COOLDOWN_MS', { type: 'ms', def: 2500, min: 0, group: 'Coinflip', desc: 'Gap left after the balance check and before /coinflip create — the /bal before it is what trips the server rate limit' })
+cfDefine('COINFLIP_COOLDOWN_MAX_RETRIES', { type: 'int', def: 5, min: 1, group: 'Coinflip', desc: 'Consecutive "you are on cooldown" replies tolerated before a run stops' })
+cfDefine('COINFLIP_DEEP_MIN_BUCKET', { type: 'int', def: 20, min: 1, group: 'Coinflip', desc: 'Flips a bucket needs before /coinflip-deep treats it as evidence rather than an anecdote' })
+cfDefine('COINFLIP_DEEP_Q', { type: 'number', def: 0.05, min: 0.0001, max: 0.5, group: 'Coinflip', desc: 'False-discovery rate a dissection must beat to count as a finding (Benjamini-Hochberg, across every test)' })
+cfDefine('COINFLIP_TZ_OFFSET_MIN', { type: 'int', def: -new Date().getTimezoneOffset(), min: -840, max: 840, group: 'Coinflip', desc: 'Minutes from UTC used for the hour-of-day dissection when a record has no server timestamp' })
 cfDefine('TIMESERIES_ENABLED', { type: 'bool', def: true, group: 'Time series', desc: 'Record samples to the data folder' })
 cfDefine('TIMESERIES_INTERVAL_MS', { type: 'ms', def: 3600000, min: 60000, group: 'Time series', desc: 'How often a sample is taken (default hourly)' })
 cfDefine('TIMESERIES_RANK_INTERVAL_MS', { type: 'ms', def: 21600000, min: 0, group: 'Time series', desc: 'How often ranks are probed (0 disables — each probe costs a /fix)' })
@@ -789,6 +795,7 @@ cfDefine('WEB_PASSWORD', { type: 'string', group: 'Dashboard', live: false, desc
 
 const COINFLIP_FILE = process.env.COINFLIP_FILE || path.join(__dirname, 'data', 'coinflip-history.jsonl')
 const COINFLIP_SUMMARY_FILE = process.env.COINFLIP_SUMMARY_FILE || path.join(__dirname, 'data', 'coinflip-stats.json')
+const COINFLIP_DEEP_FILE = process.env.COINFLIP_DEEP_FILE || path.join(__dirname, 'data', 'coinflip-deep.json')
 const TIMESERIES_FILE = process.env.TIMESERIES_FILE || path.join(__dirname, 'data', 'timeseries.jsonl')
 const TIMESERIES_SUMMARY_FILE = process.env.TIMESERIES_SUMMARY_FILE || path.join(__dirname, 'data', 'timeseries-summary.json')
 const coinflipStore = coinflip.createCoinflipStore({ file: COINFLIP_FILE, maxRecords: 200000 })
@@ -3218,6 +3225,7 @@ const COMMANDS = {
   '/coinflip-data-run [PRICE] [AMOUNT] [BOT]': `Play AMOUNT coinflips (default ${settings.get('COINFLIP_DEFAULT_FLIPS')}) on BOT (default: the active bot, or every spawned bot with \`all\`) and record every one of them. PRICE is a fixed wager (500000) or a random range (10k-1m — the COINFLIP_WAGER_MIN–MAX defaults). The result messages, the balance either side, and the next accepted create are all used to settle each flip; a coinflip that is already active is waited for, never deleted. Stops at COINFLIP_STOP_LOSS. Works with /all-slow: /all-slow /coinflip-data-run 10k-1m 20`,
   '/coinflip-stats [BOT]': 'Win/loss counts, net, streaks, drawdown, per-opponent and per-bot breakdowns, and the fairness verdict (binomial p-value, runs test, net-per-flip confidence interval) for one bot or the whole fleet',
   '/coinflip-history [n|clear confirm]': 'The last n recorded flips (default 20) with the detection method and any message/balance mismatch; \`clear confirm\` wipes the history file',
+  '/coinflip-deep [BOT]': 'Dissect the recorded flips every way at once: what follows a run of losses, whether the previous flip predicts the next (transition table and lag correlations), run lengths against chance, wager as a share of the balance, absolute wager, richest vs poorest, hour of day (server clock), pace between flips, position in the session, raising after a loss, opponents and the money curve — every bucket with its own confidence interval, corrected across the whole family of tests (Benjamini-Hochberg). Writes data/coinflip-deep.json and feeds the page on port 8080',
   '/timeseries [sample [ranks]|series <metric> [bucket] [bot]|events|clear confirm|status]': 'The recorded samples of shards, coins, balance, rank and bans over time — a sparkline, the last buckets, and where the JSON lives. \`sample\` records one right now',
   '/analytics': 'Where the read-only analytics page is, plus the JSON endpoints behind it (/api/analytics, /api/coinflip, /api/timeseries, /api/export)',
   '/env [list [filter]|get KEY|set KEY VALUE|reset KEY|reset-all]': 'Show or change a configuration value for THIS run only — nothing is ever written to the .env file and a restart forgets it. Keys marked startup-only were read once at boot. The dashboard has the same thing as the .ENV tab',
@@ -4483,6 +4491,10 @@ function logCoinflipEvent (id, event) {
     logFor(id, `{yellow-fg}⚠ An active coinflip is still open — waiting ${cfDuration(settings.get('COINFLIP_BUSY_WAIT_MS'))}, then asking again (never deleting it).{/yellow-fg}`)
     return
   }
+  if (event.kind === 'cooldown') {
+    logFor(id, `{yellow-fg}⚠ The server rate-limited /coinflip create (attempt ${event.attempt}) — waiting ${cfDuration(event.waitMs)} and asking again. Nothing was recorded.{/yellow-fg}`)
+    return
+  }
   if (event.kind === 'unresolved') {
     logFor(id, `{yellow-fg}⚠ No result and no balance change for a ${cfMoney(event.wager)} flip — leaving it pending; the next accepted create records it as a loss.{/yellow-fg}`)
     return
@@ -4505,9 +4517,42 @@ function persistCoinflipSummary () {
     })
     fs.mkdirSync(path.dirname(COINFLIP_SUMMARY_FILE), { recursive: true })
     fs.writeFileSync(COINFLIP_SUMMARY_FILE, JSON.stringify(summary, null, 2))
+    persistCoinflipDeepReport()
   } catch (_) {}
 }
 
+// ── Deep dissection report ───────────────────────────────────────────────────
+// The dissection walks the whole history and the dashboard asks for it on every
+// refresh, so the last report is cached against the history it was computed from
+// (length plus the newest timestamp is enough to notice an appended record).
+let deepCache = null
+
+function coinflipDeepReport (opts = {}) {
+  const rows = coinflipStore.all()
+  const bot = opts.bot || null
+  const minBucket = settings.get('COINFLIP_DEEP_MIN_BUCKET')
+  const q = settings.get('COINFLIP_DEEP_Q')
+  const key = [rows.length, rows.length ? rows[rows.length - 1].ts : 0, bot || '', minBucket, q].join('|')
+  if (deepCache && deepCache.key === key) return deepCache.report
+  const scoped = bot ? rows.filter(row => row.bot === bot) : rows
+  const report = analysis.deepAnalysis(scoped, {
+    q,
+    minBucket,
+    tzOffsetMinutes: settings.get('COINFLIP_TZ_OFFSET_MIN')
+  })
+  report.bot = bot
+  deepCache = { key, report }
+  return report
+}
+
+function persistCoinflipDeepReport () {
+  const report = coinflipDeepReport()
+  try {
+    fs.mkdirSync(path.dirname(COINFLIP_DEEP_FILE), { recursive: true })
+    fs.writeFileSync(COINFLIP_DEEP_FILE, JSON.stringify(report, null, 2))
+  } catch (_) { /* the report is still returned; the file is best-effort */ }
+  return report
+}
 // Plays `flips` coinflips on one bot and records every outcome. Returns the
 // session result, or null when it could not start.
 async function runCoinflipForBot (id, opts = {}) {
@@ -4554,7 +4599,10 @@ async function runCoinflipForBot (id, opts = {}) {
       busyWaitMs: settings.get('COINFLIP_BUSY_WAIT_MS'),
       busyMaxWaitMs: settings.get('COINFLIP_BUSY_MAX_WAIT_MS'),
       flipTimeoutMs: settings.get('COINFLIP_FLIP_TIMEOUT_MS'),
-      pollMs: settings.get('COINFLIP_POLL_MS')
+      pollMs: settings.get('COINFLIP_POLL_MS'),
+      // The /bal that answers just before a create is the command that trips the
+      // server's rate limit, so the create waits this long after that answer.
+      createCooldownMs: settings.get('COINFLIP_CREATE_COOLDOWN_MS')
     })
   } catch (err) {
     result = { bot: id, records: [], net: 0, stopped: 'disconnected', reason: sanitize(err.message || String(err)) }
@@ -4582,6 +4630,7 @@ async function runCoinflipForBot (id, opts = {}) {
   const flagText = fairness.flags.length ? ` — ${sanitize(fairness.flags[0])}` : ''
   logFor(id, `{${colour}}› Coinflip fairness for ${id}: ${fairness.verdict} — ${stats.wins}W/${stats.losses}L lifetime${pText}${flagText}{/${colour}}`)
   if (stats.mismatches) logFor(id, `{red-fg}✗ ${stats.mismatches} flip(s) where the message and the balance disagreed — see /coinflip-history.{/red-fg}`)
+  if (result.cooldowns) logFor(id, `{yellow-fg}⚠ The server rate-limited ${result.cooldowns} create(s) during the run — raise COINFLIP_CREATE_COOLDOWN_MS in the .ENV tab if it keeps happening.{/yellow-fg}`)
   if (result.stopped === 'no-opponent') logFor(id, `{yellow-fg}⚠ The flip is still open and will not be remade. Remove it by hand if you want the run to continue, then start it again.{/yellow-fg}`)
 
   // The session stops being "in flight" the moment it ends — otherwise the next
@@ -4739,10 +4788,12 @@ function buildAnalyticsReport (opts = {}) {
   return analytics.buildReport({
     coinflip: coinflipSummary,
     timeseries: tsSnapshot,
+    deep: coinflipDeepReport({ bot: opts.bot || null }),
     config: {
       coinflipFile: COINFLIP_FILE,
       timeseriesFile: TIMESERIES_FILE,
       coinflipSummaryFile: COINFLIP_SUMMARY_FILE,
+      coinflipDeepFile: COINFLIP_DEEP_FILE,
       timeseriesSummaryFile: TIMESERIES_SUMMARY_FILE,
       sampleIntervalMs: settings.get('TIMESERIES_INTERVAL_MS'),
       bucketMs: settings.get('ANALYTICS_BUCKET_MS'),
@@ -4805,6 +4856,12 @@ function handleAnalyticsRequest (req, res, url) {
     }))
     return
   }
+  if (p === '/api/coinflip/deep') {
+    // The whole dissection, for whoever wants to re-run the statistics
+    // elsewhere — the same object the page and /coinflip-deep use.
+    sendJson(res, coinflipDeepReport({ bot: url.searchParams.get('bot') || null }))
+    return
+  }
   if (p === '/api/timeseries') {
     const metric = url.searchParams.get('metric') || 'shards'
     const bot = url.searchParams.get('bot') || null
@@ -4826,7 +4883,7 @@ function handleAnalyticsRequest (req, res, url) {
     return
   }
   res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' })
-  res.end('not found — try /, /api/analytics, /api/coinflip, /api/timeseries?metric=shards&bucket=1h, /api/export')
+  res.end('not found — try /, /api/analytics, /api/coinflip, /api/coinflip/deep, /api/timeseries?metric=shards&bucket=1h, /api/export')
 }
 
 // The dashboard's session check lives inside startWebGUI's closure, so the
@@ -5905,6 +5962,42 @@ if (trimmed === '/timeseries' || trimmed.startsWith('/timeseries ')) {
   return
 }
 
+if (trimmed === '/coinflip-deep' || trimmed.startsWith('/coinflip-deep ')) {
+  const wanted = trimmed.slice('/coinflip-deep'.length).trim()
+  let bot = null
+  if (wanted && wanted !== 'all') {
+    bot = bots[wanted] ? wanted : (matchBotName(wanted, Object.keys(bots)) || wanted)
+  }
+  const rows = coinflipStore.all()
+  const scoped = bot ? rows.filter(row => row.bot === bot) : rows
+  if (!scoped.length) { logInfo(`No coinflip history for ${sanitize(bot || 'the fleet')} yet — run /coinflip-data-run first.`); return }
+  const report = coinflipDeepReport({ bot })
+  const rate = (value) => (value == null ? 'n/a' : `${(value * 100).toFixed(1)}%`)
+  const mark = (row) => (row.significant ? '{green-fg}★{/green-fg} ' : row.lowSample ? '{gray-fg}·{/gray-fg} ' : '  ')
+
+  logInfo(`{bold}── Coinflip dissection (${sanitize(bot || 'whole fleet')}) ──{/bold}`)
+  log(` sample: ${report.resolved} resolved flip(s) · ${report.wins}W/${report.losses}L = ${rate(report.winRate)} · net ${cfMoney(report.net)}`)
+  log(` ${report.tests} statistical test(s) corrected together at q=${report.q} · hours read from the ${sanitize(report.hourSource)} clock`)
+  for (const section of report.sections) {
+    log('')
+    log(`{cyan-fg}${sanitize(section.title)}{/cyan-fg} {gray-fg}— ${sanitize(section.question)}{/gray-fg}`)
+    if (!section.rows.length) { log(`  {gray-fg}${sanitize(section.summary)}{/gray-fg}`); continue }
+    for (const row of section.rows.slice(0, 12)) {
+      const shown = row.rate == null
+        ? sanitize(row.note || '—')
+        : `${rate(row.rate)} (${row.wins}W/${row.losses}L, n=${row.n})${row.q == null ? '' : ` q=${row.q.toExponential(2)}`}`
+      log(`  ${mark(row)}${sanitize(row.label)}: ${shown}${row.lowSample ? ` {gray-fg}(under ${settings.get('COINFLIP_DEEP_MIN_BUCKET')} flips){/gray-fg}` : ''}`)
+    }
+    if (section.rows.length > 12) log(`  {gray-fg}… ${section.rows.length - 12} more row(s) in the JSON{/gray-fg}`)
+    log(`  {gray-fg}${sanitize(section.summary)}{/gray-fg}`)
+  }
+  log('')
+  logInfo('{bold}── What the numbers say ──{/bold}')
+  report.takeaways.forEach(line => log(` • ${sanitize(line)}`))
+  const file = persistCoinflipDeepReport()
+  log(` {gray-fg}full report: ${COINFLIP_DEEP_FILE}${file ? '' : ' (could not be written)'} · page: http://${hostForLink()}:${settings.get('ANALYTICS_PORT')}/ · JSON: /api/coinflip/deep{/gray-fg}`)
+  return
+}
 if (trimmed === '/analytics' || trimmed === '/analytics open') {
   const port = settings.get('ANALYTICS_PORT')
   const summary = coinflipStore.summary({ recent: 0, minSample: settings.get('COINFLIP_MIN_SAMPLE'), suspicionP: settings.get('COINFLIP_SUSPICION_P') })
@@ -5915,7 +6008,8 @@ if (trimmed === '/analytics' || trimmed === '/analytics open') {
   log(` coinflips: ${stats.resolved} resolved (${stats.wins}W/${stats.losses}L) · net ${cfMoney(stats.net)} · verdict ${fairness.verdict}`)
   log(` time series: ${timeseriesStore.all().length} sample(s) → ${TIMESERIES_FILE}`)
   log(` coinflip history: ${coinflipStore.all().length} flip(s) → ${COINFLIP_FILE}`)
-  log(' {gray-fg}JSON: /api/analytics · /api/coinflip · /api/timeseries?metric=shards&bucket=1h · /api/export (everything){/gray-fg}')
+  log(` coinflip dissection: ${COINFLIP_DEEP_FILE}`)
+  log(' {gray-fg}JSON: /api/analytics · /api/coinflip · /api/coinflip/deep · /api/timeseries?metric=shards&bucket=1h · /api/export (everything){/gray-fg}')
   return
 }
 

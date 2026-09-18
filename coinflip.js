@@ -24,6 +24,37 @@ const TIMESTAMP_RE = /^\s*\[?\d{1,2}:\d{2}(?::\d{2})?\s*(?:[AaPp]\.?[Mm]\.?)?\]?
 const SECTION_RE = /\u00a7./g
 const NAME = '[A-Za-z0-9_]{1,16}'
 
+// The server stamps every coinflip line with its own local clock. Keeping that
+// stamp is what makes "does the time of day matter" answerable without guessing
+// which timezone the game server runs in — the hour is the server's, not ours.
+// A.M./P.M. is optional so a server that stamps 24-hour times works too;
+// without it the hour is read as-is.
+const CLOCK_RE = /^\[?(\d{1,2}):(\d{2})(?::(\d{2}))?(?:\s*([AaPp])\.?[Mm]\.?)?\]?/
+
+/** "2:50:43 AM Result: Lost" → { hour: 2, minute: 50, second: 43, label: '2:50 A.M.' }. */
+function parseServerClock (raw) {
+  const text = String(raw == null ? '' : raw).replace(SECTION_RE, '').trim()
+  const match = text.match(CLOCK_RE)
+  if (!match) return null
+  let hour = Number(match[1])
+  const minute = Number(match[2])
+  const second = match[3] == null ? null : Number(match[3])
+  const meridiem = match[4] ? match[4].toLowerCase() : null
+  if (!Number.isFinite(hour) || !Number.isFinite(minute) || minute > 59) return null
+  if (meridiem) {
+    if (hour < 1 || hour > 12) return null
+    hour = (hour % 12) + (meridiem === 'p' ? 12 : 0)
+  } else if (hour > 23) return null
+  return {
+    hour,
+    minute,
+    second,
+    label: meridiem
+      ? `${match[1]}:${match[2]} ${match[4].toUpperCase()}.M.`
+      : `${String(match[1]).padStart(2, '0')}:${match[2]}`
+  }
+}
+
 function cleanLine (text) {
   return String(text == null ? '' : text)
     .replace(SECTION_RE, '')
@@ -78,6 +109,16 @@ function classifyCoinflipLine (text) {
   }
   if (/already have an active coinflip|use \/coinflip delete first/i.test(line)) {
     return { kind: 'busy', line }
+  }
+  // The server rate-limits chat commands and answers a command sent too soon
+  // with "✘ Error ┃ You are on cooldown". The section glyphs are stripped above,
+  // so what arrives here is "Error You are on cooldown". A rate-limited create
+  // never happened, so this is a wait-and-retry, not a result — and it is worth
+  // recognising precisely, because the /bal that precedes every create is what
+  // trips it. Anchored so a player chatting "I'm on cooldown lol" cannot stall a
+  // run by accident.
+  if (/^(?:error\b[\s:]*)?(?:you\s+(?:are|'?re)\s+)?on\s+cool\s?down\b/i.test(line)) {
+    return { kind: 'cooldown', line }
   }
   // Servers write this both ways ("You don't have enough" / "You do not have
   // enough money"), and the context words stop a random player's line matching.
@@ -155,6 +196,8 @@ function createCoinflipObserver (opts = {}) {
       result,
       amount: finished.amount,
       opponent: opponentName && !isUs(opponentName, botName) ? opponentName : null,
+      serverHour: finished.clock ? finished.clock.hour : null,
+      serverClock: finished.clock ? finished.clock.label : null,
       lines: finished.lines,
       at: now()
     })
@@ -170,7 +213,10 @@ function createCoinflipObserver (opts = {}) {
     if (!cls) return null
 
     if (cls.kind === 'result' || cls.kind === 'bet' || cls.kind === 'winner' || cls.kind === 'loser') {
-      if (!block) block = { explicit: null, amount: null, winner: null, loser: null, lines: [] }
+      if (!block) block = { explicit: null, amount: null, winner: null, loser: null, clock: null, lines: [] }
+      // The block's own clock comes off its first line; the server repeats it on
+      // every line of the block, but the first one is the flip's.
+      if (!block.clock) block.clock = parseServerClock(text)
       block.lines.push(cls.line)
       if (cls.kind === 'result') block.explicit = cls.result
       else if (cls.kind === 'bet') block.amount = cls.amount
@@ -308,12 +354,23 @@ async function runCoinflipSession (opts, deps) {
     stopLoss = 10000000,
     balanceFraction = 1,
     sessionId = `cf-${Date.now().toString(36)}`,
-    maxNoResponseRetries = 3
+    maxNoResponseRetries = 3,
+    maxCooldownRetries = 5
   } = opts
   const {
     send, balance, sleep, observer, log = () => {}, now = Date.now, rand = Math.random,
-    busyWaitMs = 15000, busyMaxWaitMs = 900000, flipTimeoutMs = 600000, pollMs = 15000
+    busyWaitMs = 15000, busyMaxWaitMs = 900000, flipTimeoutMs = 600000, pollMs = 15000,
+    // The server rate-limits chat commands, and the /bal that answers just
+    // before each create is the command that trips it. This is the gap left
+    // after that answer and before "create" goes out.
+    createCooldownMs = 0,
+    cooldownWaitMs = null
   } = deps
+
+  // How long to wait when the server answers "you are on cooldown": at least
+  // the configured gap, and never less than the busy wait, which is already
+  // tuned to this server's limits.
+  const cooldownPause = () => Math.max(createCooldownMs, cooldownWaitMs == null ? 1000 : cooldownWaitMs)
 
   const records = []
   let net = 0
@@ -322,6 +379,8 @@ async function runCoinflipSession (opts, deps) {
   let pending = null // a flip we made but have not been told the result of
   let busyWaited = 0
   let noResponse = 0
+  let cooldownWaits = 0 // consecutive rate-limited creates
+  let cooldowns = 0 // rate-limited creates over the whole session
 
   const record = (entry) => {
     const row = {
@@ -333,6 +392,10 @@ async function runCoinflipSession (opts, deps) {
       wager: entry.wager,
       opponent: entry.opponent || null,
       result: entry.result,
+      // The server's own clock, when the result block carried a timestamp — the
+      // only time-of-day signal that does not depend on our timezone.
+      serverHour: entry.serverHour == null ? null : entry.serverHour,
+      serverClock: entry.serverClock || null,
       balanceBefore: entry.balanceBefore == null ? null : entry.balanceBefore,
       balanceAfter: entry.balanceAfter == null ? null : entry.balanceAfter,
       delta: entry.delta == null ? null : entry.delta,
@@ -362,6 +425,12 @@ async function runCoinflipSession (opts, deps) {
       break
     }
 
+    // The rate-limit gap. Sleeping HERE (after the balance answer, before the
+    // create) is what stops the server answering a fresh create with
+    // "You are on cooldown" — the cooldown is per command, and /bal is the one
+    // that just went out.
+    if (createCooldownMs > 0) await sleep(createCooldownMs)
+
     observer.reset()
     log({ kind: 'create', wager, bot: botId, sessionId })
     send(`/coinflip create ${wager}`)
@@ -373,6 +442,7 @@ async function runCoinflipSession (opts, deps) {
     while (!outcome) {
       const ev = await observer.next(pollMs)
       if (ev.kind === 'busy') { outcome = { kind: 'busy' }; break }
+      if (ev.kind === 'cooldown') { outcome = { kind: 'cooldown' }; break }
       if (ev.kind === 'insufficient') { outcome = { kind: 'insufficient' }; break }
       if (ev.kind === 'error') { outcome = { kind: 'error', reason: ev.reason }; break }
       if (ev.kind === 'created') { created = true; continue }
@@ -383,6 +453,8 @@ async function runCoinflipSession (opts, deps) {
           result: ev.result,
           amount: ev.amount,
           opponent: ev.opponent,
+          serverHour: ev.serverHour == null ? null : ev.serverHour,
+          serverClock: ev.serverClock || null,
           lines: ev.lines
         }
         continue
@@ -404,6 +476,21 @@ async function runCoinflipSession (opts, deps) {
       await sleep(busyWaitMs)
       // Re-asking is what tells us the old flip finally ended; if it did, the
       // create lands and the previous flip is recorded as a loss below.
+      continue
+    }
+    if (outcome.kind === 'cooldown') {
+      // A rate-limited create never happened, so nothing is recorded: retry the
+      // same flip after the cooldown instead of counting it as a loss.
+      cooldownWaits += 1
+      cooldowns += 1
+      if (cooldownWaits > maxCooldownRetries) {
+        stopped = 'cooldown'
+        reason = `the server rate-limited /coinflip create ${cooldownWaits} times — raise COINFLIP_CREATE_COOLDOWN_MS`
+        break
+      }
+      const wait = cooldownPause()
+      log({ kind: 'cooldown', attempt: cooldownWaits, waitMs: wait, bot: botId, sessionId })
+      await sleep(wait)
       continue
     }
     if (outcome.kind === 'insufficient') {
@@ -438,6 +525,7 @@ async function runCoinflipSession (opts, deps) {
 
     noResponse = 0
     busyWaited = 0
+    cooldownWaits = 0
 
     // A create that landed while a previous flip was somehow still open is proof
     // the old one ended in a loss — the server only announces wins and losses.
@@ -477,6 +565,8 @@ async function runCoinflipSession (opts, deps) {
       balanceAfter,
       delta,
       method,
+      serverHour: outcome.serverHour,
+      serverClock: outcome.serverClock,
       // A message that contradicts the money is exactly the kind of thing worth
       // seeing in the log rather than averaging away.
       mismatched: delta != null && Math.abs(delta - expected) > 0.005,
@@ -486,7 +576,7 @@ async function runCoinflipSession (opts, deps) {
     })
   }
 
-  return { bot: botId, sessionId, records, net, stopped, reason, flips: records.length }
+  return { bot: botId, sessionId, records, net, stopped, reason, flips: records.length, cooldowns }
 }
 
 // ── Statistics ───────────────────────────────────────────────────────────────
@@ -690,6 +780,7 @@ function describeSession (result) {
     stats.winRate == null ? 'no win rate yet' : `win rate ${(stats.winRate * 100).toFixed(1)}%`
   ]
   if (stats.unresolved) parts.push(`${stats.unresolved} unresolved`)
+  if (result.cooldowns) parts.push(`${result.cooldowns} create(s) rate-limited`)
   parts.push(`stopped: ${result.stopped}${result.reason ? ` (${result.reason})` : ''}`)
   return parts.join(' · ')
 }
@@ -769,6 +860,7 @@ function createCoinflipStore (opts = {}) {
 module.exports = {
   STREAK,
   cleanLine,
+  parseServerClock,
   parseAmount,
   parseWagerSpec,
   classifyCoinflipLine,
@@ -781,6 +873,9 @@ module.exports = {
   describeSession,
   createCoinflipStore,
   runsTest,
+  mean,
+  stdev,
+  resolvedRecords,
   wilsonInterval,
   twoSidedP,
   normalCdf,

@@ -45,13 +45,14 @@ function duration (ms) {
 }
 
 /** The machine-readable report behind /api/analytics. */
-function buildReport ({ coinflip = null, timeseries = null, config = {}, generatedAt = Date.now() } = {}) {
+function buildReport ({ coinflip = null, timeseries = null, deep = null, config = {}, generatedAt = Date.now() } = {}) {
   return {
     generatedAt,
     generatedAtIso: fmtTime(generatedAt),
     config,
     coinflip,
     timeseries,
+    deep,
     headline: buildHeadline(coinflip, timeseries)
   }
 }
@@ -189,6 +190,10 @@ tr:hover td{background:var(--panel2)}
 .pill.dim{color:var(--dim)}
 .win{color:var(--grn)}.loss{color:var(--red)}
 code{background:var(--panel2);border:1px solid var(--line);border-radius:4px;padding:0 5px;font-size:11px}
+tr.sig td{background:rgba(74,222,128,.07)}
+ul.takeaways{margin:0;padding-left:18px;color:var(--txt)}
+ul.takeaways li{margin:0 0 4px}
+.eq{color:var(--dim)}
 `
 
 function kpi (label, value, cls = '') {
@@ -235,6 +240,68 @@ ${(f.flags || []).length ? `<ul>${f.flags.map(flag => `<li>${esc(flag)}</li>`).j
 <h2 style="margin-top:0">Recent flips</h2>
 <table><thead><tr><th>when</th><th>bot</th><th>result</th><th>wager</th><th>opponent</th><th>Δ balance</th><th>detected by</th></tr></thead><tbody>${flips || '<tr><td colspan="7" class="empty">no flips yet</td></tr>'}</tbody></table>
 </div>`
+}
+
+// ── Deep dissection ──────────────────────────────────────────────────────────
+
+function deepRows (section) {
+  return section.rows.map(row => {
+    const flag = row.significant
+      ? '<span class="pill good">survives</span>'
+      : row.lowSample ? '<span class="pill dim">low n</span>' : ''
+    return `<tr class="${row.significant ? 'sig' : ''}">
+<td>${esc(row.label)}</td>
+<td class="num">${row.n == null ? '–' : row.n}</td>
+<td class="num">${row.rate == null ? esc(row.note || '–') : `${row.wins}W/${row.losses}L`}</td>
+<td class="num">${row.rate == null ? '–' : pct(row.rate, 1)}</td>
+<td class="num">${row.ci == null ? '–' : `${pct(row.ci.low, 1)}–${pct(row.ci.high, 1)}`}</td>
+<td class="num">${row.p == null ? '–' : row.p.toExponential(1)}</td>
+<td class="num">${row.q == null ? '–' : row.q.toExponential(1)}</td>
+<td>${flag}</td></tr>`
+  }).join('')
+}
+
+/**
+ * Every dissection, all rendered from the same `sections` shape the report
+ * carries — the page never recomputes a statistic, so what is on screen is
+ * exactly what /coinflip-deep printed and /api/coinflip/deep serves.
+ */
+function deepSection (deep) {
+  if (!deep || !deep.resolved) {
+    return `<h2>Deep dissection</h2><div class="panel"><div class="empty">No resolved coinflips recorded yet. Run <code>/coinflip-data-run</code> and every dissection fills in here.</div></div>`
+  }
+  const controls = deep.sections.filter(section => section.rows.length || section.summary)
+  const parts = controls.map(section => {
+    const heading = `<div class="panel" style="margin-bottom:12px">
+<h2 style="margin-top:0">${esc(section.title)}</h2>
+<p class="sub" style="margin:0 0 8px">${esc(section.question || '')}</p>
+${section.rows.length
+  ? `<table><thead><tr><th>bucket</th><th>n</th><th>W/L</th><th>rate</th><th>95% CI</th><th>p</th><th>q</th><th></th></tr></thead><tbody>${deepRows(section)}</tbody></table>`
+  : `<div class="empty">${esc(section.summary || 'no data')}</div>`}
+<p class="sub" style="margin:8px 0 0">${esc(section.summary || '')}</p>
+</div>`
+    return heading
+  }).join('')
+
+  return `<h2>Deep dissection</h2>
+<div class="kpis">
+${kpi('resolved flips', fmt(deep.resolved))}
+${kpi('win rate', pct(deep.winRate, 2))}
+${kpi('statistical tests', fmt(deep.tests))}
+${kpi('FDR level', esc(String(deep.q)))}
+${kpi('P(win | win)', pct(deep.markov && deep.markov.pWinAfterWin, 2))}
+${kpi('P(win | loss)', pct(deep.markov && deep.markov.pWinAfterLoss, 2))}
+${kpi('lag-1 correlation', deep.autocorrelation && deep.autocorrelation[0] && deep.autocorrelation[0].r != null ? deep.autocorrelation[0].r.toFixed(4) : '–')}
+${kpi('hour clock', esc(deep.hourSource || 'none'))}
+${kpi('deepest drawdown', fmt(deep.curve && deep.curve.maxDrawdown), 'loss')}
+${kpi('longest stretch below a high', `${deep.curve ? deep.curve.longestDrawdown : '–'} flips`)}
+</div>
+<div class="panel" style="margin-top:12px">
+<h2 style="margin-top:0">What the numbers say</h2>
+<ul class="takeaways">${(deep.takeaways || []).map(line => `<li>${esc(line)}</li>`).join('')}</ul>
+<p class="sub" style="margin:8px 0 0">${deep.tests} bucket(s) and trend(s) were tested; the q column is the p-value after the Benjamini–Hochberg correction over all ${deep.tests} of them. A bucket under ${deep.minBucket} flips is marked low n and should be read as an anecdote. <a href="/api/coinflip/deep">/api/coinflip/deep</a> has the same numbers as JSON.</p>
+</div>
+${parts}`
 }
 
 function timeseriesSection (ts, bucketMs) {
@@ -297,6 +364,7 @@ ${kpi('samples', fmt(h.samples))}
 ${kpi('shards now', fmt(h.shardsNow))}
 </div>
 ${coinflipSection(report.coinflip)}
+${deepSection(report.deep)}
 ${timeseriesSection(report.timeseries, bucketMs)}
 <p class="sub" style="margin-top:22px">JSON: <a href="/api/analytics">/api/analytics</a> · coinflips only: <a href="/api/coinflip">/api/coinflip</a> · series: <a href="/api/timeseries?metric=shards&amp;bucket=1h">/api/timeseries?metric=shards&amp;bucket=1h</a></p>
 </body></html>`
@@ -318,6 +386,7 @@ module.exports = {
   buildReport,
   buildHeadline,
   renderHtml,
+  deepSection,
   lineChart,
   rateBar,
   parseBucket,

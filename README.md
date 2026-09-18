@@ -1089,6 +1089,7 @@ Any unrecognized input is sent as a Minecraft chat message or command.
 | `/coinflip-data-run [PRICE] [AMOUNT] [BOT]` | Play `AMOUNT` coinflips (default 10) on `BOT` (default: the selected bot) and record every one. `PRICE` is a fixed wager (`500000`) or a random range (`10k-1m`, the `COINFLIP_WAGER_MIN`-`MAX` defaults), and `all` targets the whole roster. Works with `/all-slow`: `/all-slow /coinflip-data-run 10k-1m 20` |
 | `/coinflip-stats [BOT]` | Win/loss counts, net, streaks, drawdown, per-opponent and per-bot breakdowns, and the fairness verdict for one bot or the fleet |
 | `/coinflip-history [n\|clear confirm]` | The last `n` recorded flips (default 20), with how each result was detected and any message/balance mismatch |
+| `/coinflip-deep [BOT]` | Dissect the recorded flips every way at once — what follows a run of losses, whether the previous flip predicts the next, run lengths, wager as a share of the balance, hour of day, pace, session position, raising after a loss, opponents and the money curve — with every bucket corrected for multiple testing. Writes `data/coinflip-deep.json` |
 | `/timeseries [sample [ranks]\|series <metric> [bucket] [bot]\|events\|clear confirm]` | Shards, coins, balance, rank and ban counts over time - a sparkline, the last buckets, and where the JSON lives |
 | `/analytics` | Where the read-only analytics page and its JSON endpoints are |
 | `/env [list [filter]\|get KEY\|set KEY VALUE\|reset KEY\|reset-all]` | Show or change a configuration value for this run only - never written to `.env` |
@@ -1329,6 +1330,14 @@ is open, so the run waits `COINFLIP_BUSY_WAIT_MS` and re-asks, and gives up afte
 is left open and the run stops with `no-opponent` rather than piling up new ones.
 A wager above the balance is never sent at all.
 
+The server also rate-limits chat commands: a create sent too soon after the `/bal`
+that precedes it is answered with `Error | You are on cooldown`. That reply is
+recognised as its own event, so the run waits (`COINFLIP_CREATE_COOLDOWN_MS`,
+default **2500ms**, is left in front of every create) and asks again - a
+rate-limited create never happened, so it is retried rather than recorded as a
+loss. After `COINFLIP_COOLDOWN_MAX_RETRIES` consecutive refusals the run stops
+with `cooldown` and says to raise the setting.
+
 A flip whose result message and balance movement disagree is flagged `mismatched`
 and printed in red - that is precisely the evidence a rigged game would produce,
 and averaging it away would destroy it.
@@ -1354,6 +1363,7 @@ noise with a label. A p-value below `COINFLIP_SUSPICION_P` (default 0.01) is
 | --- | --- |
 | `data/coinflip-history.jsonl` | Append-only, one JSON object per flip: bot, timestamp, wager, opponent, result, balance before/after, delta, detection method, contradiction flag |
 | `data/coinflip-stats.json` | The derived summary (statistics, fairness verdict, recent flips) written after every run |
+| `data/coinflip-deep.json` | The dissection report (every section, bucket, p-value and q-value) rewritten whenever the history changes |
 | `data/timeseries.jsonl` | One sample per bot per interval (`kind: bot`) plus a fleet total (`kind: fleet`): shards, coins, balance, rank, ban state, inventory usage |
 | `data/timeseries-summary.json` | Bucketed series and the derived ban/rank events, ready to drop into a spreadsheet or a chart |
 
@@ -1369,6 +1379,42 @@ their own slower interval (`TIMESERIES_RANK_INTERVAL_MS`; `0` disables). Ban and
 rank *changes* are derived from the samples themselves, so there is no second
 event log to drift out of sync with the first.
 
+### The deep dissection
+
+`/coinflip-deep [BOT]` answers the questions the fairness verdict does not: it
+slices the same records fourteen ways and reports each bucket with its own
+sample size, 95% confidence interval and p-value.
+
+| Dissection | Question it answers |
+| --- | --- |
+| Runs and what follows them | after *k* losses, does the next flip win, and does a win arrive within two or three flips - one of them, or both of the next two? (a fair coin: 50%, 75%, 87.5% and 25%) |
+| The transition table | `P(win \| win)` vs `P(win \| loss)` as a two-proportion test, with the persistence odds ratio |
+| Run lengths | the observed streak lengths against the geometric distribution a fair coin gives (chi-square) |
+| Serial correlation | the correlation between a flip and the one 1-5 flips before it |
+| Wager vs balance | the wager as a share of the balance, bucketed, with a Cochran-Armitage trend test - does betting a bigger slice change the odds? |
+| Wager size | the same by absolute amount |
+| Rich or poor | win rate in the poorest quartile, the middle half and the richest quartile |
+| Time of day | 24 hour buckets plus four six-hour windows, using the **server's own clock** stamped on each result block |
+| Pace and idling | the gap since the previous flip on that bot |
+| Session position | flip #1 against #2-3, #4-6, #7-10, #11-20 and #21+ |
+| Chasing and staking | does a wager raised after a loss win more often? |
+| Opponents | each named opponent's win rate |
+| The money curve | net, deepest drawdown, the longest stretch below a high, the biggest single win and loss, and net per flip with its interval |
+| Per bot | each bot's rate, when more than one is recorded |
+
+Twenty ways of slicing one dataset will hand you a "significant" bucket every
+time, so every p-value in the family is corrected together with the
+Benjamini-Hochberg step-up and reported as a **q-value**. A bucket under
+`COINFLIP_DEEP_MIN_BUCKET` flips (default 20) is marked as an anecdote, and
+findings are only called out when they beat `COINFLIP_DEEP_Q` (default 0.05)
+*after* the correction. The hour of day comes from the timestamp the server puts
+on each result line; a record without one falls back to the local clock shifted
+by `COINFLIP_TZ_OFFSET_MIN`.
+
+The command prints the tables and the takeaways, writes the whole report to
+`data/coinflip-deep.json`, and shows up on the analytics page and at
+`/api/coinflip/deep?bot=Name`.
+
 ### The analytics page
 
 `ANALYTICS_PORT` (default **8080**) serves a read-only report built from those
@@ -1376,9 +1422,10 @@ files - no chart library, no CDN, and nothing leaving the machine:
 
 | Route | Contents |
 | --- | --- |
-| `/` | Coinflip statistics with the fairness verdict and confidence interval, fleet charts for shards / coins / balance / regent ranks / bans, the latest value per bot, and the ban and rank-change tables |
+| `/` | Coinflip statistics with the fairness verdict and confidence interval, the deep dissection (every bucket corrected for multiple testing), fleet charts for shards / coins / balance / regent ranks / bans, the latest value per bot, and the ban and rank-change tables |
 | `/api/analytics` | The whole report as JSON |
 | `/api/coinflip` | Coinflip statistics, fairness analysis and recent flips |
+| `/api/coinflip/deep[?bot=Name]` | The whole dissection as JSON - every bucket, p-value, q-value and takeaway |
 | `/api/timeseries?metric=shards&bucket=1h[&bot=Name]` | Bucketed points (last / min / max / mean per window) plus the summary |
 | `/api/export` | Every recorded flip and sample, for analysis elsewhere |
 
@@ -1410,7 +1457,7 @@ current value and changes one **for this run only**:
 | `COINFLIP_POLL_MS` | `15000` | How often the runner wakes to re-check |
 | `COINFLIP_SETTLE_MS` | `1500` | Quiet period that closes a multi-line result block |
 | `COINFLIP_MIN_SAMPLE` / `COINFLIP_SUSPICION_P` | `30` / `0.01` | Flips needed for a verdict / the p-value called suspicious |
-| `COINFLIP_FILE` / `COINFLIP_SUMMARY_FILE` | `data/coinflip-history.jsonl` / `data/coinflip-stats.json` | Where the history and the summary are written |
+| `COINFLIP_FILE` / `COINFLIP_SUMMARY_FILE` / `COINFLIP_DEEP_FILE` | `data/coinflip-history.jsonl` / `data/coinflip-stats.json` / `data/coinflip-deep.json` | Where the history, the summary and the dissection report are written |
 | `TIMESERIES_ENABLED` | `true` | Record samples at all |
 | `TIMESERIES_INTERVAL_MS` | `3600000` | Sampling interval (durations accept `30s`, `15m`, `1h`) |
 | `TIMESERIES_RANK_INTERVAL_MS` | `21600000` | Rank probe interval; `0` disables it |
@@ -1419,6 +1466,11 @@ current value and changes one **for this run only**:
 | `ANALYTICS_ENABLED` / `ANALYTICS_PORT` | `true` / `8080` | The read-only report and the port it listens on |
 | `ANALYTICS_OPEN` | `false` | Serve the report with no dashboard login |
 | `ANALYTICS_BUCKET_MS` | `3600000` | Chart bucket size (the API also takes `?bucket=30m`) |
+| `COINFLIP_CREATE_COOLDOWN_MS` | `2500` | Gap left after the `/bal` answer and before each `/coinflip create` - that balance check is what trips the server rate limit |
+| `COINFLIP_COOLDOWN_MAX_RETRIES` | `5` | Consecutive `you are on cooldown` replies tolerated before a run stops |
+| `COINFLIP_DEEP_MIN_BUCKET` | `20` | Flips a bucket needs before a dissection treats it as evidence rather than an anecdote |
+| `COINFLIP_DEEP_Q` | `0.05` | The false-discovery rate a finding must beat across every test in the family |
+| `COINFLIP_TZ_OFFSET_MIN` | local offset | Minutes from UTC used for hour of day when a record has no server timestamp |
 ## Project Files
 
 | File | Role |

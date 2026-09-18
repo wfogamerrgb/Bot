@@ -1,0 +1,866 @@
+'use strict'
+
+/**
+ * Deep dissection of the recorded coinflips.
+ *
+ * coinflip.js answers "is the game rigged?" with three tests. This answers the
+ * follow-up questions a data scientist asks of the same records — do streaks
+ * carry information, does betting a bigger share of the balance change the
+ * odds, does the hour matter, does idling help — the way a statistician would:
+ * every bucket gets its own sample size, confidence interval and p-value, and
+ * the whole family of tests is corrected together (Benjamini–Hochberg), because
+ * slicing one dataset twenty ways hands you a "significant" bucket every time.
+ *
+ * The statistical primitives come from coinflip.js so there is exactly one
+ * normal CDF, one Wilson interval and one definition of a resolved flip.
+ */
+
+const path = require('path')
+const { STREAK, resolvedRecords, wilsonInterval, normalCdf, twoSidedP, mean, stdev } = require(path.join(__dirname, 'coinflip'))
+
+// ── Deep dissection ──────────────────────────────────────────────────────────
+//
+// The fairness verdict answers "is the game rigged?" with three tests. This
+// answers the follow-up questions a data scientist actually asks of the same
+// records — do streaks carry information, does betting a bigger share of the
+// balance change the odds, does the hour matter, does idling help — and it
+// answers them the way a statistician would: every bucket gets its own sample
+// size, confidence interval and p-value, and the whole family of tests is then
+// corrected together (Benjamini–Hochberg), because slicing one dataset twenty
+// ways will hand you a "significant" bucket every single time if you do not.
+
+function pctText (value, digits = 1) {
+  return value == null || !Number.isFinite(value) ? 'n/a' : `${(value * 100).toFixed(digits)}%`
+}
+
+function sumOf (values) {
+  let total = 0
+  for (const value of values) total += Number(value) || 0
+  return total
+}
+
+/** What a record actually did to the balance — delta when known, else ±wager. */
+function recordNet (row) {
+  if (row.delta != null && Number.isFinite(Number(row.delta))) return Number(row.delta)
+  if (row.result === STREAK.WON) return Number(row.wager) || 0
+  if (row.result === STREAK.LOST) return -(Number(row.wager) || 0)
+  return 0
+}
+
+function quantileSorted (sorted, p) {
+  if (!sorted.length) return null
+  const position = (sorted.length - 1) * p
+  const low = Math.floor(position)
+  const high = Math.ceil(position)
+  if (low === high) return sorted[low]
+  return sorted[low] + (sorted[high] - sorted[low]) * (position - low)
+}
+
+function quantile (values, p) {
+  const sorted = values.filter(v => Number.isFinite(v)).sort((a, b) => a - b)
+  if (!sorted.length) return null
+  const position = (sorted.length - 1) * p
+  const low = Math.floor(position)
+  const high = Math.ceil(position)
+  if (low === high) return sorted[low]
+  return sorted[low] + (sorted[high] - sorted[low]) * (position - low)
+}
+
+/** Wilson–Hilferty chi-square tail — accurate enough to rank findings by. */
+function chiSquareP (x, df = 1) {
+  if (!Number.isFinite(x) || x <= 0 || !(df >= 1)) return null
+  const z = (Math.pow(x / df, 1 / 3) - (1 - 2 / (9 * df))) / Math.sqrt(2 / (9 * df))
+  return Math.max(0, Math.min(1, 1 - normalCdf(z)))
+}
+
+function chiSquare2x2 (a, b, c, d) {
+  const n = a + b + c + d
+  const denom = (a + b) * (c + d) * (a + c) * (b + d)
+  if (!n || !denom) return { chi2: null, p: null }
+  const chi2 = (n * (a * d - b * c) ** 2) / denom
+  return { chi2, p: chiSquareP(chi2, 1) }
+}
+
+/** Two-sided p for `wins` of `n` against an expected rate (0.5 by default). */
+function rateTest (wins, n, expected = 0.5) {
+  if (!n || !(expected > 0 && expected < 1)) return { z: null, p: null }
+  const z = (wins - n * expected) / Math.sqrt(n * expected * (1 - expected))
+  return { z, p: twoSidedP(z) }
+}
+
+/** Are two win rates actually different, or is the gap just sample noise? */
+function twoProportionTest (wins1, n1, wins2, n2) {
+  if (!n1 || !n2) return { z: null, p: null, diff: null }
+  const p1 = wins1 / n1
+  const p2 = wins2 / n2
+  const pooled = (wins1 + wins2) / (n1 + n2)
+  const se = Math.sqrt(pooled * (1 - pooled) * (1 / n1 + 1 / n2))
+  if (!(se > 0)) return { z: null, p: null, diff: p1 - p2 }
+  const z = (p1 - p2) / se
+  return { z, p: twoSidedP(z), diff: p1 - p2 }
+}
+
+/**
+ * Benjamini–Hochberg step-up. With twenty dissections, "p < 0.05" is a promise
+ * the data cannot keep; the q-value is the honest version, and every finding is
+ * reported next to the number of tests that were run to find it.
+ */
+function bhAdjust (pvalues, q = 0.05) {
+  const ranked = pvalues.map((p, i) => ({ p, i })).filter(entry => entry.p != null).sort((a, b) => a.p - b.p)
+  const m = ranked.length
+  const out = new Array(pvalues.length).fill(null)
+  let running = 1
+  for (let k = m - 1; k >= 0; k--) {
+    const adjusted = Math.min(running, (ranked[k].p * m) / (k + 1))
+    running = adjusted
+    out[ranked[k].i] = { q: adjusted, significant: adjusted <= q }
+  }
+  return out
+}
+
+function rateFromCounts (label, n, wins, extra = {}) {
+  const expected = extra.expected == null ? 0.5 : extra.expected
+  const test = rateTest(wins, n, expected)
+  return {
+    label,
+    n,
+    wins,
+    losses: n - wins,
+    rate: n ? wins / n : null,
+    ci: wilsonInterval(wins, n),
+    z: test.z,
+    p: test.p,
+    expected,
+    net: extra.net == null ? null : extra.net,
+    wagered: extra.wagered == null ? null : extra.wagered,
+    score: extra.score == null ? null : extra.score,
+    note: extra.note || '',
+    lowSample: false
+  }
+}
+
+function rateRow (label, rows, extra = {}) {
+  return rateFromCounts(label, rows.length, rows.filter(row => row.result === STREAK.WON).length, {
+    net: sumOf(rows.map(recordNet)),
+    wagered: sumOf(rows.map(row => Number(row.wager) || 0)),
+    ...extra
+  })
+}
+
+/**
+ * `rows` in the order they happened — every sequential dissection needs this.
+ * `alreadySorted` skips the sort (and the copy) when the caller has the ordered
+ * array to hand, which is the common case inside deepAnalysis — a copy of
+ * 200,000 records is not free.
+ */
+function inTimeOrder (records, alreadySorted = false) {
+  if (alreadySorted) return records
+  const resolved = resolvedRecords(records)
+  // An append-only history is already in order, so the sort is only paid for
+  // when a record really is out of place — one scan instead of a full sort.
+  for (let i = 1; i < resolved.length; i++) {
+    if ((resolved[i].ts || 0) < (resolved[i - 1].ts || 0)) return resolved.sort((a, b) => (a.ts || 0) - (b.ts || 0))
+  }
+  return resolved
+}
+
+/** edges = [a, b] gives three buckets: < a, a–b, ≥ b. */
+function bucketIndex (value, edges) {
+  if (value == null || !Number.isFinite(value)) return null
+  for (let i = 0; i < edges.length; i++) if (value < edges[i]) return i
+  return edges.length
+}
+
+function pushBucket (groups, index, row) {
+  if (index == null) return
+  const bucket = groups.get(index)
+  if (bucket) bucket.push(row)
+  else groups.set(index, [row])
+}
+
+/** Buckets in edge order, each summarised as a rate row. */
+function finishBuckets (groups, labelOf) {
+  return [...groups.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([index, rows]) => rateRow(labelOf(index), rows))
+}
+
+/** Groups `{ row, key }` pairs — for a key that is derived, like a time gap. */
+function bucketEntries (entries, edges, labelOf) {
+  const groups = new Map()
+  for (const entry of entries) pushBucket(groups, bucketIndex(entry.key, edges), entry.row)
+  return finishBuckets(groups, labelOf)
+}
+
+/** Groups records directly, so a plain numeric key needs no pair allocation. */
+function bucketRecords (records, keyOf, edges, labelOf) {
+  const groups = new Map()
+  for (const row of records) pushBucket(groups, bucketIndex(keyOf(row), edges), row)
+  return finishBuckets(groups, labelOf)
+}
+
+/**
+ * Cochran–Armitage trend test: does the win rate drift as the bucketed variable
+ * rises? This is the one that answers "higher bet relative to balance → higher
+ * chance?" directly, instead of eyeballing three bucket percentages.
+ */
+function trendTest (rows) {
+  const scored = rows.filter(row => row.n > 0 && Number.isFinite(row.score))
+  const n = sumOf(scored.map(row => row.n))
+  const wins = sumOf(scored.map(row => row.wins))
+  if (!n || !wins || wins === n || scored.length < 2) return { z: null, p: null, direction: null }
+  const sumNx = sumOf(scored.map(row => row.n * row.score))
+  const sumNx2 = sumOf(scored.map(row => row.n * row.score * row.score))
+  const meanX = sumNx / n
+  const varianceX = sumNx2 / n - meanX * meanX
+  const pBar = wins / n
+  const numerator = sumOf(scored.map(row => row.score * (row.wins - row.n * pBar)))
+  const denominator = Math.sqrt(pBar * (1 - pBar) * n * varianceX)
+  if (!(denominator > 0)) return { z: null, p: null, direction: null }
+  const z = numerator / denominator
+  return { z, p: twoSidedP(z), direction: z > 0 ? 'more wins as it rises' : 'fewer wins as it rises' }
+}
+
+/**
+ * What follows a run: the next flip, a win somewhere in the next few flips, and
+ * "after two losses, did both of the next two win?" — the last one is a window
+ * question, not a single-flip one, and a fair coin gives it 25%.
+ */
+function conditionalStreakRows (outcomes, maxRun = 6, horizon = 3) {
+  const rows = []
+  const horizons = [...new Set([2, horizon])].filter(h => h >= 1).sort((a, b) => a - b)
+  for (const kind of [STREAK.LOST, STREAK.WON]) {
+    const verb = kind === STREAK.WON ? 'win' : 'loss'
+    for (let k = 1; k <= maxRun; k++) {
+      let n = 0
+      let wins = 0
+      const windows = new Map()
+      for (let i = k; i < outcomes.length; i++) {
+        let match = true
+        for (let j = 1; j <= k; j++) if (outcomes[i - j] !== kind) { match = false; break }
+        if (!match) continue
+        n++
+        if (outcomes[i] === STREAK.WON) wins++
+        for (const h of horizons) {
+          if (i + h > outcomes.length) continue
+          let slot = windows.get(h)
+          if (!slot) { slot = { n: 0, any: 0, both: 0 }; windows.set(h, slot) }
+          slot.n++
+          let any = false
+          let both = true
+          for (let x = i; x < i + h; x++) {
+            if (outcomes[x] === STREAK.WON) any = true
+            else both = false
+          }
+          if (any) slot.any++
+          if (both) slot.both++
+        }
+      }
+      if (n >= 5) rows.push(rateFromCounts(`after ${k}× ${verb}, the next flip won`, n, wins, { note: `${kind} run of ${k}` }))
+      for (const h of horizons) {
+        const slot = windows.get(h)
+        if (!slot || slot.n < 5) continue
+        rows.push(rateFromCounts(`after ${k}× ${verb}, a win within ${h} flips`, slot.n, slot.any, { expected: 1 - Math.pow(0.5, h) }))
+        if (h === 2) rows.push(rateFromCounts(`after ${k}× ${verb}, both of the next 2 flips won`, slot.n, slot.both, { expected: 0.25 }))
+      }
+    }
+  }
+  return rows
+}
+
+/** Observed run lengths against the geometric distribution a fair coin gives. */
+function runLengthAnalysis (outcomes, maxBucket = 6) {
+  const lengths = []
+  for (let i = 0; i < outcomes.length;) {
+    let j = i
+    while (j < outcomes.length && outcomes[j] === outcomes[i]) j++
+    lengths.push(j - i)
+    i = j
+  }
+  if (!lengths.length) return { total: 0, observed: [], expected: [], chi2: null, df: null, p: null }
+  const observed = new Array(maxBucket).fill(0)
+  for (const length of lengths) observed[Math.min(length, maxBucket) - 1]++
+  const probabilities = []
+  for (let l = 1; l < maxBucket; l++) probabilities.push(Math.pow(0.5, l))
+  probabilities.push(Math.pow(0.5, maxBucket - 1))
+  const expected = probabilities.map(p => p * lengths.length)
+  let chi2 = 0
+  let df = -1
+  for (let i = 0; i < observed.length; i++) {
+    if (expected[i] < 5) continue
+    chi2 += ((observed[i] - expected[i]) ** 2) / expected[i]
+    df++
+  }
+  return {
+    total: lengths.length,
+    observed,
+    expected,
+    chi2: df > 0 ? chi2 : null,
+    df: df > 0 ? df : null,
+    p: df > 0 ? chiSquareP(chi2, df) : null
+  }
+}
+
+/** The 2×2 transition table: is the current flip independent of the last one? */
+function markovAnalysis (outcomes) {
+  const counts = { ww: 0, wl: 0, lw: 0, ll: 0 }
+  for (let i = 1; i < outcomes.length; i++) {
+    const previous = outcomes[i - 1]
+    const current = outcomes[i]
+    if (previous === STREAK.WON) counts[current === STREAK.WON ? 'ww' : 'wl']++
+    else counts[current === STREAK.WON ? 'lw' : 'll']++
+  }
+  const afterWin = counts.ww + counts.wl
+  const afterLoss = counts.lw + counts.ll
+  const table = chiSquare2x2(counts.ww, counts.wl, counts.lw, counts.ll)
+  const compare = twoProportionTest(counts.ww, afterWin, counts.lw, afterLoss)
+  return {
+    counts,
+    nAfterWin: afterWin,
+    nAfterLoss: afterLoss,
+    pWinAfterWin: afterWin ? counts.ww / afterWin : null,
+    pWinAfterLoss: afterLoss ? counts.lw / afterLoss : null,
+    chi2: table.chi2,
+    p: table.p,
+    compareP: compare.p,
+    diff: compare.diff,
+    df: 1,
+    oddsRatio: counts.ww && counts.ll && counts.wl && counts.lw
+      ? (counts.ww * counts.ll) / (counts.wl * counts.lw)
+      : null
+  }
+}
+
+/** Serial correlation of the outcomes at a lag: do results echo each other? */
+function autocorrelation (outcomes, lag) {
+  const x = []
+  const y = []
+  for (let i = 0; i + lag < outcomes.length; i++) {
+    x.push(outcomes[i] === STREAK.WON ? 1 : 0)
+    y.push(outcomes[i + lag] === STREAK.WON ? 1 : 0)
+  }
+  if (x.length < 10) return { lag, n: x.length, r: null, p: null }
+  const mx = mean(x)
+  const my = mean(y)
+  let numerator = 0
+  let dx = 0
+  let dy = 0
+  for (let i = 0; i < x.length; i++) {
+    numerator += (x[i] - mx) * (y[i] - my)
+    dx += (x[i] - mx) ** 2
+    dy += (y[i] - my) ** 2
+  }
+  const r = dx && dy ? numerator / Math.sqrt(dx * dy) : null
+  return { lag, n: x.length, r, p: r == null ? null : twoSidedP(r * Math.sqrt(x.length)) }
+}
+
+/**
+ * The hour a flip happened in — the server's own clock when the result block
+ * carried a timestamp, else the local clock shifted by the configured offset.
+ */
+function hourOfRecord (row, tzOffsetMinutes) {
+  if (row.serverHour != null && Number.isFinite(Number(row.serverHour))) {
+    return { hour: ((Number(row.serverHour) % 24) + 24) % 24, source: 'server' }
+  }
+  if (!row.ts) return null
+  const shifted = new Date(Number(row.ts) + tzOffsetMinutes * 60000)
+  return { hour: shifted.getUTCHours(), source: 'local' }
+}
+
+/** The gap since the previous flip on the same bot: does idling help? */
+function paceEntries (records, alreadySorted = false) {
+  const last = new Map()
+  const entries = []
+  for (const row of inTimeOrder(records, alreadySorted)) {
+    const key = row.bot || ''
+    const previous = last.get(key)
+    last.set(key, row)
+    if (!previous) continue
+    const gap = (row.ts || 0) - (previous.ts || 0)
+    if (gap < 0 || gap > 24 * 3600000) continue
+    entries.push({ row, key: gap })
+  }
+  return entries
+}
+
+/** Did the wager change between consecutive flips of the same session? */
+function martingaleEntries (records, alreadySorted = false) {
+  const bySession = new Map()
+  for (const row of inTimeOrder(records, alreadySorted)) {
+    const key = row.sessionId || row.bot || ''
+    if (!bySession.has(key)) bySession.set(key, [])
+    bySession.get(key).push(row)
+  }
+  const entries = []
+  const afterLoss = []
+  for (const rows of bySession.values()) {
+    for (let i = 1; i < rows.length; i++) {
+      const previous = rows[i - 1]
+      const current = rows[i]
+      const delta = (Number(current.wager) || 0) - (Number(previous.wager) || 0)
+      const direction = delta > 0 ? 'raised' : delta < 0 ? 'lowered' : 'same'
+      entries.push({ row: current, key: direction === 'raised' ? 1 : direction === 'same' ? 0 : -1, direction })
+      if (previous.result === STREAK.LOST && direction === 'raised') afterLoss.push(current)
+    }
+  }
+  return { entries, afterLoss }
+}
+
+function moneyCurve (ordered) {
+  let cumulative = 0
+  let peak = 0
+  let maxDrawdown = 0
+  let belowPeak = 0 // flips spent under the running high
+  let currentRun = 0
+  let longestDrawdown = 0
+  let longestDrawdownStart = null
+  let worst = null
+  let best = null
+  ordered.forEach((row, index) => {
+    const net = recordNet(row)
+    if (!worst || net < worst.net) worst = { net, row, index }
+    if (!best || net > best.net) best = { net, row, index }
+    cumulative += net
+    if (cumulative >= peak) {
+      // A new high ends the current stretch below it.
+      peak = cumulative
+      if (currentRun > longestDrawdown) { longestDrawdown = currentRun; longestDrawdownStart = index - currentRun }
+      currentRun = 0
+    } else {
+      currentRun += 1
+      belowPeak += 1
+      if (peak - cumulative > maxDrawdown) maxDrawdown = peak - cumulative
+    }
+  })
+  if (currentRun > longestDrawdown) { longestDrawdown = currentRun; longestDrawdownStart = ordered.length - currentRun }
+  const nets = ordered.map(recordNet)
+  const average = mean(nets)
+  const sd = stdev(nets, average)
+  const se = sd != null && nets.length ? sd / Math.sqrt(nets.length) : null
+  return {
+    total: cumulative,
+    peak,
+    maxDrawdown,
+    currentDrawdown: peak - cumulative,
+    belowPeak,
+    longestDrawdown,
+    longestDrawdownStart,
+    atHigh: currentRun === 0,
+    biggestWin: best ? { net: best.net, at: best.row.ts, bot: best.row.bot } : null,
+    biggestLoss: worst ? { net: worst.net, at: worst.row.ts, bot: worst.row.bot } : null,
+    netPerFlip: average,
+    netCi: se == null ? null : { low: average - 1.96 * se, high: average + 1.96 * se }
+  }
+}
+
+/**
+ * Every dissection, in one report. `sections` is a uniform shape on purpose, so
+ * the chat digest and the HTML page render the same numbers without either of
+ * them owning the statistics.
+ */
+function deepAnalysis (records = [], opts = {}) {
+  const q = opts.q == null ? 0.05 : opts.q
+  const minBucket = opts.minBucket == null ? 20 : opts.minBucket
+  const maxRun = opts.maxRun == null ? 6 : opts.maxRun
+  const horizon = opts.horizon == null ? 3 : opts.horizon
+  const tzOffsetMinutes = opts.tzOffsetMinutes == null ? -new Date().getTimezoneOffset() : opts.tzOffsetMinutes
+
+  const ordered = inTimeOrder(records)
+  const outcomes = ordered.map(row => row.result)
+  const resolved = ordered.length
+  const wins = outcomes.filter(o => o === STREAK.WON).length
+  const overall = rateFromCounts('all resolved flips', resolved, wins, { net: sumOf(ordered.map(recordNet)) })
+
+  // The hour is resolved once per record. Deriving it again inside each bucket
+  // (and inside all four windows) would allocate a quarter of a million objects
+  // for no extra information.
+  const hours = ordered.map(row => hourOfRecord(row, tzOffsetMinutes))
+  const knownHours = hours.filter(Boolean)
+  const hourSource = !knownHours.length ? 'none'
+    : knownHours.every(h => h.source === 'server') ? 'server'
+      : knownHours.every(h => h.source === 'local') ? 'local' : 'mixed'
+
+  const sections = []
+
+  // 1 — streaks.
+  const streakRows = conditionalStreakRows(outcomes, maxRun, horizon)
+  const streakWorst = [...streakRows].sort((a, b) => (a.p == null ? 1 : a.p) - (b.p == null ? 1 : b.p))[0]
+  sections.push({
+    key: 'streak',
+    title: 'Runs and what follows them',
+    question: 'Does a run of losses (or wins) change the next flip, and does N losses usually become a win within a few flips?',
+    summary: streakWorst
+      ? `Strongest row: ${streakWorst.label} — ${pctText(streakWorst.rate)} over n=${streakWorst.n} (p=${streakWorst.p == null ? 'n/a' : streakWorst.p.toExponential(3)})`
+      : 'Not enough runs to test.',
+    rows: streakRows
+  })
+
+  // 2 — the transition table.
+  const markov = markovAnalysis(outcomes)
+  const markovRows = [
+    rateFromCounts('after a win → win', markov.nAfterWin, markov.counts.ww, { note: `P(win | win) = ${pctText(markov.pWinAfterWin, 2)}` }),
+    rateFromCounts('after a loss → win', markov.nAfterLoss, markov.counts.lw, { note: `P(win | loss) = ${pctText(markov.pWinAfterLoss, 2)}` })
+  ]
+  sections.push({
+    key: 'markov',
+    title: 'Does the previous flip predict the next one?',
+    question: 'If the last flip was a loss, is the next one different from when the last flip was a win?',
+    summary: markov.diff == null
+      ? 'Not enough consecutive flips.'
+      : `P(win | win) ${pctText(markov.pWinAfterWin, 2)} vs P(win | loss) ${pctText(markov.pWinAfterLoss, 2)} — difference ${(markov.diff * 100).toFixed(2)} pp (p=${markov.p == null ? 'n/a' : markov.p.toFixed(4)}); persistence odds ratio ${markov.oddsRatio == null ? 'n/a' : markov.oddsRatio.toFixed(3)}`,
+    rows: markovRows,
+    extra: { chi2: markov.chi2, chi2p: markov.p, df: markov.df }
+  })
+
+  // 3 — run lengths against the geometric distribution.
+  const runLengths = runLengthAnalysis(outcomes)
+  const runRows = runLengths.observed.map((count, i) => {
+    const length = i + 1
+    const label = length >= runLengths.observed.length ? `${length}+ in a row` : `exactly ${length} in a row`
+    return rateFromCounts(label, runLengths.total, count, {
+      expected: runLengths.expected[i] / (runLengths.total || 1),
+      note: `expected ${runLengths.expected[i].toFixed(1)}`
+    })
+  })
+  sections.push({
+    key: 'runs',
+    title: 'How long the runs are',
+    question: 'A fair coin self-corrects by chopping streaks off; a rigged one lets them run.',
+    summary: runLengths.p == null
+      ? `${runLengths.total} run(s) — too few to compare with the geometric expectation.`
+      : `${runLengths.total} runs vs a geometric expectation (χ²=${runLengths.chi2.toFixed(2)}, df=${runLengths.df}, p=${runLengths.p.toFixed(4)})`,
+    rows: runRows,
+    extra: { chi2: runLengths.chi2, chi2p: runLengths.p, df: runLengths.df }
+  })
+
+  // 4 — serial correlation at several lags.
+  const lags = []
+  for (let lag = 1; lag <= (opts.maxLag == null ? 5 : opts.maxLag); lag++) lags.push(autocorrelation(outcomes, lag))
+  // A lag row is a correlation rather than a win rate, so it does not go
+  // through rateFromCounts — but its p-value belongs to the same family.
+  const lagRows = lags.map(entry => ({
+    label: `lag ${entry.lag}`,
+    n: entry.n,
+    wins: null,
+    losses: null,
+    rate: null,
+    ci: null,
+    z: null,
+    p: entry.p,
+    expected: null,
+    net: null,
+    wagered: null,
+    score: null,
+    note: entry.r == null ? 'not enough pairs' : `r = ${entry.r.toFixed(4)}`,
+    lowSample: false
+  }))
+  sections.push({
+    key: 'lag',
+    title: 'Serial correlation',
+    question: 'Is any flip correlated with the one N flips before it?',
+    summary: lags.filter(l => l.p != null).length
+      ? lags.filter(l => l.p != null).map(l => `lag ${l.lag}: r=${l.r.toFixed(3)} (p=${l.p.toFixed(3)})`).join(' · ')
+      : 'Not enough flips to correlate.',
+    rows: lagRows
+  })
+
+  // 5 — the share of the balance staked.
+  const ratioEdges = [0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.35, 0.5, 1]
+  const ratioLabel = (index) => {
+    if (index === 0) return `< 0.5% of balance`
+    if (index >= ratioEdges.length) return `≥ 100% of balance`
+    return `${(ratioEdges[index - 1] * 100).toFixed(1)}–${(ratioEdges[index] * 100).toFixed(1)}% of balance`
+  }
+  const ratioScores = (index) => {
+    if (index === 0) return ratioEdges[0] / 2
+    if (index >= ratioEdges.length) return ratioEdges[ratioEdges.length - 1] * 1.5
+    return (ratioEdges[index - 1] + ratioEdges[index]) / 2
+  }
+  const ratioRows = bucketRecords(ordered, row => (
+    Number(row.balanceBefore) > 0 && Number(row.wager) > 0 ? Number(row.wager) / Number(row.balanceBefore) : null
+  ), ratioEdges, ratioLabel)
+  // The trend test needs a numeric position per bucket, so the bucket order is
+  // the score — not the label, which is a range written for a human.
+  ratioRows.forEach((row, i) => { row.score = ratioScores(i) })
+  const ratioTrend = trendTest(ratioRows)
+  // One pass for the mean share staked either side of the coin.
+  let winShare = 0
+  let winShareCount = 0
+  let lossShare = 0
+  let lossShareCount = 0
+  for (const row of ordered) {
+    const balance = Number(row.balanceBefore)
+    const wager = Number(row.wager)
+    if (!(balance > 0) || !(wager > 0)) continue
+    if (row.result === STREAK.WON) { winShare += wager / balance; winShareCount++ }
+    else { lossShare += wager / balance; lossShareCount++ }
+  }
+  sections.push({
+    key: 'ratio',
+    title: 'Wager as a share of the balance',
+    question: 'Does betting a bigger slice of the balance change the odds?',
+    summary: ratioTrend.p == null
+      ? 'Needs a balance before each flip (recorded from the next run onwards).'
+      : `Trend across buckets: ${ratioTrend.direction} (z=${ratioTrend.z.toFixed(3)}, p=${ratioTrend.p.toFixed(4)}). Mean share staked: ${pctText(winShare / Math.max(1, winShareCount), 2)} when winning vs ${pctText(lossShare / Math.max(1, lossShareCount), 2)} when losing.`,
+    rows: ratioRows,
+    extra: { trend: ratioTrend }
+  })
+
+  // 6 — absolute wager size.
+  const wagerEdges = [10000, 50000, 250000, 1000000, 5000000]
+  const wagerRows = bucketRecords(ordered, row => Number(row.wager), wagerEdges, (index) => (
+    index === 0 ? '< 10k' : index >= wagerEdges.length ? '≥ 5m' : `${wagerEdges[index - 1] / 1000}k–${wagerEdges[index] / 1000}k`
+  ))
+  wagerRows.forEach((row, i) => { row.score = i })
+  sections.push({
+    key: 'wager',
+    title: 'Wager size (absolute)',
+    question: 'Do bigger bets win less often?',
+    summary: trendTest(wagerRows).p == null
+      ? 'Not enough flips spread across wager sizes.'
+      : `Trend: ${trendTest(wagerRows).direction} (p=${trendTest(wagerRows).p.toFixed(4)})`,
+    rows: wagerRows,
+    extra: { trend: trendTest(wagerRows) }
+  })
+
+  // 7 — how rich the bot was at the time.
+  const balances = ordered.map(row => Number(row.balanceBefore)).filter(v => Number.isFinite(v) && v > 0)
+  const sortedBalances = balances.length ? balances.slice().sort((a, b) => a - b) : []
+  const balanceEdges = balances.length >= 4
+    ? [quantileSorted(sortedBalances, 0.25), quantileSorted(sortedBalances, 0.75)]
+    : []
+  const balanceRows = balanceEdges.length === 2 && balanceEdges[0] !== balanceEdges[1]
+    ? bucketRecords(ordered, row => (Number(row.balanceBefore) > 0 ? Number(row.balanceBefore) : null), balanceEdges, (index) => (
+        index === 0 ? 'poorest quartile' : index === 1 ? 'middle half' : 'richest quartile'
+      ))
+    : []
+  balanceRows.forEach((row, i) => { row.score = i })
+  sections.push({
+    key: 'balance',
+    title: 'Does being rich or poor matter?',
+    question: 'Is the win rate different when the bot is on its richest vs its poorest days?',
+    summary: balanceRows.length
+      ? `Quartile boundaries: ${balanceEdges.map(v => v.toLocaleString(undefined, { maximumFractionDigits: 0 })).join(' / ')}`
+      : 'Not enough recorded balances yet.',
+    rows: balanceRows
+  })
+
+  // 8 — the hour of day.
+  const hourBuckets = new Map()
+  for (let i = 0; i < ordered.length; i++) {
+    if (!hours[i]) continue
+    pushBucket(hourBuckets, hours[i].hour, ordered[i])
+  }
+  const hourKeys = [...hourBuckets.keys()].sort((a, b) => a - b)
+  const hourRows = finishBuckets(hourBuckets, (hour) => `${String(hour).padStart(2, '0')}:00–${String(hour).padStart(2, '0')}:59`)
+    .map((row, i) => { row.score = hourKeys[i]; return row })
+  const windows = [['00:00–05:59', 0, 6], ['06:00–11:59', 6, 12], ['12:00–17:59', 12, 18], ['18:00–23:59', 18, 24]]
+  const windowRows = windows.map(([label, from, to]) => rateRow(label, ordered.filter((row, i) => hours[i] && hours[i].hour >= from && hours[i].hour < to), { score: from })).filter(row => row.n > 0)
+  const bestHour = [...hourRows].filter(row => row.p != null).sort((a, b) => a.p - b.p)[0]
+  sections.push({
+    key: 'hour',
+    title: 'Time of day',
+    question: 'Do some hours win more? People gaming the system would show up here.',
+    summary: hourSource === 'none'
+      ? 'No timestamps recorded.'
+      : `${hourRows.length} hour bucket(s) on the ${hourSource} clock${bestHour ? `; most extreme ${bestHour.label} at ${pctText(bestHour.rate)} (n=${bestHour.n}, p=${bestHour.p.toFixed(4)}, before correction)` : ''}. With 24 buckets, expect at least one to look surprising by chance alone.`,
+    rows: [...windowRows, ...hourRows],
+    extra: { hourSource }
+  })
+
+  // 9 — pace.
+  const paceValues = paceEntries(ordered, true)
+  const paceEdges = [5000, 15000, 60000, 300000, 1800000]
+  const paceRows = bucketEntries(paceValues, paceEdges, (index) => (
+    index === 0 ? 'under 5s later' : index === 1 ? '5–15s later' : index === 2 ? '15–60s later' : index === 3 ? '1–5 min later' : index === 4 ? '5–30 min later' : '30+ min later'
+  ))
+  paceRows.forEach((row, i) => { row.score = i })
+  sections.push({
+    key: 'pace',
+    title: 'Pace and idling',
+    question: 'Does leaving a longer gap between flips change the odds?',
+    summary: paceRows.length
+      ? ['Gap since the previous flip on the same bot.', trendTest(paceRows).p == null ? '' : `Trend: ${trendTest(paceRows).direction} (p=${trendTest(paceRows).p.toFixed(4)})`].filter(Boolean).join(' ')
+      : 'Not enough flips in a sequence yet.',
+    rows: paceRows,
+    extra: { trend: trendTest(paceRows) }
+  })
+
+  // 10 — where in the session the flip fell.
+  const positionEdges = [1, 3, 6, 10, 20]
+  const positionRows = bucketRecords(ordered, row => (Number.isFinite(Number(row.index)) ? Number(row.index) : null), positionEdges, (index) => (
+    index === 0 ? 'flip #1' : index === 1 ? 'flips #2–3' : index === 2 ? 'flips #4–6' : index === 3 ? 'flips #7–10' : index === 4 ? 'flips #11–20' : 'flips #21+'
+  ))
+  positionRows.forEach((row, i) => { row.score = i })
+  sections.push({
+    key: 'position',
+    title: 'Position in the session',
+    question: 'Does the first flip behave differently from the tenth?',
+    summary: positionRows.length > 1
+      ? `First flip ${pctText(positionRows[0].rate)} (n=${positionRows[0].n}) vs the rest. ${trendTest(positionRows).p == null ? '' : `Trend: ${trendTest(positionRows).direction} (p=${trendTest(positionRows).p.toFixed(4)})`}`
+      : 'Not enough flips with a session position yet.',
+    rows: positionRows,
+    extra: { trend: trendTest(positionRows) }
+  })
+
+  // 11 — martingale behaviour.
+  const { entries: martingale, afterLoss } = martingaleEntries(ordered, true)
+  const martingaleRows = bucketEntries(martingale.map(entry => ({ row: entry.row, key: entry.key })), [-0.5, 0.5], (index) => (
+    index === 0 ? 'wager was lowered' : index === 1 ? 'wager was unchanged' : 'wager was raised'
+  ))
+  martingaleRows.forEach((row, i) => { row.score = i })
+  const afterLossRows = afterLoss.length >= 5 ? [rateRow('after a loss, the wager was raised', afterLoss)] : []
+  sections.push({
+    key: 'martingale',
+    title: 'Chasing and staking patterns',
+    question: 'When the bet is raised after a loss, does it win more often?',
+    summary: afterLoss.length
+      ? `${afterLoss.length} flip(s) followed a loss with a raised wager and won ${pctText(afterLoss.filter(r => r.result === STREAK.WON).length / afterLoss.length)} of the time.`
+      : 'No raised-after-a-loss flips recorded.',
+    rows: [...martingaleRows, ...afterLossRows]
+  })
+
+  // 12 — opponents.
+  const byOpponent = new Map()
+  for (const row of ordered) {
+    const key = row.opponent || '(unnamed)'
+    if (!byOpponent.has(key)) byOpponent.set(key, [])
+    byOpponent.get(key).push(row)
+  }
+  const opponentRows = [...byOpponent.entries()]
+    .map(([name, rows]) => rateRow(name, rows))
+    .sort((a, b) => b.n - a.n)
+  const worstOpponent = [...opponentRows].filter(row => row.p != null && row.n >= minBucket).sort((a, b) => a.p - b.p)[0]
+  sections.push({
+    key: 'opponent',
+    title: 'Opponents',
+    question: 'Is one opponent beating us far more than the coin says they should?',
+    summary: opponentRows.length
+      ? `${opponentRows.length} named opponent(s); in a fair game any of them landing at p<0.05 is normal — the most extreme with n≥${minBucket} is ${worstOpponent ? `${worstOpponent.label} at ${pctText(worstOpponent.rate)} (n=${worstOpponent.n}, p=${worstOpponent.p.toFixed(4)}, before correction)` : 'not large enough yet'}`
+      : 'No named opponents recorded.',
+    rows: opponentRows
+  })
+
+  // 13 — the money curve.
+  const curve = moneyCurve(ordered)
+  sections.push({
+    key: 'money',
+    title: 'The money curve',
+    question: 'What does the cumulative net actually look like — drawdowns, swings, and drift?',
+    summary: `Net ${curve.total.toFixed(2)} over ${resolved} flip(s); deepest drawdown ${curve.maxDrawdown.toFixed(2)} (longest stretch below a high: ${curve.longestDrawdown} flips, ${curve.belowPeak} flips in total); currently ${curve.atHigh ? 'at a new high' : `${curve.currentDrawdown.toFixed(2)} below the high`}; net per flip ${curve.netPerFlip == null ? 'n/a' : curve.netPerFlip.toFixed(2)}${curve.netCi ? ` (95% CI ${curve.netCi.low.toFixed(2)}…${curve.netCi.high.toFixed(2)})` : ''}`,
+    rows: [],
+    extra: { curve }
+  })
+
+  // 14 — per bot, which is only a dissection when there is a fleet.
+  const byBot = new Map()
+  for (const row of ordered) {
+    const key = row.bot || '(unknown)'
+    if (!byBot.has(key)) byBot.set(key, [])
+    byBot.get(key).push(row)
+  }
+  const botRows = [...byBot.entries()].map(([name, rows]) => rateRow(name, rows)).sort((a, b) => b.n - a.n)
+  if (botRows.length > 1) {
+    sections.push({
+      key: 'bot',
+      title: 'Per bot',
+      question: 'Is one bot winning far more than the others?',
+      summary: botRows.map(row => `${row.label}: ${pctText(row.rate)} (n=${row.n})`).join(' · '),
+      rows: botRows
+    })
+  }
+
+  // One family of tests, one correction. Every bucket p-value above is in here.
+  const flat = []
+  for (const section of sections) {
+    for (const row of section.rows) flat.push(row)
+    if (section.extra && section.extra.chi2p != null) flat.push({ p: section.extra.chi2p })
+    if (section.extra && section.extra.trend && section.extra.trend.p != null) flat.push({ p: section.extra.trend.p })
+  }
+  const adjusted = bhAdjust(flat.map(row => row.p), q)
+  flat.forEach((row, i) => {
+    if (adjusted[i]) { row.q = adjusted[i].q; row.significant = adjusted[i].significant }
+    if (row.n != null && row.n < minBucket) row.lowSample = true
+  })
+
+  const survivors = sections.flatMap(section => section.rows.map(row => ({ section: section.key, ...row })))
+    .filter(row => row.significant && row.q != null)
+    .sort((a, b) => a.q - b.q)
+
+  const takeaways = []
+  takeaways.push(`Overall ${wins}W/${resolved - wins}L = ${pctText(overall.rate)} over ${resolved} resolved flip(s); a fair coin is 50% (two-sided p=${overall.p == null ? 'n/a' : overall.p.toExponential(3)}).`)
+  takeaways.push(markov.diff == null
+    ? 'Not enough consecutive flips to say whether the previous result predicts the next.'
+    : `After a loss the next flip won ${pctText(markov.pWinAfterLoss)} of the time (n=${markov.nAfterLoss}); after a win ${pctText(markov.pWinAfterWin)} (n=${markov.nAfterWin}). P(win|win) − P(win|loss) = ${(markov.diff * 100).toFixed(2)} pp, p=${markov.p == null ? 'n/a' : markov.p.toFixed(4)}.`)
+  takeaways.push(ratioTrend.p == null
+    ? 'Wager-to-balance ratio needs balanceBefore on the records (from this version onwards).'
+    : `Staking a bigger share of the balance ${ratioTrend.direction} (trend p=${ratioTrend.p.toFixed(4)}).`)
+  const afterTwoLosses = streakRows.find(row => row.label === 'after 2× loss, the next flip won')
+  const bothAfterTwoLosses = streakRows.find(row => row.label === 'after 2× loss, both of the next 2 flips won')
+  if (afterTwoLosses && afterTwoLosses.n >= minBucket) {
+    takeaways.push(`After two losses: the next flip won ${pctText(afterTwoLosses.rate)} of the time, and both of the next two won ${bothAfterTwoLosses ? `${pctText(bothAfterTwoLosses.rate)} (n=${bothAfterTwoLosses.n})` : 'n/a'} — a fair coin gives 50% and 25%.`)
+  }
+  if (hourSource !== 'none') {
+    takeaways.push(hourRows.length
+      ? `Time of day: ${hourRows.length} hour bucket(s) recorded; the most extreme is ${[...hourRows].filter(r => r.p != null).sort((a, b) => a.p - b.p)[0].label}. Surviving the multiple-testing correction needs far more flips.`
+      : 'Time of day: no hour buckets yet.')
+  }
+  if (survivors.length) {
+    takeaways.push(`${survivors.length} finding(s) survive the ${q} false-discovery-rate correction across ${flat.length} tests: ${survivors.slice(0, 5).map(row => `${row.label} (${pctText(row.rate)}, n=${row.n}, q=${row.q.toExponential(2)})`).join('; ')}.`)
+  } else {
+    takeaways.push(`No dissection survives the ${q} false-discovery-rate correction across ${flat.length} tests — with this sample the coinflip looks like a fair coin in every slicing.`)
+  }
+
+  return {
+    generatedAt: Date.now(),
+    resolved,
+    wins,
+    losses: resolved - wins,
+    unresolved: (records || []).length - resolved,
+    winRate: overall.rate,
+    ci: overall.ci,
+    p: overall.p,
+    z: overall.z,
+    net: overall.net,
+    hourSource,
+    q,
+    minBucket,
+    tests: flat.length,
+    sections,
+    markov,
+    runLengths,
+    autocorrelation: lags,
+    ratioTrend,
+    curve,
+    takeaways
+  }
+}
+
+module.exports = {
+  deepAnalysis,
+  conditionalStreakRows,
+  runLengthAnalysis,
+  markovAnalysis,
+  autocorrelation,
+  trendTest,
+  chiSquare2x2,
+  chiSquareP,
+  twoProportionTest,
+  rateTest,
+  rateFromCounts,
+  rateRow,
+  bhAdjust,
+  bucketEntries,
+  bucketRecords,
+  bucketIndex,
+  quantileSorted,
+  hourOfRecord,
+  inTimeOrder,
+  moneyCurve,
+  paceEntries,
+  martingaleEntries,
+  quantile,
+  recordNet,
+  sumOf,
+  pctText
+}

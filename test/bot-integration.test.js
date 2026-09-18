@@ -1250,9 +1250,14 @@ function dataEnv (env = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bot-data-'))
   return {
     COINFLIP_FILE: path.join(dir, 'coinflip-history.jsonl'),
+    COINFLIP_DEEP_FILE: path.join(dir, 'coinflip-deep.json'),
     TIMESERIES_FILE: path.join(dir, 'timeseries.jsonl'),
     // Short enough that a run in a test gets as far as sending the create.
     COINFLIP_POLL_MS: '1000',
+    // The production default is a real 2.5s wait in front of every create;
+    // these tests would sit on a timer the harness never fires. The cooldown
+    // has its own test, which sets it back up per run.
+    COINFLIP_CREATE_COOLDOWN_MS: '0',
     ...env
   }
 }
@@ -1585,4 +1590,162 @@ test('a secret is listed as set, never echoed back to the dashboard', async () =
   assert.equal(row.secret, true)
   assert.equal(r.run("settings.list().find(r => r.key === 'WEB_PASSWORD').value"), null)
   await r.request('/api/settings/reset', JSON.stringify({ all: true }), cookie, 'POST')
+})
+
+// ── The deep dissection: /coinflip-deep, the report and the page ─────────────
+
+// Seeding goes through the real store, with COINFLIP_FILE pointed at a temp
+// file by dataEnv(), so nothing lands in the repo's data folder.
+function seedHistory (r, rows) {
+  r.run(`coinflipStore.appendAll(${JSON.stringify(rows)})`)
+}
+
+function seededFlip (i, over = {}) {
+  const won = i % 3 !== 0
+  return {
+    id: `seed-${i}`,
+    sessionId: `seed-session-${Math.floor(i / 10)}`,
+    bot: 'A',
+    index: (i % 10) + 1,
+    ts: 1770000000000 + i * 60000,
+    wager: 10000,
+    opponent: 'Rival',
+    result: won ? 'won' : 'lost',
+    balanceBefore: 1000000,
+    balanceAfter: null,
+    delta: won ? 10000 : -10000,
+    method: 'message',
+    mismatched: false,
+    serverHour: 14,
+    serverClock: '2:00 P.M.',
+    ...over
+  }
+}
+
+test('/coinflip-deep dissects the stored flips and names every dissection', () => {
+  const r = runtime(dataEnv({ COINFLIP_DEEP_MIN_BUCKET: '3' }))
+  r.run("handleCommand('/coinflip-deep', { selectedId: 'A' })")
+  assert.match(channelLogs(r, 'A', 'system'), /No coinflip history for the fleet/)
+
+  seedHistory(r, Array.from({ length: 60 }, (_, i) => seededFlip(i)))
+  r.run("handleCommand('/coinflip-deep A', { selectedId: 'A' })")
+  const text = channelLogs(r, 'A', 'B', 'system')
+  assert.match(text, /Coinflip dissection \(A\)/)
+  assert.match(text, /Does the previous flip predict the next one\?/)
+  assert.match(text, /Runs and what follows them/)
+  assert.match(text, /Wager as a share of the balance/)
+  assert.match(text, /Time of day/)
+  assert.match(text, /Pace and idling/)
+  assert.match(text, /The money curve/)
+  assert.match(text, /What the numbers say/)
+  assert.match(text, /statistical test\(s\) corrected together at q=0\.05/)
+  // The hour comes off the record's own server stamp, not our clock.
+  assert.match(text, /hours read from the server clock/)
+
+  const report = plain(r.run('coinflipDeepReport()'))
+  assert.equal(report.resolved, 60)
+  assert.ok(report.sections.length >= 13, `${report.sections.length} dissections`)
+  assert.ok(report.tests > 10, `${report.tests} tests in the family`)
+  assert.equal(report.hourSource, 'server')
+  assert.ok(report.takeaways.length >= 4)
+  // Same history, same report — the cache is not allowed to change the numbers.
+  assert.equal(r.run('coinflipDeepReport() === coinflipDeepReport()'), true)
+  assert.equal(r.run('persistCoinflipDeepReport().resolved'), 60)
+})
+
+test('/coinflip-deep can be scoped to one bot and an empty scope says so', () => {
+  const r = runtime(dataEnv({ COINFLIP_DEEP_MIN_BUCKET: '2' }))
+  const rows = [
+    ...Array.from({ length: 30 }, (_, i) => seededFlip(i)),
+    ...Array.from({ length: 30 }, (_, i) => seededFlip(i, { bot: 'B', id: `seed-b-${i}` }))
+  ]
+  seedHistory(r, rows)
+  assert.equal(r.run('coinflipDeepReport().resolved'), 60)
+  assert.equal(r.run('coinflipDeepReport({ bot: "B" }).resolved'), 30)
+  assert.equal(r.run('coinflipDeepReport({ bot: "B" }).bot'), 'B')
+
+  r.run("handleCommand('/coinflip-deep B', { selectedId: 'A' })")
+  assert.match(channelLogs(r, 'A', 'B', 'system'), /Coinflip dissection \(B\)/)
+  r.run("handleCommand('/coinflip-deep Ghost', { selectedId: 'A' })")
+  assert.match(channelLogs(r, 'A', 'B', 'system'), /No coinflip history for Ghost/)
+})
+
+test('the analytics report and page carry the dissection', () => {
+  const r = runtime(dataEnv({ COINFLIP_DEEP_MIN_BUCKET: '3' }))
+  seedHistory(r, Array.from({ length: 45 }, (_, i) => seededFlip(i)))
+
+  const report = plain(r.run('buildAnalyticsReport({ recent: 0 })'))
+  assert.equal(report.deep.resolved, 45)
+  assert.ok(report.deep.sections.length >= 13)
+  assert.equal(report.headline.coinflips, 45)
+  assert.ok(report.config.coinflipDeepFile.endsWith('coinflip-deep.json'))
+
+  const html = r.run("analytics.renderHtml(buildAnalyticsReport())")
+  assert.match(html, /Deep dissection/)
+  assert.match(html, /What the numbers say/)
+  assert.match(html, /\/api\/coinflip\/deep/)
+  assert.match(html, /statistical tests/)
+  // Every dissection gets a table, every table and row is closed, and no
+  // template placeholder survived the render.
+  const tables = html.split('<table>').length - 1
+  assert.equal(html.split('</table>').length - 1, tables, 'every table is closed')
+  assert.ok(tables >= 13, `${tables} dissection tables`)
+  assert.equal(html.split('<tr').length, html.split('</tr>').length, 'every row is closed')
+  assert.equal(/undefined|NaN/.test(html), false, 'no placeholder leaked into the page')
+})
+
+test('the create waits out the configured cooldown after the balance answer', async () => {
+  const r = runtime(dataEnv())
+  r.run(payingBot('A', 50000))
+  // Nothing is reset between runtimes, so clear any override another test left.
+  r.run("settings.reset('COINFLIP_CREATE_COOLDOWN_MS')")
+  const before = r.run("settings.get('COINFLIP_CREATE_COOLDOWN_MS')")
+  try {
+    r.run("handleCommand('/env set COINFLIP_CREATE_COOLDOWN_MS 400', { selectedId: 'A' })")
+    assert.equal(r.run("settings.get('COINFLIP_CREATE_COOLDOWN_MS')"), 400)
+
+    r.run("handleCommand('/coinflip-data-run 1000 1 A', { selectedId: 'A' })")
+    await flushMicrotasks()
+    // The balance was asked for and the run is parked on the cooldown: this is
+    // the gap that stops the server answering "you are on cooldown".
+    const parked = [...r.timers.values()].filter(timer => timer.delay === 400)
+    assert.equal(parked.length, 1, 'one 400ms wait, between /bal and the create')
+    assert.deepEqual(coinflipChats(r), [])
+
+    parked[0].fn()
+    await flushMicrotasks()
+    assert.deepEqual(coinflipChats(r), [['A', '/coinflip create 1000']])
+
+    // Let the flip finish so the run does not outlive the test.
+    for (const line of ['Result: Won', 'Amount Bet: $1,000', 'Winner: A', 'Loser: Rival']) {
+      r.run(`coinflipObserverFor('A').feed(${JSON.stringify(line)})`)
+    }
+    await flushMicrotasks()
+    assert.equal(r.run('coinflipSessions.has("A")'), false)
+  } finally {
+    r.run("settings.reset('COINFLIP_CREATE_COOLDOWN_MS')")
+  }
+  assert.equal(r.run("settings.get('COINFLIP_CREATE_COOLDOWN_MS')"), before, 'the override is gone')
+})
+
+test('the new coinflip knobs are registered, live, and described for the .ENV tab', () => {
+  const r = runtime(dataEnv())
+  const keys = plain(r.run('settings.registered()'))
+  for (const key of [
+    'COINFLIP_CREATE_COOLDOWN_MS',
+    'COINFLIP_COOLDOWN_MAX_RETRIES',
+    'COINFLIP_DEEP_MIN_BUCKET',
+    'COINFLIP_DEEP_Q',
+    'COINFLIP_TZ_OFFSET_MIN'
+  ]) {
+    assert.ok(keys.includes(key), `${key} is registered`)
+    const row = plain(r.run(`settings.list().find(entry => entry.key === '${key}')`))
+    assert.equal(row.group, 'Coinflip')
+    assert.equal(row.live, true, `${key} is read where it is used`)
+    assert.ok(row.desc.length > 10, `${key} explains itself in the tab`)
+  }
+  // A value outside the allowed range is refused rather than silently clamped.
+  assert.equal(r.run("settings.set('COINFLIP_DEEP_Q', '5').ok"), false)
+  assert.equal(r.run("settings.set('COINFLIP_CREATE_COOLDOWN_MS', '2s').value"), 2000)
+  r.run("settings.reset('COINFLIP_CREATE_COOLDOWN_MS')")
 })

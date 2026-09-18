@@ -270,6 +270,81 @@ test('a wager above the balance is never even sent', async () => {
   assert.deepEqual(sent, [])
 })
 
+// ── The server's rate limit and its clock ────────────────────────────────────
+
+test('the rate-limit reply is its own event, and player chat cannot forge it', () => {
+  // This is the line the user hit: /bal then /coinflip create too soon.
+  assert.equal(cf.classifyCoinflipLine('✘ Error ┃ You are on cooldown').kind, 'cooldown')
+  assert.equal(cf.classifyCoinflipLine('Error You are on cooldown').kind, 'cooldown')
+  assert.equal(cf.classifyCoinflipLine('You are on cooldown').kind, 'cooldown')
+  assert.equal(cf.classifyCoinflipLine('you are on cool down').kind, 'cooldown')
+  // A player saying it in chat is not an error line, and a cooldown only ever
+  // delays a run — it must never be mistaken for a result either.
+  assert.equal(cf.classifyCoinflipLine("Steve: I'm on cooldown lol"), null)
+  assert.equal(cf.classifyCoinflipLine('Steve: you are on cooldown mate'), null)
+})
+
+test('the server clock is read off a result line and off an error line', () => {
+  assert.deepEqual(cf.parseServerClock('2:50:43 AM Result: Lost'), { hour: 2, minute: 50, second: 43, label: '2:50 A.M.' })
+  assert.equal(cf.parseServerClock('3:03:52 PM ✘ Error ┃ You are on cooldown').hour, 15)
+  assert.equal(cf.parseServerClock('12:05:01 AM Winner: BotA').hour, 0)
+  assert.equal(cf.parseServerClock('12:05:01 PM Winner: BotA').hour, 12)
+  assert.equal(cf.parseServerClock('no clock here'), null)
+  assert.equal(cf.parseServerClock('[23:59] Amount Bet: $1,000').hour, 23)
+})
+
+test('a result block carries the server hour through to its event', async () => {
+  const observer = cf.createCoinflipObserver({ botName: 'BotA', settleMs: 10 })
+  observer.feed('2:50:43 AM Result: Lost')
+  observer.feed('2:50:43 AM Amount Bet: $20,000')
+  observer.feed('2:50:43 AM Winner: Rival')
+  observer.feed('2:50:43 AM Loser: BotA')
+  const ev = await observer.next(10)
+  assert.equal(ev.result, 'lost')
+  assert.equal(ev.serverHour, 2)
+  assert.equal(ev.serverClock, '2:50 A.M.')
+})
+
+test('the configured cooldown is waited before every create, after the balance', async () => {
+  const { deps, sent } = runnerDeps({ events: [{ kind: 'created' }, { kind: 'result', result: 'won', amount: 1000 }], balances: [10000, 11000] })
+  const waits = []
+  deps.sleep = async (ms) => waits.push(ms)
+  await cf.runCoinflipSession({ bot: 'BotA', flips: 1, wagerSpec: { kind: 'fixed', amount: 1000 } }, { ...deps, createCooldownMs: 2500 })
+  assert.deepEqual(waits, [2500], 'the /bal that just answered is the command that trips the rate limit')
+  assert.deepEqual(sent, ['/coinflip create 1000'])
+})
+
+test('a rate-limited create is retried, never recorded as a loss', async () => {
+  const events = [
+    { kind: 'cooldown' },
+    { kind: 'created' },
+    { kind: 'result', result: 'won', amount: 1000 }
+  ]
+  const { deps, sent } = runnerDeps({ events, balances: [10000, 10000, 11000] })
+  const result = await cf.runCoinflipSession({ bot: 'BotA', flips: 1, wagerSpec: { kind: 'fixed', amount: 1000 } }, { ...deps, createCooldownMs: 2500 })
+  assert.equal(result.records.length, 1, 'the rejected create is not a flip')
+  assert.equal(result.records[0].result, 'won')
+  assert.equal(result.cooldowns, 1)
+  assert.deepEqual(sent, ['/coinflip create 1000', '/coinflip create 1000'])
+})
+
+test('persistent rate limiting stops the run with a reason instead of spinning', async () => {
+  const events = []
+  for (let i = 0; i < 10; i++) events.push({ kind: 'cooldown' })
+  const { deps } = runnerDeps({ events, balances: Array(12).fill(10000) })
+  const result = await cf.runCoinflipSession({ bot: 'BotA', flips: 3, wagerSpec: { kind: 'fixed', amount: 1000 }, maxCooldownRetries: 2 }, { ...deps, createCooldownMs: 2500 })
+  assert.equal(result.stopped, 'cooldown')
+  assert.match(result.reason, /rate-limited/)
+  assert.equal(result.records.length, 0)
+})
+
+test('the server hour is stored on the record so time of day can be dissected', async () => {
+  const { deps } = runnerDeps({ events: [{ kind: 'created' }, { kind: 'result', result: 'won', amount: 1000, serverHour: 22, serverClock: '10:14 P.M.' }], balances: [10000, 11000] })
+  const result = await cf.runCoinflipSession({ bot: 'BotA', flips: 1, wagerSpec: { kind: 'fixed', amount: 1000 } }, deps)
+  assert.equal(result.records[0].serverHour, 22)
+  assert.equal(result.records[0].serverClock, '10:14 P.M.')
+})
+
 // ── Statistics ───────────────────────────────────────────────────────────────
 
 function flip (result, wager = 1000, extra = {}) {
