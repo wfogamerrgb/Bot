@@ -202,7 +202,7 @@ function kpi (label, value, cls = '') {
 
 function coinflipSection (coinflip) {
   if (!coinflip || !coinflip.stats || !coinflip.stats.resolved) {
-    return `<div class="panel"><h2>Coinflip</h2><div class="empty">No resolved coinflips recorded yet. Run <code>/coinflip run</code> and the history fills in here.</div></div>`
+    return `<div class="panel"><h2>Coinflip</h2><div class="empty">No resolved coinflips recorded yet. Run <code>/bot-coinflip run</code> and the history fills in here.</div></div>`
   }
   const s = coinflip.stats
   const f = coinflip.fairness || {}
@@ -264,11 +264,11 @@ function deepRows (section) {
 /**
  * Every dissection, all rendered from the same `sections` shape the report
  * carries — the page never recomputes a statistic, so what is on screen is
- * exactly what /coinflip deep printed and /api/coinflip/deep serves.
+ * exactly what /bot-coinflip deep printed and /api/coinflip/deep serves.
  */
 function deepSection (deep) {
   if (!deep || !deep.resolved) {
-    return `<h2>Deep dissection</h2><div class="panel"><div class="empty">No resolved coinflips recorded yet. Run <code>/coinflip run</code> and every dissection fills in here.</div></div>`
+    return `<h2>Deep dissection</h2><div class="panel"><div class="empty">No resolved coinflips recorded yet. Run <code>/bot-coinflip run</code> and every dissection fills in here.</div></div>`
   }
   const controls = deep.sections.filter(section => section.rows.length || section.summary)
   const parts = controls.map(section => {

@@ -1086,14 +1086,14 @@ Any unrecognized input is sent as a Minecraft chat message or command.
 | `/pos` | Show the active bot's position, facing, and dimension |
 | `/gui-tui` | Toggle the clickable ASCII GUI overlay for the open window |
 | `/exit` | Disconnect all bots and exit |
-| `/coinflip` | The whole coinflip suite in one command — run, stats, deep, history and export; bare `/coinflip` prints the list and a summary of what has been recorded |
-| `/coinflip run [PRICE] [AMOUNT] [BOT]` | Play `AMOUNT` coinflips (default 10) on `BOT` (default: the selected bot) and record every one. `PRICE` is a fixed wager (`500000`) or a random range (`10k-1m`, the `COINFLIP_WAGER_MIN`-`MAX` defaults), and `all` targets the whole roster. A busy or rate-limited create is waited for and re-asked, never deleted. Works with `/all-slow`: `/all-slow /coinflip run 10k-1m 20` |
-| `/coinflip stats [BOT]` | Win/loss counts, net, streaks, drawdown, per-opponent and per-bot breakdowns, and the fairness verdict for one bot or the fleet |
-| `/coinflip deep [BOT]` | Dissect the recorded flips fourteen ways at once — what follows a run of losses, whether the previous flip predicts the next, run lengths, wager as a share of the balance, hour of day, pace, session position, raising after a loss, opponents and the money curve — with every bucket corrected for multiple testing. Writes `data/coinflip-deep.json` |
-| `/coinflip history [n\|clear confirm]` | The last `n` recorded flips (default 20), with how each result was detected and any message/balance mismatch |
-| `/coinflip export [BOT]` | Write `data/coinflip-export.csv`, one row per recorded flip, for a spreadsheet, pandas or R |
-| `/coinflip create …`, `/coinflip delete` | Anything that is not one of the five subcommands above is the **game's** command and is sent to the selected bot unchanged |
-| `/coinflip-data-run`, `/coinflip-stats`, `/coinflip-history`, `/coinflip-deep` | The older top-level names — still accepted, and they resolve to `run`, `stats`, `history` and `deep` |
+| `/bot-coinflip` | The whole coinflip suite in one command — run, stats, deep, history and export; bare `/bot-coinflip` prints the list and a summary of what has been recorded |
+| `/bot-coinflip run [PRICE] [AMOUNT] [BOT]` | Play `AMOUNT` coinflips (default 10) on `BOT` (default: the selected bot) and record every one. `PRICE` is a fixed wager (`500000`) or a random range (`10k-1m`, the `COINFLIP_WAGER_MIN`-`MAX` defaults), and `all` targets the whole roster. A busy or rate-limited create is waited for and re-asked, never deleted. Works with `/all-slow`: `/all-slow /bot-coinflip run 10k-1m 20` |
+| `/bot-coinflip stats [BOT]` | Win/loss counts, net, streaks, drawdown, per-opponent and per-bot breakdowns, and the fairness verdict for one bot or the fleet |
+| `/bot-coinflip deep [BOT]` | Dissect the recorded flips fourteen ways at once — what follows a run of losses, whether the previous flip predicts the next, run lengths, wager as a share of the balance, hour of day, pace, session position, raising after a loss, opponents and the money curve — with every bucket corrected for multiple testing. Writes `data/coinflip-deep.json` |
+| `/bot-coinflip history [n\|clear confirm]` | The last `n` recorded flips (default 20), with how each result was detected and any message/balance mismatch |
+| `/bot-coinflip export [BOT]` | Write `data/coinflip-export.csv`, one row per recorded flip, for a spreadsheet, pandas or R |
+| `/coinflip …` | The **game's** own coinflip command, owned by the server. The console never intercepts this name, so a bare `/coinflip`, `/coinflip create 10k` and `/coinflip delete` all reach the selected bot (or every bot, under `/all-slow`) as chat |
+| `/bot-coinflip help` | The same list from the console (a bare `/bot-coinflip` prints it too) |
 | `/timeseries [sample [ranks]\|series <metric> [bucket] [bot]\|events\|clear confirm]` | Shards, coins, balance, rank and ban counts over time - a sparkline, the last buckets, and where the JSON lives |
 | `/analytics` | Where the read-only analytics page and its JSON endpoints are |
 | `/env [list [filter]\|get KEY\|set KEY VALUE\|reset KEY\|reset-all]` | Show or change a configuration value for this run only - never written to `.env` |
@@ -1308,9 +1308,19 @@ RTP log for webhook errors. Node.js 18+ is required for the built-in `fetch`.
 
 ## Coinflip data collection, time series and analytics
 
-`/coinflip run` exists to answer one question with evidence: **is the coinflip
+`/bot-coinflip run` exists to answer one question with evidence: **is the coinflip
 fair?** It plays a series of flips, records every one of them, and then does the
 statistics on the records rather than on a running tally.
+
+The suite owns `/bot-coinflip` and nothing else. It used to live at the bare
+`/coinflip`, which meant it shared a name with the **server's** own coinflip
+command — so a plain `/coinflip create 10k` could be shadowed by a console
+subcommand. The server keeps that name now: anything spelled `/coinflip …` goes
+to the bot as chat, and the data commands are reached through `/bot-coinflip`.
+The old dash spellings (`/coinflip-data-run`, `/coinflip-stats`,
+`/coinflip-history`, `/coinflip-deep`) are gone with it — macros using them need
+`/bot-coinflip run`, `/bot-coinflip stats`, `/bot-coinflip history` and
+`/bot-coinflip deep`.
 
 ### How one flip is detected
 
@@ -1348,7 +1358,7 @@ and averaging it away would destroy it.
 
 ### The fairness verdict
 
-`/coinflip stats` (and the last line of every run) reports:
+`/bot-coinflip stats` (and the last line of every run) reports:
 
 - **win rate** with a 95% Wilson confidence interval, against the 50% a fair coin gives;
 - a **two-sided binomial p-value** over the resolved flips;
@@ -1370,7 +1380,7 @@ noise with a label. A p-value below `COINFLIP_SUSPICION_P` (default 0.01) is
 | `data/coinflip-deep.json` | The dissection report (every section, bucket, p-value and q-value) rewritten whenever the history changes |
 | `data/timeseries.jsonl` | One sample per bot per interval (`kind: bot`) plus a fleet total (`kind: fleet`): shards, coins, balance, rank, ban state, inventory usage |
 | `data/timeseries-summary.json` | Bucketed series and the derived ban/rank events, ready to drop into a spreadsheet or a chart |
-| `data/coinflip-export.csv` | Written by `/coinflip export`: one row per flip with the wager as a share of the balance, so it opens directly in a spreadsheet |
+| `data/coinflip-export.csv` | Written by `/bot-coinflip export`: one row per flip with the wager as a share of the balance, so it opens directly in a spreadsheet |
 
 These are generated files (git-ignored), and nothing here writes to `.env`.
 
@@ -1386,7 +1396,7 @@ event log to drift out of sync with the first.
 
 ### The deep dissection
 
-`/coinflip deep [BOT]` answers the questions the fairness verdict does not: it
+`/bot-coinflip deep [BOT]` answers the questions the fairness verdict does not: it
 slices the same records fourteen ways and reports each bucket with its own
 sample size, 95% confidence interval and p-value.
 
@@ -1427,16 +1437,16 @@ Four ways in, depending on the question:
 | To answer | Use |
 | --- | --- |
 | "what happened, in one screen?" | the analytics page on port 8080 (`/analytics` prints the URL) |
-| "is a pattern real?" | `/coinflip deep [BOT]` — fourteen lenses, every bucket with a confidence interval, p-values corrected together |
-| "is it fair at all?" | `/coinflip stats [BOT]` — win rate, binomial p, runs test, net per flip |
-| "I want to do my own statistics" | `/coinflip export [BOT]` for a CSV, or the JSONL files below |
+| "is a pattern real?" | `/bot-coinflip deep [BOT]` — fourteen lenses, every bucket with a confidence interval, p-values corrected together |
+| "is it fair at all?" | `/bot-coinflip stats [BOT]` — win rate, binomial p, runs test, net per flip |
+| "I want to do my own statistics" | `/bot-coinflip export [BOT]` for a CSV, or the JSONL files below |
 
 The raw history is append-only JSONL, one object per flip, so `jq`, pandas or R
 can read it without going through this program:
 
 ```bash
 # every flip as a CSV, ready for pandas / R / a spreadsheet
-node -e "console.log(require('./coinflip').toCsv(require('./coinflip').createCoinflipStore({ file: 'data/coinflip-history.jsonl' }).all()))" > flips.csv
+node -e "console.log(require('./bot-coinflip').toCsv(require('./bot-coinflip').createCoinflipStore({ file: 'data/coinflip-history.jsonl' }).all()))" > flips.csv
 
 # the median wager as a share of the balance, which is the "big bet" question
 jq -r 'select(.balanceBefore) | .wager / .balanceBefore' data/coinflip-history.jsonl | sort -n | awk '{a[NR]=$1} END {print a[int(NR/2)]}'
@@ -1479,7 +1489,7 @@ current value and changes one **for this run only**:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `COINFLIP_DEFAULT_FLIPS` | `10` | Flips per bot when `/coinflip run` is given no count |
+| `COINFLIP_DEFAULT_FLIPS` | `10` | Flips per bot when `/bot-coinflip run` is given no count |
 | `COINFLIP_WAGER_MIN` / `COINFLIP_WAGER_MAX` | `10000` / `1000000` | The random wager range (`10k-1m`) |
 | `COINFLIP_STOP_LOSS` | `10000000` | Stop a per-bot run once its net loss reaches this |
 | `COINFLIP_BALANCE_FRACTION` | `1` | Never wager more than this fraction of the balance |
@@ -1502,7 +1512,7 @@ current value and changes one **for this run only**:
 | `COINFLIP_DEEP_MIN_BUCKET` | `20` | Flips a bucket needs before a dissection treats it as evidence rather than an anecdote |
 | `COINFLIP_DEEP_Q` | `0.05` | The false-discovery rate a finding must beat across every test in the family |
 | `COINFLIP_TZ_OFFSET_MIN` | local offset | Minutes from UTC used for hour of day when a record has no server timestamp |
-| `COINFLIP_EXPORT_FILE` | `data/coinflip-export.csv` | Where `/coinflip export` writes the CSV |
+| `COINFLIP_EXPORT_FILE` | `data/coinflip-export.csv` | Where `/bot-coinflip export` writes the CSV |
 ## Project Files
 
 | File | Role |

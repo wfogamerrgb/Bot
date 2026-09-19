@@ -1291,17 +1291,17 @@ function payingBot (id, balance, extra = {}) {
 }
 
 // The coinflip commands only; a balance query is also chat traffic.
-const coinflipChats = (r) => plain(r.run("chats.filter(c => /coinflip/.test(c[1]))"))
+const coinflipChats = (r) => plain(r.run("chats.filter(c => c[1].startsWith('/coinflip'))"))
 
 const channelLogs = (r, ...ids) => ids
   .map(id => (id === 'system' ? r.run('systemLogs.map(l => l.text)') : r.run(`bots.${id}.logs.map(l => l.text)`)))
   .flat()
   .join('\n')
 
-test('/coinflip-data-run sends one create for the requested wager and remembers the session', async () => {
+test('/bot-coinflip run sends one create for the requested wager and remembers the session', async () => {
   const r = runtime(dataEnv())
   r.run(payingBot('A', 50000))
-  r.run("handleCommand('/coinflip-data-run 1000 2 A', { selectedId: 'A' })")
+  r.run("handleCommand('/bot-coinflip run 1000 2 A', { selectedId: 'A' })")
   await new Promise(resolve => setTimeout(resolve, 40))
   assert.deepEqual(coinflipChats(r), [['A', '/coinflip create 1000']])
   assert.equal(r.run('coinflipSessions.get("A").planned'), 2)
@@ -1317,32 +1317,32 @@ test('/coinflip-data-run sends one create for the requested wager and remembers 
   assert.equal(r.run('coinflipLastRun.get("A").stopped'), 'insufficient-balance')
 })
 
-test('/coinflip-data-run takes a named bot, and an unknown name is reported rather than guessed at', async () => {
+test('/bot-coinflip run takes a named bot, and an unknown name is reported rather than guessed at', async () => {
   const r = runtime(dataEnv())
   r.run(payingBot('B', 50000))
-  r.run("handleCommand('/coinflip-data-run 500 1 B')")
+  r.run("handleCommand('/bot-coinflip run 500 1 B')")
   await new Promise(resolve => setTimeout(resolve, 40))
   assert.deepEqual(coinflipChats(r), [['B', '/coinflip create 500']])
   r.run("coinflipObserverFor('B').feed('You do not have enough money for this coinflip bet')")
   await new Promise(resolve => setTimeout(resolve, 1300))
 
   r.run('chats = []')
-  r.run("handleCommand('/coinflip-data-run 500 1 Ghost')")
+  r.run("handleCommand('/bot-coinflip run 500 1 Ghost')")
   assert.deepEqual(plain(r.run('chats')), [])
   assert.match(channelLogs(r, 'A', 'B', 'system'), /No bot named/)
 })
 
 test('an unreadable PRICE is refused and no coinflip is sent', () => {
   const r = runtime(dataEnv())
-  r.run("handleCommand('/coinflip-data-run 5x 2 A', { selectedId: 'A' })")
+  r.run("handleCommand('/bot-coinflip run 5x 2 A', { selectedId: 'A' })")
   assert.deepEqual(plain(r.run('chats')), [])
   assert.match(channelLogs(r, 'A', 'system'), /Unknown option/)
 })
 
-test('/coinflip-data-run is dispatched per bot, which is what /all-slow needs', async () => {
+test('/bot-coinflip run is dispatched per bot, which is what /all-slow needs', async () => {
   const r = runtime(dataEnv())
   r.run(payingBot('B', 50000))
-  r.run("dispatchCommandToBot('/coinflip-data-run 250 1', 'B')")
+  r.run("dispatchCommandToBot('/bot-coinflip run 250 1', 'B')")
   await new Promise(resolve => setTimeout(resolve, 40))
   assert.deepEqual(coinflipChats(r), [['B', '/coinflip create 250']])
   assert.equal(r.run('coinflipSessions.has("A")'), false, 'the selected bot is not the target here')
@@ -1350,26 +1350,26 @@ test('/coinflip-data-run is dispatched per bot, which is what /all-slow needs', 
   await new Promise(resolve => setTimeout(resolve, 1300))
 })
 
-// ── One /coinflip suite: run, stats, deep, history and export under one name ─
+// ── One /bot-coinflip suite: run, stats, deep, history and export under one name ─
 
-test('/coinflip with no subcommand lists the suite and the recorded totals', () => {
+test('/bot-coinflip with no subcommand lists the suite and the recorded totals', () => {
   const r = runtime(dataEnv())
   r.run("coinflipStore.append({ id: 'x1', bot: 'A', ts: 1700000000000, wager: 1000, result: 'won', delta: 1000, method: 'message' })")
-  r.run("handleCommand('/coinflip', { selectedId: 'A' })")
+  r.run("handleCommand('/bot-coinflip', { selectedId: 'A' })")
   const logs = channelLogs(r, 'A')
-  assert.match(logs, /── \/coinflip ──/)
+  assert.match(logs, /── \/bot-coinflip ──/)
   assert.match(logs, /1 resolved flip\(s\) \(1W\/0L\)/)
-  assert.match(logs, /\/coinflip run \[PRICE\] \[AMOUNT\] \[BOT\|all\]/)
-  assert.match(logs, /\/coinflip deep \[BOT\]/)
-  assert.match(logs, /\/coinflip export \[BOT\]/)
-  // A bare /coinflip is the console's; it must not land in the game as chat.
+  assert.match(logs, /\/bot-coinflip run \[PRICE\] \[AMOUNT\] \[BOT\|all\]/)
+  assert.match(logs, /\/bot-coinflip deep \[BOT\]/)
+  assert.match(logs, /\/bot-coinflip export \[BOT\]/)
+  // A bare /bot-coinflip is the console's; it must not land in the game as chat.
   assert.deepEqual(plain(r.run('chats')), [])
 })
 
-test('/coinflip run plays and records exactly what /coinflip-data-run did', async () => {
+test('/bot-coinflip run plays and records exactly what /bot-coinflip run did', async () => {
   const r = runtime(dataEnv())
   r.run(payingBot('A', 50000))
-  r.run("handleCommand('/coinflip run 1200 2 A', { selectedId: 'A' })")
+  r.run("handleCommand('/bot-coinflip run 1200 2 A', { selectedId: 'A' })")
   await new Promise(resolve => setTimeout(resolve, 40))
   assert.deepEqual(coinflipChats(r), [['A', '/coinflip create 1200']])
   assert.equal(r.run('coinflipSessions.get("A").planned'), 2)
@@ -1379,10 +1379,10 @@ test('/coinflip run plays and records exactly what /coinflip-data-run did', asyn
   assert.equal(r.run('coinflipSessions.has("A")'), false)
 })
 
-test('/coinflip run is dispatched per bot, which is what /all-slow needs now', async () => {
+test('/bot-coinflip run is dispatched per bot, which is what /all-slow needs now', async () => {
   const r = runtime(dataEnv())
   r.run(payingBot('B', 50000))
-  r.run("dispatchCommandToBot('/coinflip run 250 1', 'B')")
+  r.run("dispatchCommandToBot('/bot-coinflip run 250 1', 'B')")
   await new Promise(resolve => setTimeout(resolve, 40))
   assert.deepEqual(coinflipChats(r), [['B', '/coinflip create 250']])
   assert.equal(r.run('coinflipSessions.has("A")'), false, 'the selected bot is not the target here')
@@ -1390,67 +1390,77 @@ test('/coinflip run is dispatched per bot, which is what /all-slow needs now', a
   await new Promise(resolve => setTimeout(resolve, 1300))
 })
 
-test('/coinflip stats and /coinflip history answer on the merged names', () => {
+test('/bot-coinflip stats and /bot-coinflip history answer on the merged names', () => {
   const r = runtime(dataEnv())
   r.run("coinflipStore.append({ id: 'x1', bot: 'A', ts: 1700000000000, wager: 1000, result: 'won', delta: 1000, opponent: 'Rival', method: 'message' })")
-  r.run("handleCommand('/coinflip stats A', { selectedId: 'A' })")
+  r.run("handleCommand('/bot-coinflip stats A', { selectedId: 'A' })")
   assert.match(channelLogs(r, 'A'), /1 resolved \(1W\/0L\)/)
 
-  r.run("handleCommand('/coinflip history', { selectedId: 'A' })")
+  r.run("handleCommand('/bot-coinflip history', { selectedId: 'A' })")
   assert.match(channelLogs(r, 'A'), /Last 1 coinflip\(s\)/)
 
   r.run('chats = []')
-  r.run("handleCommand('/coinflip history clear', { selectedId: 'A' })")
-  assert.match(channelLogs(r, 'A'), /\/coinflip history clear confirm/)
+  r.run("handleCommand('/bot-coinflip history clear', { selectedId: 'A' })")
+  assert.match(channelLogs(r, 'A'), /\/bot-coinflip history clear confirm/)
   assert.equal(r.run('coinflipStore.all().length'), 1, 'clear without confirm changes nothing')
 })
 
-test('/coinflip deep finds the same dissection the older name found', () => {
+test('/bot-coinflip deep finds the same dissection the older name found', () => {
   const r = runtime(dataEnv())
   for (let i = 0; i < 40; i++) {
     r.run(`coinflipStore.append({ id: 'd${i}', bot: 'A', ts: ${1700000000000 + i * 60000}, wager: 1000, result: '${i % 2 ? 'won' : 'lost'}', delta: ${i % 2 ? 1000 : -1000}, balanceBefore: 50000, method: 'message', serverHour: ${8 + (i % 4)} })`)
   }
-  r.run("handleCommand('/coinflip deep A', { selectedId: 'A' })")
+  r.run("handleCommand('/bot-coinflip deep A', { selectedId: 'A' })")
   const logs = channelLogs(r, 'A')
   assert.match(logs, /Coinflip dissection \(A\)/)
   assert.match(logs, /40 resolved flip\(s\)/)
   assert.match(logs, /What the numbers say/)
 })
 
-test('/coinflip export reports every flip and where the CSV went', () => {
+test('/bot-coinflip export reports every flip and where the CSV went', () => {
   const r = runtime(dataEnv())
   r.run("coinflipStore.append({ index: 1, id: 'x1', bot: 'A', ts: 1700000000000, wager: 1000, result: 'won', delta: 1000, opponent: 'Rival', balanceBefore: 50000, balanceAfter: 51000, method: 'message', serverHour: 9 })")
   r.run("coinflipStore.append({ index: 2, id: 'x2', bot: 'B', ts: 1700000060000, wager: 2000, result: 'lost', delta: -2000, balanceBefore: 40000, balanceAfter: 38000, method: 'recreate' })")
-  r.run("handleCommand('/coinflip export', { selectedId: 'A' })")
+  r.run("handleCommand('/bot-coinflip export', { selectedId: 'A' })")
   const logs = channelLogs(r, 'A')
   assert.match(logs, /2 flip\(s\) exported to .*coinflip-export\.csv/)
   assert.match(logs, /columns: index, ts, utc, bot, result, wager, opponent, delta/)
 
   r.run('bots.A.logs.length = 0')
-  r.run("handleCommand('/coinflip export B', { selectedId: 'A' })")
+  r.run("handleCommand('/bot-coinflip export B', { selectedId: 'A' })")
   assert.match(channelLogs(r, 'A'), /1 flip\(s\) exported/, 'the bot argument scopes the export')
 
   r.run('bots.A.logs.length = 0')
-  r.run("handleCommand('/coinflip export Ghost', { selectedId: 'A' })")
+  r.run("handleCommand('/bot-coinflip export Ghost', { selectedId: 'A' })")
   assert.match(channelLogs(r, 'A'), /No bot named "Ghost"/, 'an unknown bot is reported, not widened to the fleet')
 })
 
-test('/coinflip create is forwarded to the game, not swallowed by the suite', () => {
+test('the server owns /coinflip and the suite owns /bot-coinflip', () => {
   const r = runtime(dataEnv())
   r.run(payingBot('A', 50000))
+  // /coinflip is a SERVER command, so the console must not own that name: a bare
+  // one and the game's own subcommands all reach the bot as ordinary chat.
+  r.run("handleCommand('/coinflip', { selectedId: 'A' })")
   r.run("handleCommand('/coinflip create 10000', { selectedId: 'A' })")
-  assert.deepEqual(plain(r.run("chats.filter(c => c[1] === '/coinflip create 10000')")), [['A', '/coinflip create 10000']])
+  r.run("handleCommand('/coinflip delete', { selectedId: 'A' })")
+  assert.deepEqual(plain(r.run("chats.map(c => c[1])")), ['/coinflip', '/coinflip create 10000', '/coinflip delete'])
   assert.equal(r.run('coinflipSessions.size'), 0, 'the console did not start a data run')
 
-  r.run("handleCommand('/coinflip delete', { selectedId: 'A' })")
-  assert.deepEqual(plain(r.run("chats.filter(c => c[1] === '/coinflip delete')")), [['A', '/coinflip delete']])
+  // The suite name refuses a subcommand it does not own instead of inventing
+  // server chat out of it, and points at the game's command.
+  r.run('bots.A.logs.length = 0')
+  r.run("handleCommand('/bot-coinflip create 10000', { selectedId: 'A' })")
+  const logs = channelLogs(r, 'A')
+  assert.match(logs, /Unknown \/bot-coinflip subcommand "create"/)
+  assert.match(logs, /plain \/coinflip/)
+  assert.equal(r.run("chats.filter(c => c[1].startsWith('/bot-coinflip')).length"), 0, 'never forwarded as chat')
 })
 
-test('/coinflip-stats reports the recorded numbers, the streak and the fairness verdict', () => {
+test('/bot-coinflip stats reports the recorded numbers, the streak and the fairness verdict', () => {
   const r = runtime(dataEnv())
   r.run("coinflipStore.append({ id: 'x1', bot: 'A', ts: 1700000000000, wager: 1000, result: 'won', delta: 1000, opponent: 'Rival', method: 'message' })")
   r.run("coinflipStore.append({ id: 'x2', bot: 'A', ts: 1700000001000, wager: 1000, result: 'lost', delta: -1000, opponent: 'Rival', method: 'message' })")
-  r.run("handleCommand('/coinflip-stats A', { selectedId: 'A' })")
+  r.run("handleCommand('/bot-coinflip stats A', { selectedId: 'A' })")
   const logs = channelLogs(r, 'A')
   assert.match(logs, /2 resolved \(1W\/1L\)/)
   assert.match(logs, /net: \$0/)
@@ -1459,26 +1469,26 @@ test('/coinflip-stats reports the recorded numbers, the streak and the fairness 
   assert.match(logs, /Rival: 2 flips/)
 })
 
-test('/coinflip-stats on an empty history says how to fill it instead of printing zeros', () => {
+test('/bot-coinflip stats on an empty history says how to fill it instead of printing zeros', () => {
   const r = runtime(dataEnv())
-  r.run("handleCommand('/coinflip-stats', { selectedId: 'A' })")
+  r.run("handleCommand('/bot-coinflip stats', { selectedId: 'A' })")
   assert.match(channelLogs(r, 'A'), /No coinflip history for the whole fleet yet/)
-  assert.match(channelLogs(r, 'A'), /run \/coinflip run/)
+  assert.match(channelLogs(r, 'A'), /run \/bot-coinflip run/)
 })
 
-test('/coinflip-history lists the flips and needs a confirmation to erase them', () => {
+test('/bot-coinflip history lists the flips and needs a confirmation to erase them', () => {
   const r = runtime(dataEnv())
   r.run("coinflipStore.append({ id: 'x1', bot: 'A', ts: 1700000000000, wager: 2000, result: 'lost', delta: -2000, opponent: 'Rival', method: 'message' })")
-  r.run("handleCommand('/coinflip-history', { selectedId: 'A' })")
+  r.run("handleCommand('/bot-coinflip history', { selectedId: 'A' })")
   let logs = channelLogs(r, 'A')
   assert.match(logs, /Last 1 coinflip\(s\)/)
   assert.match(logs, /\$2,000/)
 
-  r.run("handleCommand('/coinflip-history clear', { selectedId: 'A' })")
+  r.run("handleCommand('/bot-coinflip history clear', { selectedId: 'A' })")
   assert.equal(r.run('coinflipStore.all().length'), 1, 'clear without confirm changes nothing')
   assert.match(channelLogs(r, 'A'), /clear confirm/)
 
-  r.run("handleCommand('/coinflip-history clear confirm', { selectedId: 'A' })")
+  r.run("handleCommand('/bot-coinflip history clear confirm', { selectedId: 'A' })")
   assert.equal(r.run('coinflipStore.all().length'), 0)
 })
 
@@ -1689,7 +1699,7 @@ test('a secret is listed as set, never echoed back to the dashboard', async () =
   await r.request('/api/settings/reset', JSON.stringify({ all: true }), cookie, 'POST')
 })
 
-// ── The deep dissection: /coinflip-deep, the report and the page ─────────────
+// ── The deep dissection: /bot-coinflip deep, the report and the page ─────────────
 
 // Seeding goes through the real store, with COINFLIP_FILE pointed at a temp
 // file by dataEnv(), so nothing lands in the repo's data folder.
@@ -1719,13 +1729,13 @@ function seededFlip (i, over = {}) {
   }
 }
 
-test('/coinflip-deep dissects the stored flips and names every dissection', () => {
+test('/bot-coinflip deep dissects the stored flips and names every dissection', () => {
   const r = runtime(dataEnv({ COINFLIP_DEEP_MIN_BUCKET: '3' }))
-  r.run("handleCommand('/coinflip-deep', { selectedId: 'A' })")
+  r.run("handleCommand('/bot-coinflip deep', { selectedId: 'A' })")
   assert.match(channelLogs(r, 'A', 'system'), /No coinflip history for the fleet/)
 
   seedHistory(r, Array.from({ length: 60 }, (_, i) => seededFlip(i)))
-  r.run("handleCommand('/coinflip-deep A', { selectedId: 'A' })")
+  r.run("handleCommand('/bot-coinflip deep A', { selectedId: 'A' })")
   const text = channelLogs(r, 'A', 'B', 'system')
   assert.match(text, /Coinflip dissection \(A\)/)
   assert.match(text, /Does the previous flip predict the next one\?/)
@@ -1750,7 +1760,7 @@ test('/coinflip-deep dissects the stored flips and names every dissection', () =
   assert.equal(r.run('persistCoinflipDeepReport().resolved'), 60)
 })
 
-test('/coinflip-deep can be scoped to one bot and an empty scope says so', () => {
+test('/bot-coinflip deep can be scoped to one bot and an empty scope says so', () => {
   const r = runtime(dataEnv({ COINFLIP_DEEP_MIN_BUCKET: '2' }))
   const rows = [
     ...Array.from({ length: 30 }, (_, i) => seededFlip(i)),
@@ -1761,9 +1771,9 @@ test('/coinflip-deep can be scoped to one bot and an empty scope says so', () =>
   assert.equal(r.run('coinflipDeepReport({ bot: "B" }).resolved'), 30)
   assert.equal(r.run('coinflipDeepReport({ bot: "B" }).bot'), 'B')
 
-  r.run("handleCommand('/coinflip-deep B', { selectedId: 'A' })")
+  r.run("handleCommand('/bot-coinflip deep B', { selectedId: 'A' })")
   assert.match(channelLogs(r, 'A', 'B', 'system'), /Coinflip dissection \(B\)/)
-  r.run("handleCommand('/coinflip-deep Ghost', { selectedId: 'A' })")
+  r.run("handleCommand('/bot-coinflip deep Ghost', { selectedId: 'A' })")
   assert.match(channelLogs(r, 'A', 'B', 'system'), /No coinflip history for Ghost/)
 })
 
@@ -1801,7 +1811,7 @@ test('the create waits out the configured cooldown after the balance answer', as
     r.run("handleCommand('/env set COINFLIP_CREATE_COOLDOWN_MS 400', { selectedId: 'A' })")
     assert.equal(r.run("settings.get('COINFLIP_CREATE_COOLDOWN_MS')"), 400)
 
-    r.run("handleCommand('/coinflip-data-run 1000 1 A', { selectedId: 'A' })")
+    r.run("handleCommand('/bot-coinflip run 1000 1 A', { selectedId: 'A' })")
     await flushMicrotasks()
     // The balance was asked for and the run is parked on the cooldown: this is
     // the gap that stops the server answering "you are on cooldown".

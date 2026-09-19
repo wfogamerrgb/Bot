@@ -739,7 +739,7 @@ function cfDefine (key, spec) {
 // settings.get(...) at the moment it is used; the few that are read once at
 // boot say so in their description, because pretending otherwise would make the
 // tab lie about what it just did.
-cfDefine('COINFLIP_DEFAULT_FLIPS', { type: 'int', def: 10, min: 1, group: 'Coinflip', desc: 'Flips per bot when /coinflip run gets no count' })
+cfDefine('COINFLIP_DEFAULT_FLIPS', { type: 'int', def: 10, min: 1, group: 'Coinflip', desc: 'Flips per bot when /bot-coinflip run gets no count' })
 cfDefine('COINFLIP_WAGER_MIN', { type: 'int', def: 10000, min: 1, group: 'Coinflip', desc: 'Low end of the random wager (used when no PRICE argument is given)' })
 cfDefine('COINFLIP_WAGER_MAX', { type: 'int', def: 1000000, min: 1, group: 'Coinflip', desc: 'High end of the random wager' })
 cfDefine('COINFLIP_STOP_LOSS', { type: 'int', def: 10000000, min: 1, group: 'Coinflip', desc: 'Stop a per-bot run once its net loss reaches this' })
@@ -754,7 +754,7 @@ cfDefine('COINFLIP_SUSPICION_P', { type: 'number', def: 0.01, min: 0.0001, max: 
 cfDefine('COINFLIP_BALANCE_TIMEOUT_MS', { type: 'ms', def: 2500, min: 500, group: 'Coinflip', desc: 'How long /bal has to answer around a flip' })
 cfDefine('COINFLIP_CREATE_COOLDOWN_MS', { type: 'ms', def: 2500, min: 0, group: 'Coinflip', desc: 'Gap left after the balance check and before /coinflip create — the /bal before it is what trips the server rate limit' })
 cfDefine('COINFLIP_COOLDOWN_MAX_RETRIES', { type: 'int', def: 5, min: 1, group: 'Coinflip', desc: 'Consecutive "you are on cooldown" replies tolerated before a run stops' })
-cfDefine('COINFLIP_DEEP_MIN_BUCKET', { type: 'int', def: 20, min: 1, group: 'Coinflip', desc: 'Flips a bucket needs before /coinflip deep treats it as evidence rather than an anecdote' })
+cfDefine('COINFLIP_DEEP_MIN_BUCKET', { type: 'int', def: 20, min: 1, group: 'Coinflip', desc: 'Flips a bucket needs before /bot-coinflip deep treats it as evidence rather than an anecdote' })
 cfDefine('COINFLIP_DEEP_Q', { type: 'number', def: 0.05, min: 0.0001, max: 0.5, group: 'Coinflip', desc: 'False-discovery rate a dissection must beat to count as a finding (Benjamini-Hochberg, across every test)' })
 cfDefine('COINFLIP_TZ_OFFSET_MIN', { type: 'int', def: -new Date().getTimezoneOffset(), min: -840, max: 840, group: 'Coinflip', desc: 'Minutes from UTC used for the hour-of-day dissection when a record has no server timestamp' })
 cfDefine('TIMESERIES_ENABLED', { type: 'bool', def: true, group: 'Time series', desc: 'Record samples to the data folder' })
@@ -803,7 +803,7 @@ const coinflipStore = coinflip.createCoinflipStore({ file: COINFLIP_FILE, maxRec
 const timeseriesStore = timeseries.createTimeseriesStore({ file: TIMESERIES_FILE })
 
 
-const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dump-spawners', '/dc', '/reconnect', '/crates', '/crates-loop', '/spawners', '/data', '/shardshop-loop', '/closeBot', '/coinflip', '/coinflip-data-run']
+const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dump-spawners', '/dc', '/reconnect', '/crates', '/crates-loop', '/spawners', '/data', '/shardshop-loop', '/closeBot', '/bot-coinflip']
 
 const logSubscribers = new Set()
 function subscribeLog(fn) { logSubscribers.add(fn); return () => logSubscribers.delete(fn) }
@@ -3223,8 +3223,8 @@ const COMMANDS = {
 '/shardshop-loop [slot]': `Repeatedly run ${SHARDSHOP_COMMAND} until the server signals it's empty (grep: SHARDSHOP_STOP_PHRASES) or hits the ${SHARDSHOP_LOOP_MAX_RUNS}-run safety cap; optional [slot] overrides default GUI slot`,
 '/crates-all [n] [color] [dump=…] [afk=…]': `Run shardshop → crates → dump on bots 1 through n (default: all bots) targeting crate [color] (default: ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')}), ${(CRATES_ALL_STAGGER_MS / 1000).toFixed(0)}s apart so they don't hit the server at once. dump=off|tpa|home|hidden|player:<name> chooses the dump step and afk=now|off|<seconds> chooses the AFK warp; both override CRATES_ALL_DUMP / CRATES_ALL_AFK_WARP / CRATES_ALL_AFK_DELAY_MS for that run`,
 '/crates-solo [bot] [color] [dump=…] [afk=…]': 'Run shardshop → crates → dump on just one bot (default: active bot) targeting crate [color] — not all bots. Takes the same dump= / afk= flags as /crates-all',
-  '/coinflip [run|stats|deep|history|export] [args]': `The whole coinflip suite. \`run [PRICE] [AMOUNT] [BOT|all]\` plays AMOUNT flips (default ${settings.get('COINFLIP_DEFAULT_FLIPS')}) and records every one: PRICE is a fixed wager (500000) or a random range (10k-1m — the COINFLIP_WAGER_MIN–MAX defaults), a busy or rate-limited create is waited for and re-asked (never deleted), and the run stops at COINFLIP_STOP_LOSS. \`stats [BOT]\` is the win/loss picture with the fairness verdict. \`deep [BOT]\` dissects the history fourteen ways (what follows a loss run, transition table and lag correlation, run lengths, wager against balance and against absolute size, richest vs poorest, hour of day on the server clock, pace, session position, raising after a loss, opponents, money curve) with a confidence interval per bucket and p-values corrected across the whole family. \`history [n|clear confirm]\` lists or wipes the raw records. \`export [BOT]\` writes data/coinflip-export.csv. Any other subcommand (/coinflip create 10k, /coinflip delete) is forwarded to the game. Works with /all-slow: /all-slow /coinflip run 10k-1m 20`,
-  '/coinflip-data-run, /coinflip-stats, /coinflip-history, /coinflip-deep': 'The older top-level names for /coinflip run, /coinflip stats, /coinflip history and /coinflip deep — still accepted, and what to use with /all-slow',
+  '/bot-coinflip [run|stats|deep|history|export] [args]': `The whole coinflip suite. \`run [PRICE] [AMOUNT] [BOT|all]\` plays AMOUNT flips (default ${settings.get('COINFLIP_DEFAULT_FLIPS')}) and records every one: PRICE is a fixed wager (500000) or a random range (10k-1m — the COINFLIP_WAGER_MIN–MAX defaults), a busy or rate-limited create is waited for and re-asked (never deleted), and the run stops at COINFLIP_STOP_LOSS. \`stats [BOT]\` is the win/loss picture with the fairness verdict. \`deep [BOT]\` dissects the history fourteen ways (what follows a loss run, transition table and lag correlation, run lengths, wager against balance and against absolute size, richest vs poorest, hour of day on the server clock, pace, session position, raising after a loss, opponents, money curve) with a confidence interval per bucket and p-values corrected across the whole family. \`history [n|clear confirm]\` lists or wipes the raw records. \`export [BOT]\` writes data/coinflip-export.csv. Anything else is refused with the list. The game's own /coinflip (create, delete, …) is a separate server command: this console does not intercept that name at all, so /coinflip create 10k reaches the selected bot untouched. Works with /all-slow: /all-slow /bot-coinflip run 10k-1m 20`,
+  '/coinflip …': 'The game\'s own coinflip command, owned by the server. The console never intercepts it — /coinflip, /coinflip create 10k and /coinflip delete all reach the selected bot (or every bot with /all-slow) untouched',
   '/timeseries [sample [ranks]|series <metric> [bucket] [bot]|events|clear confirm|status]': 'The recorded samples of shards, coins, balance, rank and bans over time — a sparkline, the last buckets, and where the JSON lives. \`sample\` records one right now',
   '/analytics': 'Where the read-only analytics page is, plus the JSON endpoints behind it (/api/analytics, /api/coinflip, /api/timeseries, /api/export)',
   '/env [list [filter]|get KEY|set KEY VALUE|reset KEY|reset-all]': 'Show or change a configuration value for THIS run only — nothing is ever written to the .env file and a restart forgets it. Keys marked startup-only were read once at boot. The dashboard has the same thing as the .ENV tab',
@@ -4424,7 +4424,7 @@ cratesAllRunning = false
 }
 
 // ── Coinflip data run ────────────────────────────────────────────────────────
-// /coinflip run plays N coinflips on one bot and records every one of them.
+// /bot-coinflip run plays N coinflips on one bot and records every one of them.
 // The rules it follows, and why:
 //   • A busy flip is never deleted and remade — remaking cannot succeed while a
 //     flip is open, so the run waits and re-asks instead.
@@ -4433,7 +4433,7 @@ cratesAllRunning = false
 //     and since the server announces wins, that means it was a loss.
 //   • Nothing is inferred from the absence of a message alone — an unreadable
 //     flip stays pending and is settled by the next accepted create.
-const COINFLIP_USAGE = '/coinflip run [PRICE] [AMOUNT] [BOT] — PRICE is a fixed amount (500000) or a random range (10k-1m), AMOUNT is how many flips per bot (default COINFLIP_DEFAULT_FLIPS), BOT defaults to the current bot (or `all` for every spawned bot). Named forms work too: wager=10k-1m flips=5 bot=BotA'
+const COINFLIP_USAGE = '/bot-coinflip run [PRICE] [AMOUNT] [BOT] — PRICE is a fixed amount (500000) or a random range (10k-1m), AMOUNT is how many flips per bot (default COINFLIP_DEFAULT_FLIPS), BOT defaults to the current bot (or `all` for every spawned bot). Named forms work too: wager=10k-1m flips=5 bot=BotA'
 const coinflipObservers = new Map()
 const coinflipSessions = new Map() // bot -> session in flight (guards against a second run)
 const coinflipLastRun = new Map() // bot -> the finished session, for the bot card
@@ -4558,9 +4558,9 @@ async function runCoinflipForBot (id, opts = {}) {
   const entry = bots[id]
   if (!entry) { logFor(activeId || SYSTEM_ID, `{red-fg}✗ No bot named "${sanitize(id)}".{/red-fg}`); return null }
   if (!entry.bot?.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not spawned — nothing to run.{/yellow-fg}`); return null }
-  if (coinflipSessions.has(id)) { logFor(id, `{yellow-fg}⚠ ${id} already has a /coinflip run going (${coinflipSessions.get(id).flips} flip(s) so far).{/yellow-fg}`); return null }
-  if (entry.manualMode) { logFor(id, `{yellow-fg}⚠ Stop manual interact (/manual-stop) before running /coinflip run on ${id}.{/yellow-fg}`); return null }
-  if (entry.crateRoutineRunning || entry.crateLoopRunning) { logFor(id, `{yellow-fg}⚠ ${id} is busy with a crate routine — skipping /coinflip run.{/yellow-fg}`); return null }
+  if (coinflipSessions.has(id)) { logFor(id, `{yellow-fg}⚠ ${id} already has a /bot-coinflip run going (${coinflipSessions.get(id).flips} flip(s) so far).{/yellow-fg}`); return null }
+  if (entry.manualMode) { logFor(id, `{yellow-fg}⚠ Stop manual interact (/manual-stop) before running /bot-coinflip run on ${id}.{/yellow-fg}`); return null }
+  if (entry.crateRoutineRunning || entry.crateLoopRunning) { logFor(id, `{yellow-fg}⚠ ${id} is busy with a crate routine — skipping /bot-coinflip run.{/yellow-fg}`); return null }
 
   const planned = opts.flips == null ? settings.get('COINFLIP_DEFAULT_FLIPS') : opts.flips
   const stopLoss = settings.get('COINFLIP_STOP_LOSS')
@@ -4571,7 +4571,7 @@ async function runCoinflipForBot (id, opts = {}) {
 
   const observer = coinflipObserverFor(id)
   observer.reset()
-  logFor(id, `{cyan-fg}› /coinflip run: up to ${planned} flip(s) at ${describeWagerSpec(spec)}, stop loss ${cfMoney(stopLoss)}{/cyan-fg}`)
+  logFor(id, `{cyan-fg}› /bot-coinflip run: up to ${planned} flip(s) at ${describeWagerSpec(spec)}, stop loss ${cfMoney(stopLoss)}{/cyan-fg}`)
 
   let result = null
   try {
@@ -4628,12 +4628,12 @@ async function runCoinflipForBot (id, opts = {}) {
   const pText = fairness.p == null ? '' : `, p=${fairness.p.toFixed(4)}`
   const flagText = fairness.flags.length ? ` — ${sanitize(fairness.flags[0])}` : ''
   logFor(id, `{${colour}}› Coinflip fairness for ${id}: ${fairness.verdict} — ${stats.wins}W/${stats.losses}L lifetime${pText}${flagText}{/${colour}}`)
-  if (stats.mismatches) logFor(id, `{red-fg}✗ ${stats.mismatches} flip(s) where the message and the balance disagreed — see /coinflip history.{/red-fg}`)
+  if (stats.mismatches) logFor(id, `{red-fg}✗ ${stats.mismatches} flip(s) where the message and the balance disagreed — see /bot-coinflip history.{/red-fg}`)
   if (result.cooldowns) logFor(id, `{yellow-fg}⚠ The server rate-limited ${result.cooldowns} create(s) during the run — raise COINFLIP_CREATE_COOLDOWN_MS in the .ENV tab if it keeps happening.{/yellow-fg}`)
   if (result.stopped === 'no-opponent') logFor(id, `{yellow-fg}⚠ The flip is still open and will not be remade. Remove it by hand if you want the run to continue, then start it again.{/yellow-fg}`)
 
   // The session stops being "in flight" the moment it ends — otherwise the next
-  // /coinflip run on this bot would be refused as a duplicate forever. The
+  // /bot-coinflip run on this bot would be refused as a duplicate forever. The
   // summary stays on the card as the last run instead.
   coinflipSessions.delete(id)
   coinflipLastRun.set(id, { ...session, finishedAt: Date.now() })
@@ -4646,11 +4646,11 @@ async function runCoinflipForBot (id, opts = {}) {
 // so the server does not see a burst of coinflip commands.
 async function runCoinflipAcrossBots (ids, opts) {
   const stagger = settings.get('ALL_SLOW_DELAY_MS')
-  logFor(SYSTEM_ID, `{cyan-fg}› Starting /coinflip run for ${ids.length} bot(s), ${cfDuration(stagger)} apart…{/cyan-fg}`)
+  logFor(SYSTEM_ID, `{cyan-fg}› Starting /bot-coinflip run for ${ids.length} bot(s), ${cfDuration(stagger)} apart…{/cyan-fg}`)
   await Promise.allSettled(ids.map((id, idx) => new Promise(resolve => {
     setTimeout(() => { runCoinflipForBot(id, opts).finally(resolve) }, idx * stagger)
   })))
-  logFor(SYSTEM_ID, `{green-fg}✓ /coinflip run finished for ${ids.length} bot(s).{/green-fg}`)
+  logFor(SYSTEM_ID, `{green-fg}✓ /bot-coinflip run finished for ${ids.length} bot(s).{/green-fg}`)
 }
 
 // ── Time series ──────────────────────────────────────────────────────────────
@@ -4857,7 +4857,7 @@ function handleAnalyticsRequest (req, res, url) {
   }
   if (p === '/api/coinflip/deep') {
     // The whole dissection, for whoever wants to re-run the statistics
-    // elsewhere — the same object the page and /coinflip deep use.
+    // elsewhere — the same object the page and /bot-coinflip deep use.
     sendJson(res, coinflipDeepReport({ bot: url.searchParams.get('bot') || null }))
     return
   }
@@ -5825,32 +5825,21 @@ logInfo(`Starting /crates-solo (shardshop → crates → dump) for ${targetId}${
 return runCratesAllSequenceForBot(targetId, blockName, plan)
 }
 
-// ── /coinflip-data-run, /coinflip-stats, /coinflip-history, /timeseries, /analytics, /env ──
-// ── /coinflip — one command for the whole suite ─────────────────────────────
-// `/coinflip run|stats|deep|history|export|help` is handled here. Any other
-// subcommand (/coinflip create 10k, /coinflip delete) belongs to the game, so it
-// is forwarded to the active bot untouched. The older top-level names
-// (/coinflip-data-run, /coinflip-stats, /coinflip-history, /coinflip-deep) still
-// work and resolve to the same subcommands.
+// ── /bot-coinflip, /timeseries, /analytics, /env ─────────────────────────────
+// ── /bot-coinflip — one command for the whole suite ─────────────────────────
+// `/bot-coinflip run|stats|deep|history|export|help` is handled here, and nothing
+// else. `/coinflip` is a SERVER command — the game's own coinflip — so this
+// console never intercepts that name: a bare /coinflip, /coinflip create 10k and
+// /coinflip delete all fall through to the selected bot like any other chat.
 const COINFLIP_SUBCOMMANDS = ['run', 'stats', 'deep', 'history', 'export', 'help']
-const COINFLIP_ALIASES = [
-  ['/coinflip-data-run', 'run'],
-  ['/coinflip-stats', 'stats'],
-  ['/coinflip-history', 'history'],
-  ['/coinflip-deep', 'deep']
-]
 const coinflipCall = (() => {
-  const match = trimmed.match(/^\/coinflip(?:\s+([\s\S]*))?$/)
-  if (match) {
-    const rest = (match[1] || '').trim()
-    if (!rest) return { sub: 'help', args: '' }
-    const word = rest.split(/\s+/)[0].toLowerCase()
-    if (COINFLIP_SUBCOMMANDS.includes(word)) return { sub: word, args: rest.slice(word.length).trim() }
-    return { sub: 'game', args: rest }
-  }
-  const alias = COINFLIP_ALIASES.find(([name]) => trimmed === name || trimmed.startsWith(name + ' '))
-  if (!alias) return null
-  return { sub: alias[1], args: trimmed.slice(alias[0].length).trim(), alias: alias[0] }
+  const match = trimmed.match(/^\/bot-coinflip(?:\s+([\s\S]*))?$/)
+  if (!match) return null
+  const rest = (match[1] || '').trim()
+  if (!rest) return { sub: 'help', args: '' }
+  const word = rest.split(/\s+/)[0].toLowerCase()
+  if (COINFLIP_SUBCOMMANDS.includes(word)) return { sub: word, args: rest.slice(word.length).trim() }
+  return { sub: 'unknown', args: rest }
 })()
 function textSpark (values) {
   const blocks = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█']
@@ -5873,12 +5862,12 @@ if (coinflipCall && coinflipCall.sub === 'run') {
     if (!match) { logWarn(`No bot named "${sanitize(target)}". Known bots: ${Object.keys(bots).join(', ') || 'none'}`); return }
     target = match
   }
-  // A per-bot dispatch (e.g. `/all-slow /coinflip run …`) arrives with that
+  // A per-bot dispatch (e.g. `/all-slow /bot-coinflip run …`) arrives with that
   // bot selected and no BOT argument — it must act on that bot, not on all of them.
   if (!target && !parsed.all && activeId) target = activeId
   if (target) return runCoinflipForBot(target, { flips, wagerSpec })
   const ids = Object.keys(bots).filter(id => bots[id]?.bot?.entity)
-  if (!ids.length) { logWarn('No spawned bots to run /coinflip run on.'); return }
+  if (!ids.length) { logWarn('No spawned bots to run /bot-coinflip run on.'); return }
   return runCoinflipAcrossBots(ids, { flips, wagerSpec })
 }
 
@@ -5891,7 +5880,7 @@ if (coinflipCall && coinflipCall.sub === 'stats') {
     rows = rows.filter(row => row.bot === match)
     label = match
   }
-  if (!rows.length) { logInfo(`No coinflip history for ${sanitize(label)} yet — run /coinflip run${wanted ? ` ${sanitize(wanted)}` : ''}.`); return }
+  if (!rows.length) { logInfo(`No coinflip history for ${sanitize(label)} yet — run /bot-coinflip run${wanted ? ` ${sanitize(wanted)}` : ''}.`); return }
   const stats = coinflip.computeStats(rows)
   const fairness = coinflip.analyzeFairness(rows, { minSample: settings.get('COINFLIP_MIN_SAMPLE'), suspicionP: settings.get('COINFLIP_SUSPICION_P') })
   const verdictColour = fairness.verdict === 'suspicious' ? 'red-fg' : fairness.verdict === 'watch' ? 'yellow-fg' : fairness.verdict === 'within-noise' ? 'green-fg' : 'gray-fg'
@@ -5919,7 +5908,7 @@ if (coinflipCall && coinflipCall.sub === 'stats') {
 if (coinflipCall && coinflipCall.sub === 'history') {
   const parts = coinflipCall.args.split(/\s+/).filter(Boolean)
   if (parts[0] === 'clear') {
-    if (parts[1] !== 'confirm') { logWarn(`This deletes ${coinflipStore.all().length} recorded flip(s) from ${COINFLIP_FILE}. Run /coinflip history clear confirm to do it.`); return }
+    if (parts[1] !== 'confirm') { logWarn(`This deletes ${coinflipStore.all().length} recorded flip(s) from ${COINFLIP_FILE}. Run /bot-coinflip history clear confirm to do it.`); return }
     const count = coinflipStore.all().length
     coinflipStore.clear()
     persistCoinflipSummary()
@@ -5928,14 +5917,14 @@ if (coinflipCall && coinflipCall.sub === 'history') {
   }
   const wanted = Number(parts[0]) || 20
   const rows = coinflipStore.all().slice(-Math.max(1, Math.min(500, wanted))).reverse()
-  if (!rows.length) { logInfo('No coinflip history yet — run /coinflip run.'); return }
+  if (!rows.length) { logInfo('No coinflip history yet — run /bot-coinflip run.'); return }
   logInfo(`{bold}── Last ${rows.length} coinflip(s) ──{/bold}`)
   rows.forEach(row => {
     const colour = row.result === 'won' ? 'green-fg' : row.result === 'lost' ? 'red-fg' : 'yellow-fg'
     const when = new Date(row.ts).toISOString().replace('T', ' ').slice(0, 19)
     log(`{${colour}} ${when} ${sanitize(row.bot)} ${row.result} ${cfMoney(row.wager)}${row.opponent ? ` vs ${sanitize(row.opponent)}` : ''} — Δ ${cfMoney(row.delta)} (${row.method})${row.mismatched ? ' ⚠ mismatch' : ''}{/${colour}}`)
   })
-  log(` {gray-fg}${COINFLIP_FILE} · /coinflip stats for the numbers{/gray-fg}`)
+  log(` {gray-fg}${COINFLIP_FILE} · /bot-coinflip stats for the numbers{/gray-fg}`)
   return
 }
 
@@ -5995,7 +5984,7 @@ if (coinflipCall && coinflipCall.sub === 'deep') {
   }
   const rows = coinflipStore.all()
   const scoped = bot ? rows.filter(row => row.bot === bot) : rows
-  if (!scoped.length) { logInfo(`No coinflip history for ${sanitize(bot || 'the fleet')} yet — run /coinflip run first.`); return }
+  if (!scoped.length) { logInfo(`No coinflip history for ${sanitize(bot || 'the fleet')} yet — run /bot-coinflip run first.`); return }
   const report = coinflipDeepReport({ bot })
   const rate = (value) => (value == null ? 'n/a' : `${(value * 100).toFixed(1)}%`)
   const mark = (row) => (row.significant ? '{green-fg}★{/green-fg} ' : row.lowSample ? '{gray-fg}·{/gray-fg} ' : '  ')
@@ -6027,17 +6016,17 @@ if (coinflipCall && coinflipCall.sub === 'deep') {
 if (coinflipCall && coinflipCall.sub === 'help') {
   const summary = coinflipStore.summary({ recent: 0, minSample: settings.get('COINFLIP_MIN_SAMPLE'), suspicionP: settings.get('COINFLIP_SUSPICION_P') })
   const stats = summary.stats
-  logInfo('{bold}── /coinflip ──{/bold}')
+  logInfo('{bold}── /bot-coinflip ──{/bold}')
   log(` recorded: ${stats.resolved} resolved flip(s) (${stats.wins}W/${stats.losses}L) · net ${cfMoney(stats.net)} · fairness verdict ${sanitize(summary.fairness.verdict)}`)
   log('')
-  log(`{cyan-fg}/coinflip run [PRICE] [AMOUNT] [BOT|all]{/cyan-fg} {gray-fg}— play AMOUNT flips (default ${settings.get('COINFLIP_DEFAULT_FLIPS')}) and record every one. PRICE is fixed (500000) or a range (10k-1m); a busy or rate-limited create is waited for, never deleted{/gray-fg}`)
-  log(`{cyan-fg}/coinflip stats [BOT]{/cyan-fg} {gray-fg}— wins, losses, net, streaks, drawdown, per-opponent, fairness verdict{/gray-fg}`)
-  log(`{cyan-fg}/coinflip deep [BOT]{/cyan-fg} {gray-fg}— the dissection: what follows a loss run, lag correlation, wager against balance, hour of day, pace, position, opponents, money curve, each with a confidence interval{/gray-fg}`)
-  log(`{cyan-fg}/coinflip history [n|clear confirm]{/cyan-fg} {gray-fg}— the raw recorded flips, and how to wipe them{/gray-fg}`)
-  log(`{cyan-fg}/coinflip export [BOT]{/cyan-fg} {gray-fg}— ${COINFLIP_EXPORT_FILE} for pandas, R or a spreadsheet{/gray-fg}`)
+  log(`{cyan-fg}/bot-coinflip run [PRICE] [AMOUNT] [BOT|all]{/cyan-fg} {gray-fg}— play AMOUNT flips (default ${settings.get('COINFLIP_DEFAULT_FLIPS')}) and record every one. PRICE is fixed (500000) or a range (10k-1m); a busy or rate-limited create is waited for, never deleted{/gray-fg}`)
+  log(`{cyan-fg}/bot-coinflip stats [BOT]{/cyan-fg} {gray-fg}— wins, losses, net, streaks, drawdown, per-opponent, fairness verdict{/gray-fg}`)
+  log(`{cyan-fg}/bot-coinflip deep [BOT]{/cyan-fg} {gray-fg}— the dissection: what follows a loss run, lag correlation, wager against balance, hour of day, pace, position, opponents, money curve, each with a confidence interval{/gray-fg}`)
+  log(`{cyan-fg}/bot-coinflip history [n|clear confirm]{/cyan-fg} {gray-fg}— the raw recorded flips, and how to wipe them{/gray-fg}`)
+  log(`{cyan-fg}/bot-coinflip export [BOT]{/cyan-fg} {gray-fg}— ${COINFLIP_EXPORT_FILE} for pandas, R or a spreadsheet{/gray-fg}`)
   log('')
-  log(' {gray-fg}anything else (/coinflip create 10k, /coinflip delete) goes to the game unchanged{/gray-fg}')
-  log(` {gray-fg}/all-slow /coinflip run 10k-1m 20 spreads it across every bot · page http://${hostForLink()}:${settings.get('ANALYTICS_PORT')}/ · JSON /api/coinflip, /api/coinflip/deep, /api/export{/gray-fg}`)
+  log(' {gray-fg}/coinflip is the server\'s own coinflip command and is never intercepted — /coinflip create 10k, /coinflip delete and a bare /coinflip all reach the selected bot untouched. This suite only owns /bot-coinflip{/gray-fg}')
+  log(` {gray-fg}/all-slow /bot-coinflip run 10k-1m 20 spreads it across every bot · page http://${hostForLink()}:${settings.get('ANALYTICS_PORT')}/ · JSON /api/coinflip, /api/coinflip/deep, /api/export{/gray-fg}`)
   return
 }
 
@@ -6050,7 +6039,7 @@ if (coinflipCall && coinflipCall.sub === 'export') {
   }
   const all = coinflipStore.all()
   const rows = match ? all.filter(row => row.bot === match) : all
-  if (!rows.length) { logInfo(`No coinflip history for ${sanitize(match || 'the fleet')} yet — /coinflip run records some first.`); return }
+  if (!rows.length) { logInfo(`No coinflip history for ${sanitize(match || 'the fleet')} yet — /bot-coinflip run records some first.`); return }
   try {
     fs.mkdirSync(path.dirname(COINFLIP_EXPORT_FILE), { recursive: true })
     fs.writeFileSync(COINFLIP_EXPORT_FILE, coinflip.toCsv(rows))
@@ -6064,12 +6053,10 @@ if (coinflipCall && coinflipCall.sub === 'export') {
   return
 }
 
-if (coinflipCall && coinflipCall.sub === 'game') {
-  // The game's own /coinflip (create, delete, …): sent to the active bot exactly
-  // like any other line this console does not own.
-  if (!activeId) { logWarn(`/coinflip ${coinflipCall.args} is a server command — select a bot first (or use /all-slow).`); return }
-  try { bots[activeId].bot.chat(trimmed) } catch (err) { logError(`Chat failed: ${sanitize(err.message)}`); return }
-  log(`{green-fg}❯{/green-fg} Sent: ${sanitize(trimmed)}`)
+if (coinflipCall && coinflipCall.sub === 'unknown') {
+  // Never forwarded: the game's own command is the plain /coinflip name, which
+  // this console does not own, so guessing at a prefix would only invent chat.
+  logWarn(`Unknown /bot-coinflip subcommand "${sanitize(coinflipCall.args.split(/\s+/)[0])}" — try /bot-coinflip for the list. The game's own command is plain /coinflip (e.g. /coinflip create 10000) and always reaches the selected bot untouched.`)
   return
 }
 if (trimmed === '/analytics' || trimmed === '/analytics open') {
