@@ -857,9 +857,41 @@ function createCoinflipStore (opts = {}) {
   return { append, appendAll, all, clear, summary, file }
 }
 
+// ── CSV export ───────────────────────────────────────────────────────────────
+// One row per recorded flip, wide enough to be analysed without the JSONL: the
+// derived columns (share of the balance, UTC time) are the ones a spreadsheet or
+// pandas would have to work out by hand otherwise.
+const CSV_COLUMNS = [
+  'index', 'ts', 'utc', 'bot', 'result', 'wager', 'opponent', 'delta',
+  'balanceBefore', 'balanceAfter', 'wagerShareOfBalance', 'method',
+  'serverHour', 'serverClock', 'mismatched'
+]
+
+function csvCell (value) {
+  if (value == null) return ''
+  const text = String(value)
+  return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text
+}
+
+function toCsv (rows) {
+  const lines = [CSV_COLUMNS.join(',')]
+  for (const row of rows) {
+    const share = row.wager != null && row.balanceBefore ? row.wager / row.balanceBefore : null
+    lines.push([
+      row.index, row.ts, row.ts == null ? '' : new Date(row.ts).toISOString(), row.bot,
+      row.result, row.wager, row.opponent, row.delta, row.balanceBefore, row.balanceAfter,
+      share == null ? '' : share.toFixed(6), row.method, row.serverHour, row.serverClock,
+      row.mismatched ? 1 : 0
+    ].map(csvCell).join(','))
+  }
+  return lines.join('\n') + '\n'
+}
+
 module.exports = {
   STREAK,
   cleanLine,
+  toCsv,
+  CSV_COLUMNS,
   parseServerClock,
   parseAmount,
   parseWagerSpec,

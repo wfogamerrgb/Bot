@@ -488,3 +488,67 @@ test('a missing history file is an empty history, not a crash', () => {
   assert.deepEqual(store.all(), [])
   assert.equal(store.summary().stats.resolved, 0)
 })
+
+// ── CSV export ───────────────────────────────────────────────────────────────
+
+// Reads a CSV line back the way a spreadsheet would, so a quoting bug shows up
+// as a shifted column rather than as a still-valid-looking line.
+function parseCsvLine (line) {
+  const cells = []
+  let cell = ''
+  let quoted = false
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i]
+    if (quoted) {
+      if (ch === '"') {
+        if (line[i + 1] === '"') { cell += '"'; i++ } else quoted = false
+      } else cell += ch
+    } else if (ch === '"') quoted = true
+    else if (ch === ',') { cells.push(cell); cell = '' } else cell += ch
+  }
+  cells.push(cell)
+  return cells
+}
+
+// A name the server hands us verbatim can contain a comma, a quote or both, and
+// a CSV that silently shifts a column is worse than no CSV.
+test('the CSV export quotes what it must and leaves the rest alone', () => {
+  const rows = [
+    flip('won', 1000, { index: 1, balanceBefore: 50000, balanceAfter: 51000, method: 'message' }),
+    flip('lost', 2000, { index: 2, opponent: 'Rival, "the" bold', balanceBefore: 40000, method: 'recreate', mismatched: true })
+  ]
+  const lines = cf.toCsv(rows).trim().split('\n')
+  assert.equal(lines[0], cf.CSV_COLUMNS.join(','))
+  assert.deepEqual(cf.CSV_COLUMNS.slice(0, 6), ['index', 'ts', 'utc', 'bot', 'result', 'wager'])
+  assert.equal(lines.length, 3)
+
+  // A plain name is written unquoted; quoting it anyway would be noise.
+  assert.match(lines[1], /,Rival,/, 'an ordinary opponent name is not quoted')
+  assert.match(lines[2], /"Rival, ""the"" bold"/, 'a comma and a quote are both escaped')
+  const cells = parseCsvLine(lines[2])
+  assert.equal(cells.length, cf.CSV_COLUMNS.length, 'the quoted row still has one cell per column')
+  assert.equal(cells[cf.CSV_COLUMNS.indexOf('opponent')], 'Rival, "the" bold')
+})
+
+// The share column is the whole point of exporting rather than reading the JSONL:
+// "did a bigger bet relative to the balance win more" needs wager/balanceBefore.
+test('the CSV export derives the wager share and an ISO timestamp per row', () => {
+  const [header, row] = cf.toCsv([
+    flip('won', 2500, { index: 7, ts: 1700000000000, balanceBefore: 50000, balanceAfter: 52500, method: 'message' })
+  ]).trim().split('\n')
+  const cells = Object.fromEntries(header.split(',').map((key, i) => [key, row.split(',')[i]]))
+  assert.equal(cells.wagerShareOfBalance, '0.050000')
+  assert.equal(cells.utc, '2023-11-14T22:13:20.000Z')
+  assert.equal(cells.bot, 'BotA')
+  assert.equal(cells.mismatched, '0')
+  assert.equal(cells.serverHour, '', 'a missing field is empty, not "undefined"')
+  // No balance to divide by — the share is left blank rather than a division by zero.
+  const [, unknown] = cf.toCsv([flip('won', 1000, { balanceBefore: null })]).trim().split('\n')
+  assert.equal(unknown.split(',')[10], '')
+})
+
+test('the CSV export of an empty history is just the header', () => {
+  const rows = cf.toCsv([]).trim().split('\n')
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0], cf.CSV_COLUMNS.join(','))
+})

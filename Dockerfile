@@ -78,6 +78,8 @@ COPY removed-bots.js ./removed-bots.js
 COPY coinflip.js ./coinflip.js
 COPY settings.js ./settings.js
 COPY timeseries.js ./timeseries.js
+COPY analysis.js ./analysis.js
+COPY analytics.js ./analytics.js
 # Build script (and its dig-fix patch script) ship in the image so
 # `npm run web-client:build` also works inside a running container
 # (docker exec …) to rebuild the client in place.
