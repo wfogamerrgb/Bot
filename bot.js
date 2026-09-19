@@ -49,6 +49,7 @@ const coinflip = require(path.join(__dirname, 'coinflip'))
 const analysis = require(path.join(__dirname, 'analysis'))
 const timeseries = require(path.join(__dirname, 'timeseries'))
 const analytics = require(path.join(__dirname, 'analytics'))
+const { handleChartJs, handleCoinflipDashboardJs } = require('./coinflip-dashboard-static')
 const mineflayer = require('mineflayer')
 const armorManager = require('mineflayer-armor-manager')
 const { pathfinder, Movements, goals: { GoalNear } } = require('mineflayer-pathfinder')
@@ -1358,10 +1359,10 @@ button.tb:hover{color:var(--txt);border-color:var(--acc)}
 .toast.bad{border-left-color:var(--red)}.toast.good{border-left-color:var(--grn)}
 .toast.out{opacity:0;transition:opacity .4s}
 @media(max-width:760px){header{overflow-x:auto}header>*{flex-shrink:0}#chips{flex-wrap:nowrap}#loghead{overflow-x:auto}#loghead>*{flex-shrink:0}#botlist{display:flex;gap:6px}.bot{margin-bottom:0}#app{grid-template-columns:1fr;grid-template-areas:"top" "side" "main";grid-template-rows:46px 160px 1fr}#cmdbar{left:0}#manualbar{left:0;overflow-x:auto;justify-content:flex-start}#search{width:110px}aside{display:flex;gap:6px;overflow-x:auto;overflow-y:hidden}.bot{min-width:180px}.views{min-width:140px;flex-direction:column}}
-</style></head><body>
+</style><script src="/chart.js"></script><script src="/coinflip-dashboard.js"></script></head><body>
 <div id="app">
 <header><div class="logo">⛏ AFK<b>CONSOLE</b></div><div id="chips"></div><div id="wsstate" class="wsstate down">offline</div><button id="logout">sign out</button></header>
-<aside><div class="views"><div class="vchip on" data-view="all">ALL</div><div class="vchip" data-view="system">SYSTEM</div><button class="vchip" id="terminalbtn" type="button">TERMINAL</button><button class="vchip" id="envbtn" type="button" title="Temporary .env overrides — nothing is written to disk">.ENV</button><!--PLAYBTN--></div><div id="botlist"></div></aside>
+<aside><div class="views"><div class="vchip on" data-view="all">ALL</div><div class="vchip" data-view="system">SYSTEM</div><button class="vchip" id="terminalbtn" type="button">TERMINAL</button><button class="vchip" id="envbtn" type="button" title="Temporary .env overrides — nothing is written to disk">.ENV</button><button class="vchip" id="coinflipbtn" type="button" title="Coinflip fleet analytics">COINFLIP</button><!--PLAYBTN--></div><div id="botlist"></div></aside>
 <main>
 <div id="loghead"><span id="channame">ALL CHANNELS</span><span id="newchip"></span>
 <input id="search" placeholder="filter logs…"><button class="tb" id="topbtn" type="button" title="scroll to top">↑ top</button><button class="tb" id="bottombtn" type="button" title="scroll to newest">↓ bottom</button><button class="tb" id="followbtn" type="button">⏸ pause</button>
@@ -1401,6 +1402,24 @@ button.tb:hover{color:var(--txt);border-color:var(--acc)}
 <div id="envpanel" hidden><div id="envbox"><div class="ehead"><b>.ENV</b><span class="enote">temporary — applied to this running process only, and forgotten on the next restart (edit the file for a permanent change)</span><button class="tb" id="envresetall" type="button">reset all</button><button class="tb" id="envclose" type="button">close</button></div><div id="envbody">loading…</div></div></div>
 <div id="terminal" hidden><div class="terminal-head"><b>bash</b><button class="tb" id="terminalclose" type="button">close</button></div><pre id="terminalout"></pre><form id="terminalform"><span class="prompt">$</span><input id="terminalinput" autocomplete="off" spellcheck="false"><button class="tb" type="submit">run</button></form></div>
 </main>
+</div>
+<div id="coinflippanel" hidden style="position:absolute;inset:0;z-index:35;background:var(--bg);overflow:auto;padding:14px">
+<div style="max-width:1400px;margin:0 auto">
+<div style="display:flex;align-items:center;gap:10px;margin-bottom:14px">
+<h2 style="color:var(--acc);font-size:15px;margin:0">🎲 Coinflip Fleet Analytics</h2>
+<button class="tb" id="cfclose" type="button" title="close">✕ close</button>
+</div>
+<div id="cfkpi" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-bottom:14px"></div>
+<div style="display:grid;grid-template-columns:280px 1fr;gap:14px;min-height:60vh">
+<div style="display:flex;flex-direction:column;gap:8px">
+<div style="color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.5px">Bots</div>
+<div id="cfbotlist" style="display:flex;flex-direction:column;gap:6px;max-height:40vh;overflow-y:auto"></div>
+<div style="color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-top:8px">Tabs</div>
+<div id="cftabs" style="display:flex;gap:6px;flex-wrap:wrap"></div>
+</div>
+<div id="cfcontent" style="min-width:0"></div>
+</div>
+</div>
 </div>
 <div id="toasts"></div>
 <script>
@@ -1812,7 +1831,7 @@ const handle = { clients, port: null, url: null }
 const appJsMatch = PAGE_HTML.match(/<script>([\s\S]*?)<\/script>/)
 const appJsBuf = Buffer.from(appJsMatch ? appJsMatch[1] : '', 'utf8')
 const pageHtml = PAGE_HTML
-.replace('<!--PLAYBTN-->', MC_WEB_ENABLED ? '<button class="vchip" id="playbtn" type="button" title="Play the server in your browser (zardoy minecraft-web-client)">PLAY</button>' : '')
+.replace('<button class="vchip" id="coinflipbtn" type="button" title="Coinflip fleet analytics">COINFLIP</button><!--PLAYBTN-->', MC_WEB_ENABLED ? '<button class="vchip" id="playbtn" type="button" title="Play the server in your browser (zardoy minecraft-web-client)">PLAY</button>' : '')
 .replace(/<script>[\s\S]*?<\/script>/, '<script src="/app.js"></script>')
 const pageBuf = Buffer.from(pageHtml, 'utf8')
 let pageGz = null
@@ -2220,6 +2239,52 @@ webTrace('serving minecraft web client page')
 res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' })
 res.end(playPageHtml(clientBaseFor(req)))
 return
+}
+if (p === '/api/coinflip/summary' && req.method === 'GET') {
+  sendJson(res, coinflipStore.summary({ recent: 100, minSample: settings.get('COINFLIP_MIN_SAMPLE'), suspicionP: settings.get('COINFLIP_SUSPICION_P') }))
+  return
+}
+if (p === '/api/coinflip/bot' && req.method === 'GET') {
+  const botName = url.searchParams.get('bot') || null
+  if (!botName) { sendJson(res, { ok: false, error: 'bot parameter required' }, 400); return }
+  const rows = coinflipStore.all().filter(r => r.bot === botName)
+  const summary = coinflipStore.summary({ recent: 100, minSample: settings.get('COINFLIP_MIN_SAMPLE'), suspicionP: settings.get('COINFLIP_SUSPICION_P') })
+  sendJson(res, { bot: botName, rows, summary })
+  return
+}
+if (p === '/api/coinflip/fairness' && req.method === 'GET') {
+  const rows = coinflipStore.all()
+  const fairness = coinflip.analyzeFairness(rows, { minSample: settings.get('COINFLIP_MIN_SAMPLE'), suspicionP: settings.get('COINFLIP_SUSPICION_P') })
+  sendJson(res, fairness)
+  return
+}
+if (p === '/api/coinflip/deep' && req.method === 'GET') {
+  const botName = url.searchParams.get('bot') || null
+  const deep = coinflipDeepReport({ bot: botName })
+  sendJson(res, deep)
+  return
+}
+if (p === '/api/coinflip/bots' && req.method === 'GET') {
+  const rows = coinflipStore.all()
+  const botsMap = {}
+  for (const row of rows) {
+    if (!botsMap[row.bot]) botsMap[row.bot] = { flips: 0, wins: 0, losses: 0, net: 0, lastSeen: 0 }
+    botsMap[row.bot].flips++
+    if (row.result === 'win') botsMap[row.bot].wins++
+    else if (row.result === 'loss') botsMap[row.bot].losses++
+    botsMap[row.bot].net += row.delta || 0
+    botsMap[row.bot].lastSeen = Math.max(botsMap[row.bot].lastSeen, row.ts || 0)
+  }
+  sendJson(res, { bots: botsMap })
+  return
+}
+if (p === '/chart.js' && req.method === 'GET') {
+  handleChartJs(req, res)
+  return
+}
+if (p === '/coinflip-dashboard.js' && req.method === 'GET') {
+  handleCoinflipDashboardJs(req, res)
+  return
 }
 res.writeHead(404); res.end('not found')
 } catch (err) {
