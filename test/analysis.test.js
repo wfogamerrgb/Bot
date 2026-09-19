@@ -248,5 +248,5 @@ test('records are never mutated and a nonsense record is skipped rather than fat
   assert.deepEqual(input, copy, 'the dissection sorts a copy, it does not reorder the history')
   assert.equal(report.resolved, 2)
   assert.deepEqual(analysis.deepAnalysis([]).resolved, 0)
-  assert.deepEqual(analysis.deepAnalysis().sections.length, 13)
+  assert.deepEqual(analysis.deepAnalysis().sections.length, 18)
 })

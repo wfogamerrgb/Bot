@@ -803,7 +803,7 @@ const coinflipStore = coinflip.createCoinflipStore({ file: COINFLIP_FILE, maxRec
 const timeseriesStore = timeseries.createTimeseriesStore({ file: TIMESERIES_FILE })
 
 
-const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dump-spawners', '/dc', '/reconnect', '/crates', '/crates-loop', '/spawners', '/data', '/shardshop-loop', '/closeBot', '/bot-coinflip']
+const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dump-spawners', '/dc', '/reconnect', '/crates', '/crates-loop', '/spawners', '/data', '/shardshop-loop', '/closeBot', '/bot-coinflip', '/bot-coinflip-all']
 
 const logSubscribers = new Set()
 function subscribeLog(fn) { logSubscribers.add(fn); return () => logSubscribers.delete(fn) }
@@ -4434,9 +4434,24 @@ cratesAllRunning = false
 //   • Nothing is inferred from the absence of a message alone — an unreadable
 //     flip stays pending and is settled by the next accepted create.
 const COINFLIP_USAGE = '/bot-coinflip run [PRICE] [AMOUNT] [BOT] — PRICE is a fixed amount (500000) or a random range (10k-1m), AMOUNT is how many flips per bot (default COINFLIP_DEFAULT_FLIPS), BOT defaults to the current bot (or `all` for every spawned bot). Named forms work too: wager=10k-1m flips=5 bot=BotA'
+const COINFLIP_ALL_USAGE = '/bot-coinflip-all run [PRICE] [AMOUNT] [MAX_CONCURRENT] — runs coinflips across the fleet with a concurrency pool. Randomly selects MAX_CONCURRENT bots (default 5), each playing AMOUNT flips (default COINFLIP_DEFAULT_FLIPS). When a bot finishes, another random bot is selected from the queue automatically. PRICE is fixed (500000) or a random range (10k-1m).'
 const coinflipObservers = new Map()
 const coinflipSessions = new Map() // bot -> session in flight (guards against a second run)
 const coinflipLastRun = new Map() // bot -> the finished session, for the bot card
+
+// ── /bot-coinflip-all concurrency-pooled fleet engine ───────────────────────
+// Runs coinflips across the fleet with a concurrency pool: at most
+// MAX_CONCURRENT bots are active at once, and when one finishes another random
+// bot is selected from the queue. This prevents server rate-limiting from a
+// burst of simultaneous creates while keeping the fleet busy.
+const coinflipAllPool = {
+  active: new Map(),     // botId -> { session, opts }
+  queue: [],             // remaining botIds waiting to run
+  completed: 0,          // total flips completed across the fleet
+  total: 0,              // total flips planned
+  running: false,
+  stopRequested: false
+}
 
 function cfMoney (value) {
   if (value == null || !Number.isFinite(Number(value))) return 'N/A'
@@ -4651,6 +4666,81 @@ async function runCoinflipAcrossBots (ids, opts) {
     setTimeout(() => { runCoinflipForBot(id, opts).finally(resolve) }, idx * stagger)
   })))
   logFor(SYSTEM_ID, `{green-fg}✓ /bot-coinflip run finished for ${ids.length} bot(s).{/green-fg}`)
+}
+
+// ── /bot-coinflip-all: concurrency-pooled fleet engine ─────────────────────
+// Runs coinflips across the fleet with a concurrency pool: at most
+// MAX_CONCURRENT bots are active at once. When one finishes, another random
+// bot is selected from the queue automatically. This prevents server
+// rate-limiting from a burst of simultaneous creates while keeping the fleet
+// busy. Uses Fisher-Yates shuffle for random selection.
+function shuffleArray (arr) {
+  const a = arr.slice()
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1))
+    ;[a[i], a[j]] = [a[j], a[i]]
+  }
+  return a
+}
+
+async function runCoinflipAll (ids, opts) {
+  const maxConcurrent = Math.max(1, Math.min(opts.maxConcurrent || 5, ids.length))
+  const flipsPerBot = opts.flips || settings.get('COINFLIP_DEFAULT_FLIPS')
+  const totalFlips = flipsPerBot * ids.length
+  
+  coinflipAllPool.active.clear()
+  coinflipAllPool.queue = shuffleArray(ids)
+  coinflipAllPool.completed = 0
+  coinflipAllPool.total = totalFlips
+  coinflipAllPool.running = true
+  coinflipAllPool.stopRequested = false
+  
+  logFor(SYSTEM_ID, `{cyan-fg}› Starting /bot-coinflip-all: ${ids.length} bot(s), ${maxConcurrent} concurrent, ${flipsPerBot} flips each (${totalFlips} total){/cyan-fg}`)
+  
+  return new Promise((resolve) => {
+    const pump = async () => {
+      // Fill the pool up to maxConcurrent
+      while (coinflipAllPool.active.size < maxConcurrent && coinflipAllPool.queue.length > 0 && !coinflipAllPool.stopRequested) {
+        const botId = coinflipAllPool.queue.shift()
+        const entry = bots[botId]
+        if (!entry?.bot?.entity) continue
+        if (coinflipSessions.has(botId)) continue
+        if (entry.manualMode) continue
+        if (entry.crateRoutineRunning || entry.crateLoopRunning) continue
+        
+        const session = { startedAt: Date.now(), planned: flipsPerBot, flips: 0, wins: 0, losses: 0, unresolved: 0, net: 0, stopped: 'running', sessionId: `cf-all-${Date.now().toString(36)}` }
+        coinflipSessions.set(botId, session)
+        coinflipAllPool.active.set(botId, { session, opts })
+        notifyBotsChanged()
+        
+        // Run the session asynchronously; when done, remove from pool and pump again
+        runCoinflipForBot(botId, { flips: flipsPerBot, wagerSpec: opts.wagerSpec }).finally(() => {
+          coinflipAllPool.active.delete(botId)
+          coinflipAllPool.completed += flipsPerBot
+          notifyBotsChanged()
+          pump() // refill the pool
+        })
+      }
+      
+      // Check if done
+      if (coinflipAllPool.active.size === 0 && coinflipAllPool.queue.length === 0) {
+        coinflipAllPool.running = false
+        logFor(SYSTEM_ID, `{green-fg}✓ /bot-coinflip-all finished: ${coinflipAllPool.completed} flips completed across ${ids.length} bot(s).{/green-fg}`)
+        resolve({ completed: coinflipAllPool.completed, total: coinflipAllPool.total })
+      }
+    }
+    pump()
+  })
+}
+
+async function stopCoinflipAll () {
+  coinflipAllPool.stopRequested = true
+  // Wait for active sessions to finish
+  while (coinflipAllPool.active.size > 0) {
+    await new Promise(r => setTimeout(r, 1000))
+  }
+  coinflipAllPool.running = false
+  logFor(SYSTEM_ID, `{yellow-fg}⚠ /bot-coinflip-all stopped by request.{/yellow-fg}`)
 }
 
 // ── Time series ──────────────────────────────────────────────────────────────
@@ -5823,6 +5913,53 @@ if (!bots[targetId]) { logWarn(`No bot named "${sanitize(targetId)}".`); return 
 const plan = cratesAllPlan(flags)
 logInfo(`Starting /crates-solo (shardshop → crates → dump) for ${targetId}${blockName ? ` targeting ${blockName.replace(/_/g, ' ')}` : ''} — ${describeCratesAllPlan(plan)}…`)
 return runCratesAllSequenceForBot(targetId, blockName, plan)
+}
+
+// ── /bot-coinflip-all: concurrency-pooled fleet engine ─────────────────────
+// Runs coinflips across the fleet with a concurrency pool: at most
+// MAX_CONCURRENT bots are active at once. When one finishes, another random
+// bot is selected from the queue automatically. This prevents server
+// rate-limiting from a burst of simultaneous creates while keeping the fleet
+// busy. Uses Fisher-Yates shuffle for random selection.
+if (trimmed === '/bot-coinflip-all' || trimmed.startsWith('/bot-coinflip-all ')) {
+  const parts = trimmed.slice('/bot-coinflip-all'.length).trim().split(/\s+/).filter(Boolean)
+  const sub = parts[0] || 'help'
+  
+  if (sub === 'help' || sub === '') {
+    const summary = coinflipStore.summary({ recent: 0, minSample: settings.get('COINFLIP_MIN_SAMPLE'), suspicionP: settings.get('COINFLIP_SUSPICION_P') })
+    const stats = summary.stats
+    logInfo('{bold}── /bot-coinflip-all ──{/bold}')
+    log(` running: ${coinflipAllPool.running} · active: ${coinflipAllPool.active.size} · queued: ${coinflipAllPool.queue.length} · completed: ${coinflipAllPool.completed}/${coinflipAllPool.total}`)
+    log('')
+    log(`{cyan-fg}/bot-coinflip-all run [PRICE] [AMOUNT] [MAX_CONCURRENT]{/cyan-fg} {gray-fg}— run coinflips across the fleet with a concurrency pool. Randomly selects MAX_CONCURRENT bots (default 5), each playing AMOUNT flips (default ${settings.get('COINFLIP_DEFAULT_FLIPS')}). When a bot finishes, another random bot is selected from the queue automatically. PRICE is fixed (500000) or a range (10k-1m).{/gray-fg}`)
+    log(`{cyan-fg}/bot-coinflip-all stop{/cyan-fg} {gray-fg}— stop the current /bot-coinflip-all run after the active flips finish.{/gray-fg}`)
+    log('')
+    log(` {gray-fg}/all-slow /bot-coinflip-all run 10k-1m 5000 5 runs it across every bot with 5 concurrent{/gray-fg}`)
+    return
+  }
+  
+  if (sub === 'stop') {
+    if (!coinflipAllPool.running) { logWarn('/bot-coinflip-all is not running.'); return }
+    return stopCoinflipAll()
+  }
+  
+  if (sub === 'run') {
+    const rest = parts.slice(1)
+    const parsed = coinflip.parseCoinflipRunArgs(rest)
+    if (parsed.errors.length) { logWarn(`Unknown option "${sanitize(parsed.errors[0])}". Usage: ${COINFLIP_ALL_USAGE}`); return }
+    const wagerSpec = parsed.wager || coinflip.parseWagerSpec('', { min: settings.get('COINFLIP_WAGER_MIN'), max: settings.get('COINFLIP_WAGER_MAX') })
+    const flips = parsed.flips || settings.get('COINFLIP_DEFAULT_FLIPS')
+    const maxConcurrent = Math.max(1, Math.min(rest.length > 0 && /^\d+$/.test(rest[rest.length - 1]) ? parseInt(rest.pop(), 10) : 5, 30))
+    
+    const ids = Object.keys(bots).filter(id => bots[id]?.bot?.entity)
+    if (!ids.length) { logWarn('No spawned bots to run /bot-coinflip-all on.'); return }
+    if (coinflipAllPool.running) { logWarn('/bot-coinflip-all is already running. Use /bot-coinflip-all stop first.'); return }
+    
+    return runCoinflipAll(ids, { flips, wagerSpec, maxConcurrent })
+  }
+  
+  logWarn(`Unknown /bot-coinflip-all subcommand "${sanitize(sub)}" — try /bot-coinflip-all for the list.`)
+  return
 }
 
 // ── /bot-coinflip, /timeseries, /analytics, /env ─────────────────────────────

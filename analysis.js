@@ -406,6 +406,162 @@ function martingaleEntries (records, alreadySorted = false) {
   return { entries, afterLoss }
 }
 
+/** Fleet Homogeneity (Cochran's Q / Chi-Square across bots) */
+function fleetHomogeneityTest (orderedRecords) {
+  const byBot = new Map()
+  for (const row of orderedRecords) {
+    const bot = row.bot || '(unknown)'
+    if (!byBot.has(bot)) byBot.set(bot, { wins: 0, losses: 0, n: 0 })
+    const b = byBot.get(bot)
+    b.n++
+    if (row.result === STREAK.WON) b.wins++
+    else if (row.result === STREAK.LOST) b.losses++
+  }
+  const bots = [...byBot.entries()].filter(([_, b]) => b.n >= 5)
+  if (bots.length < 2) return { chi2: null, p: null, bots: bots.length }
+  const totalN = sumOf(bots.map(([_, b]) => b.n))
+  const totalWins = sumOf(bots.map(([_, b]) => b.wins))
+  const pBar = totalWins / totalN
+  if (!(pBar > 0 && pBar < 1)) return { chi2: null, p: null, bots: bots.length }
+  
+  let chi2 = 0
+  for (const [bot, b] of bots) {
+    const expectedWins = b.n * pBar
+    const expectedLosses = b.n * (1 - pBar)
+    chi2 += ((b.wins - expectedWins) ** 2) / expectedWins + ((b.losses - expectedLosses) ** 2) / expectedLosses
+  }
+  const df = bots.length - 1
+  return {
+    chi2,
+    df,
+    p: chiSquareP(chi2, df),
+    bots: bots.length,
+    pBar
+  }
+}
+
+/** Kaplan-Meier hazard rate for streak hard-caps */
+function streakHazardAnalysis (outcomes, maxK = 8) {
+  const hazardRows = []
+  for (const kind of [STREAK.WON, STREAK.LOST]) {
+    const verb = kind === STREAK.WON ? 'win' : 'loss'
+    for (let k = 1; k <= maxK; k++) {
+      let reached = 0
+      let terminated = 0
+      for (let i = k; i < outcomes.length; i++) {
+        let match = true
+        for (let j = 1; j <= k; j++) {
+          if (outcomes[i - j] !== kind) { match = false; break }
+        }
+        if (!match) continue
+        reached++
+        if (outcomes[i] !== kind) terminated++
+      }
+      if (reached >= 10) {
+        const hazard = terminated / reached
+        const test = rateTest(terminated, reached, 0.5)
+        hazardRows.push({
+          label: `hazard of ending a ${k}× ${verb} streak`,
+          n: reached,
+          wins: terminated,
+          losses: reached - terminated,
+          rate: hazard,
+          ci: wilsonInterval(terminated, reached),
+          z: test.z,
+          p: test.p,
+          expected: 0.5,
+          note: `terminated ${terminated} / reached ${reached} (${pctText(hazard)})`
+        })
+      }
+    }
+  }
+  return hazardRows
+}
+
+/** Rolling Window Profit Decay / Soft Cap test */
+function profitCapAnalysis (orderedRecords) {
+  let cumulative = 0
+  const entries = []
+  for (const row of orderedRecords) {
+    const net = recordNet(row)
+    cumulative += net
+    entries.push({ row, key: cumulative })
+  }
+  if (entries.length < 30) return { rows: [], trend: null }
+  
+  const profits = entries.map(e => e.key).sort((a, b) => a - b)
+  const edges = [quantileSorted(profits, 0.25), quantileSorted(profits, 0.5), quantileSorted(profits, 0.75)]
+  const rows = bucketEntries(entries, edges, (index) => {
+    if (index === 0) return 'lowest profit quartile'
+    if (index === 1) return 'lower-middle profit quartile'
+    if (index === 2) return 'upper-middle profit quartile'
+    return 'highest profit quartile'
+  })
+  rows.forEach((row, i) => { row.score = i })
+  const trend = trendTest(rows)
+  return { rows, trend }
+}
+
+/** Simultaneous Flip Cross-Correlation across bots */
+function simultaneousFlipAnalysis (orderedRecords, windowMs = 2000) {
+  const timed = orderedRecords.filter(r => r.ts).sort((a, b) => a.ts - b.ts)
+  let simultaneousPairs = 0
+  let sameOutcomePairs = 0
+  for (let i = 0; i < timed.length; i++) {
+    for (let j = i + 1; j < timed.length; j++) {
+      const dt = timed[j].ts - timed[i].ts
+      if (dt > windowMs) break
+      if (timed[i].bot !== timed[j].bot) {
+        simultaneousPairs++
+        if (timed[i].result === timed[j].result) sameOutcomePairs++
+      }
+    }
+  }
+  const agreementRate = simultaneousPairs ? sameOutcomePairs / simultaneousPairs : null
+  const test = rateTest(sameOutcomePairs, simultaneousPairs, 0.5)
+  return {
+    pairs: simultaneousPairs,
+    sameOutcomePairs,
+    agreementRate,
+    p: test.p
+  }
+}
+
+/** Opponent Binomial Disparity Matrix (House Bot / Shill detection) */
+function opponentDisparityAnalysis (orderedRecords, minBucket = 10) {
+  const byOpponent = new Map()
+  for (const row of orderedRecords) {
+    const opp = row.opponent || '(unnamed)'
+    if (!byOpponent.has(opp)) byOpponent.set(opp, { winsAgainstUs: 0, lossesAgainstUs: 0, n: 0, wagered: 0, net: 0 })
+    const o = byOpponent.get(opp)
+    o.n++
+    const net = recordNet(row)
+    o.net += net
+    o.wagered += Number(row.wager) || 0
+    if (row.result === STREAK.WON) o.lossesAgainstUs++
+    else o.winsAgainstUs++
+  }
+  const rows = []
+  for (const [opp, o] of byOpponent.entries()) {
+    if (o.n < minBucket) continue
+    const test = rateTest(o.winsAgainstUs, o.n, 0.5)
+    rows.push({
+      label: `opponent ${opp}`,
+      n: o.n,
+      wins: o.winsAgainstUs,
+      losses: o.lossesAgainstUs,
+      rate: o.winsAgainstUs / o.n,
+      ci: wilsonInterval(o.winsAgainstUs, o.n),
+      z: test.z,
+      p: test.p,
+      expected: 0.5,
+      net: -o.net,
+      note: `net impact on us: ${Number(o.net).toFixed(2)}`
+    })
+  }
+  return rows.sort((a, b) => b.rate - a.rate)
+}
+
 function moneyCurve (ordered) {
   let cumulative = 0
   let peak = 0
@@ -752,6 +908,69 @@ function deepAnalysis (records = [], opts = {}) {
     extra: { curve }
   })
 
+  // 14 — fleet homogeneity: are all accounts on the same luck curve?
+  const fleetHomogeneity = fleetHomogeneityTest(ordered)
+  sections.push({
+    key: 'fleet',
+    title: 'Fleet homogeneity',
+    question: 'Do all bots share the same win rate, or does the server hand out luck per account?',
+    summary: fleetHomogeneity.chi2 == null
+      ? 'Not enough bots with enough flips to compare.'
+      : `${fleetHomogeneity.bots} bot(s) compared (χ²=${fleetHomogeneity.chi2.toFixed(2)}, df=${fleetHomogeneity.df}, p=${fleetHomogeneity.p == null ? 'n/a' : fleetHomogeneity.p.toFixed(4)}). Pooled p=${pctText(fleetHomogeneity.pBar, 2)}. A p<0.01 means the bots are NOT on the same luck curve — some accounts are blessed or cursed.`,
+    rows: [],
+    extra: { chi2: fleetHomogeneity.chi2, chi2p: fleetHomogeneity.p, df: fleetHomogeneity.df }
+  })
+
+  // 15 — Kaplan-Meier hazard rate: are streaks cut off at a hard cap?
+  const hazardRows = streakHazardAnalysis(outcomes, 8)
+  sections.push({
+    key: 'hazard',
+    title: 'Streak hard-caps',
+    question: 'Does the server force a loss after N consecutive wins (or a win after N losses)?',
+    summary: hazardRows.length
+      ? `Hazard of streak ending at each step: ${hazardRows.slice(0, 4).map(r => `${r.label.split(' ')[2]}× = ${pctText(r.rate, 1)} (n=${r.n})`).join(' · ')}`
+      : 'Not enough streaks of length ≥1 to measure.',
+    rows: hazardRows
+  })
+
+  // 16 — rolling profit decay: does the win rate collapse after a big run?
+  const profitCap = profitCapAnalysis(ordered)
+  sections.push({
+    key: 'profit',
+    title: 'Profit soft-caps',
+    question: 'Does the win rate fall off as cumulative profit rises — a daily or session cap?',
+    summary: profitCap.rows.length
+      ? `Win rate across profit quartiles: ${profitCap.rows.map(r => `${r.label}: ${pctText(r.rate, 1)} (n=${r.n})`).join(' · ')}${profitCap.trend.p == null ? '' : ` · trend p=${profitCap.trend.p.toFixed(4)}`}`
+      : 'Not enough cumulative profit spread to bucket.',
+    rows: profitCap.rows,
+    extra: { trend: profitCap.trend }
+  })
+
+  // 17 — simultaneous flip cross-correlation across bots
+  const simultaneous = simultaneousFlipAnalysis(ordered)
+  sections.push({
+    key: 'simultaneous',
+    title: 'Simultaneous flips',
+    question: 'Do bots flipping on the same server tick share the same outcome (shared PRNG state)?',
+    summary: simultaneous.pairs == null || simultaneous.pairs < 10
+      ? `${simultaneous.pairs || 0} simultaneous pairs — not enough to test for a shared PRNG.`
+      : `${simultaneous.pairs} simultaneous pairs across different bots; ${pctText(simultaneous.agreementRate, 1)} agreed on the same outcome (p=${simultaneous.p == null ? 'n/a' : simultaneous.p.toExponential(2)}). A fair coin with independent PRNGs gives 50%.`,
+    rows: [],
+    extra: { pairs: simultaneous.pairs, sameOutcomePairs: simultaneous.sameOutcomePairs, agreementRate: simultaneous.agreementRate, p: simultaneous.p }
+  })
+
+  // 18 — opponent binomial disparity matrix (house bot / shill detection)
+  const opponentDisparity = opponentDisparityAnalysis(ordered, minBucket)
+  sections.push({
+    key: 'disparity',
+    title: 'Opponent disparity',
+    question: 'Is one opponent account winning far more than the coin says they should (a house bot or staff account)?',
+    summary: opponentDisparity.length
+      ? `${opponentDisparity.length} opponent(s) with n≥${minBucket}. Most extreme: ${opponentDisparity[0].label} at ${pctText(opponentDisparity[0].rate, 1)} (n=${opponentDisparity[0].n}, p=${opponentDisparity[0].p == null ? 'n/a' : opponentDisparity[0].p.toExponential(2)}).`
+      : 'No opponents with enough flips to test.',
+    rows: opponentDisparity
+  })
+
   // 14 — per bot, which is only a dissection when there is a fleet.
   const byBot = new Map()
   for (const row of ordered) {
@@ -838,6 +1057,11 @@ function deepAnalysis (records = [], opts = {}) {
 
 module.exports = {
   deepAnalysis,
+  fleetHomogeneityTest,
+  streakHazardAnalysis,
+  profitCapAnalysis,
+  simultaneousFlipAnalysis,
+  opponentDisparityAnalysis,
   conditionalStreakRows,
   runLengthAnalysis,
   markovAnalysis,
