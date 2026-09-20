@@ -4,7 +4,7 @@
   "description": "",
   "main": "bot.js",
   "scripts": {
-    "start": "node bot.js",
+    "start": "bash ./scripts/restart-tor.sh",
     "test": "node --test test/*.test.js",
     "web-client:build": "bash ./scripts/build-web-client.sh",
     "web-client:serve": "node web-client.js",
