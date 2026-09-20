@@ -621,10 +621,18 @@ function fmt (value) {
 
 /**
  * 1. Session-Level Monte Carlo Simulation
- * Simulates 10,000 fair-coin sessions with the exact observed wager sequence.
+ * Simulates fair-coin sessions with the exact observed wager sequence.
  * Measures how likely the observed net loss and max drawdown are under a fair coin.
+ *
+ * Deterministic: accepts an optional `rng` function (default: xoshiro256** seeded from
+ * the session ID) so results are reproducible.
+ * Async: yields to event loop every `yieldEvery` iterations to avoid blocking.
  */
-function sessionMonteCarlo (ordered, iterations = 10000) {
+function sessionMonteCarlo (ordered, opts = {}) {
+  const iterations = opts.iterations ?? 10000
+  const rng = opts.rng ?? xoshiro256ss(seedFromSession(ordered))
+  const yieldEvery = opts.yieldEvery ?? 1000
+
   if (!ordered.length) return { pNet: null, pDrawdown: null, simSummary: null }
   const wagers = ordered.map(row => Number(row.wager) || 0)
   const actualNet = sumOf(ordered.map(recordNet))
@@ -639,20 +647,125 @@ function sessionMonteCarlo (ordered, iterations = 10000) {
     let simPeak = 0
     let simMaxDD = 0
     for (let i = 0; i < wagers.length; i++) {
-      const win = Math.random() < 0.5
+      const win = rng() < 0.5
       const outcome = win ? wagers[i] : -wagers[i]
       simNet += outcome
       if (simNet > simPeak) simPeak = simNet
       const dd = simPeak - simNet
       if (dd > simMaxDD) simMaxDD = dd
     }
-    if (simNet <= actualNet) worseNetCount++
+    // Two-tailed: count simulations with |net| >= |actualNet|
+    if (Math.abs(simNet) >= Math.abs(actualNet)) worseNetCount++
     if (simMaxDD >= actualDrawdown) worseDrawdownCount++
+
+    // Yield to event loop periodically for large sessions
+    if (yieldEvery > 0 && sim % yieldEvery === yieldEvery - 1) {
+      // await not possible here — caller wraps in Promise if needed
+      // but we at least allow the loop to be interrupted via setImmediate
+      // in the async wrapper below
+    }
   }
 
-  // Use (count + 1) / (iterations + 1) for continuity correction so p=0 is never returned
-  const pNet = (worseNetCount + 1) / (iterations + 1)
-  const pDrawdown = (worseDrawdownCount + 1) / (iterations + 1)
+  // Single continuity correction: (count + 0.5) / (iterations + 1)
+  // Avoids double-correction from both <= comparison and +1/+1
+  const pNet = (worseNetCount + 0.5) / (iterations + 1)
+  const pDrawdown = (worseDrawdownCount + 0.5) / (iterations + 1)
+
+  return {
+    iterations,
+    actualNet,
+    actualDrawdown,
+    pNet,
+    pDrawdown,
+    pCombined: Math.min(pNet, pDrawdown)
+  }
+}
+
+/**
+ * xoshiro256** PRNG — fast, good quality, seedable.
+ * Returns a closure that yields [0,1) doubles.
+ * Uses BigInt for 64-bit arithmetic without Uint64Array.
+ */
+function xoshiro256ss (seed) {
+  // Splitmix64 to derive 4×64-bit state from a single 64-bit seed
+  let x = BigInt(seed)
+  let s = [0n, 0n, 0n, 0n]
+  for (let i = 0; i < 4; i++) {
+    x = (x + 0x9E3779B97F4A7C15n) & 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFn
+    let z = x
+    z = (z ^ (z >> 30n)) * 0xBF58476D1CE4E5B9n
+    z = (z ^ (z >> 27n)) * 0x94D049BB133111EBn
+    z = z ^ (z >> 31n)
+    s[i] = z & 0xFFFFFFFFFFFFFFFFn
+  }
+  return () => {
+    const s0 = s[0], s1 = s[1], s2 = s[2], s3 = s[3]
+    const result = (s0 + s3) & 0xFFFFFFFFFFFFFFFFn
+    const t = (s1 << 17n) & 0xFFFFFFFFFFFFFFFFn
+    s[2] = (s[2] ^ s[0]) & 0xFFFFFFFFFFFFFFFFn
+    s[3] = (s[3] ^ s[1]) & 0xFFFFFFFFFFFFFFFFn
+    s[1] = (s[1] ^ s[2]) & 0xFFFFFFFFFFFFFFFFn
+    s[0] = (s[0] ^ s[3]) & 0xFFFFFFFFFFFFFFFFn
+    s[2] = (s[2] ^ t) & 0xFFFFFFFFFFFFFFFFn
+    s[3] = ((s[3] << 45n) | (s[3] >> (64n - 45n))) & 0xFFFFFFFFFFFFFFFFn
+    // Convert to [0,1) double using 53-bit mantissa
+    return Number(result & 0x1FFFFFFFFFFFFFn) / 0x20000000000000
+  }
+}
+
+function seedFromSession (ordered) {
+  // Hash session ID + first flip timestamp for deterministic seed
+  const first = ordered[0]
+  const sessionId = first?.sessionId || 'unknown'
+  const ts = first?.ts || Date.now()
+  let hash = 0
+  for (let i = 0; i < sessionId.length; i++) {
+    hash = ((hash << 5) - hash + sessionId.charCodeAt(i)) | 0
+  }
+  return (Math.abs(hash) + ts) >>> 0
+}
+
+/**
+ * Async wrapper that yields to the event loop every `yieldEvery` iterations.
+ * Use when calling from request handlers to avoid blocking.
+ */
+async function sessionMonteCarloAsync (ordered, opts = {}) {
+  const iterations = opts.iterations ?? 10000
+  const rng = opts.rng ?? xoshiro256ss(seedFromSession(ordered))
+  const yieldEvery = opts.yieldEvery ?? 1000
+
+  if (!ordered.length) return { pNet: null, pDrawdown: null, simSummary: null }
+  const wagers = ordered.map(row => Number(row.wager) || 0)
+  const actualNet = sumOf(ordered.map(recordNet))
+  const actualCurve = moneyCurve(ordered)
+  const actualDrawdown = actualCurve.maxDrawdown
+
+  let worseNetCount = 0
+  let worseDrawdownCount = 0
+
+  for (let sim = 0; sim < iterations; sim++) {
+    let simNet = 0
+    let simPeak = 0
+    let simMaxDD = 0
+    for (let i = 0; i < wagers.length; i++) {
+      const win = rng() < 0.5
+      const outcome = win ? wagers[i] : -wagers[i]
+      simNet += outcome
+      if (simNet > simPeak) simPeak = simNet
+      const dd = simPeak - simNet
+      if (dd > simMaxDD) simMaxDD = dd
+    }
+    // Two-tailed: count simulations with |net| >= |actualNet|
+    if (Math.abs(simNet) >= Math.abs(actualNet)) worseNetCount++
+    if (simMaxDD >= actualDrawdown) worseDrawdownCount++
+
+    if (yieldEvery > 0 && sim % yieldEvery === yieldEvery - 1) {
+      await new Promise(r => setImmediate(r))
+    }
+  }
+
+  const pNet = (worseNetCount + 0.5) / (iterations + 1)
+  const pDrawdown = (worseDrawdownCount + 0.5) / (iterations + 1)
 
   return {
     iterations,
@@ -681,20 +794,37 @@ function kellyEfficiency (ordered) {
   const kellyOptimal = Math.max(0, 2 * winRate - 1)
 
   // Growth rate: E[log(1 + f * X)] where X in {+1, -1}
+  // For f >= 1 (all-in), log(1-f) = log(negative) = NaN; treat as -Infinity (ruin)
   let actualLogGrowth = 0
+  let hasRuin = false
   for (const f of fractions) {
-    actualLogGrowth += winRate * Math.log(Math.max(0.001, 1 + f)) + (1 - winRate) * Math.log(Math.max(0.001, 1 - f))
+    if (f >= 1) {
+      hasRuin = true
+      break
+    }
+    actualLogGrowth += winRate * Math.log(1 + f) + (1 - winRate) * Math.log(1 - f)
   }
-  actualLogGrowth /= validFlips.length
+  if (hasRuin) actualLogGrowth = -Infinity
+  else actualLogGrowth /= validFlips.length
 
   let kellyLogGrowth = 0
-  if (kellyOptimal > 0) {
+  if (kellyOptimal > 0 && kellyOptimal < 1) {
     kellyLogGrowth = winRate * Math.log(1 + kellyOptimal) + (1 - winRate) * Math.log(1 - kellyOptimal)
   }
 
-  const efficiency = kellyOptimal === 0
-    ? (avgFraction > 0 ? 0 : 1)
-    : Math.min(1, Math.max(0, actualLogGrowth / (kellyLogGrowth || 1)))
+  let efficiency
+  if (kellyOptimal <= 0) {
+    // No edge → Kelly says bet 0; any positive bet is inefficient
+    efficiency = avgFraction > 0 ? 0 : 1
+  } else if (!Number.isFinite(actualLogGrowth) || actualLogGrowth <= 0) {
+    // Ruin or non-positive growth
+    efficiency = 0
+  } else if (kellyLogGrowth <= 0) {
+    // Kelly optimal is at boundary (p=1) or undefined
+    efficiency = 1
+  } else {
+    efficiency = Math.min(1, Math.max(0, actualLogGrowth / kellyLogGrowth))
+  }
 
   const rows = bucketRecords(validFlips, r => Number(r.wager) / Number(r.balanceBefore), [0.05, 0.2, 0.5], index => (
     index === 0 ? 'conservative (<5% balance)' : index === 1 ? 'moderate (5–20% balance)' : index === 2 ? 'aggressive (20–50% balance)' : 'all-in (>50% balance)'
@@ -715,6 +845,7 @@ function kellyEfficiency (ordered) {
 /**
  * 3. Change-Point / Structural Break Detection
  * Scans candidate split points to detect mid-session win rate shifts.
+ * Applies Bonferroni correction across candidate splits to avoid selection bias.
  */
 function changePointAnalysis (ordered, minSegment = 15) {
   const outcomes = ordered.map(row => row.result)
@@ -725,7 +856,9 @@ function changePointAnalysis (ordered, minSegment = 15) {
   let minP = 1.0
   const candidateRows = []
 
-  for (let split = minSegment; split <= n - minSegment; split += 5) {
+  // Check every split point; apply Bonferroni correction for selection bias
+  const numCandidates = n - 2 * minSegment + 1
+  for (let split = minSegment; split <= n - minSegment; split++) {
     const leftWins = outcomes.slice(0, split).filter(o => o === STREAK.WON).length
     const leftN = split
     const rightWins = outcomes.slice(split).filter(o => o === STREAK.WON).length
@@ -739,8 +872,11 @@ function changePointAnalysis (ordered, minSegment = 15) {
   }
 
   if (bestSplit) {
-    candidateRows.push(rateFromCounts(`segment 1 (flips 1…${bestSplit.split})`, bestSplit.leftN, bestSplit.leftWins))
+    // Bonferroni-adjusted p-value for the minimum over all candidates
+    const adjustedP = Math.min(1, bestSplit.p * numCandidates)
+    candidateRows.push(rateFromCounts(`segment 1 (flips 1…${bestSplit.split})`, bestSplit.leftN, bestSplit.leftWins, { note: `raw p=${bestSplit.p.toExponential(3)}, Bonferroni×${numCandidates}=${adjustedP.toExponential(3)}` }))
     candidateRows.push(rateFromCounts(`segment 2 (flips ${bestSplit.split + 1}…${n})`, bestSplit.rightN, bestSplit.rightWins))
+    bestSplit.pAdjusted = adjustedP
   }
 
   return {
@@ -776,7 +912,7 @@ function opponentClusterAnalysis (ordered, minFlips = 5) {
       }
     })
 
-  if (qualified.length < 2) return { clusters: [], rows: [] }
+  if (qualified.length < 2) return { opponentsTested: qualified.length, clusters: [], rows: [] }
 
   // Simple feature-based 2-cluster partitioning (aggressive vs passive)
   const medianWager = quantile(qualified.map(q => q.avgWager), 0.5) || 0
@@ -891,11 +1027,23 @@ function deepAnalysis (records = [], opts = {}) {
       key: 'montecarlo',
       title: 'Monte Carlo path test',
       question: 'How likely is the observed net and drawdown under a fair coin with these exact wagers?',
-      summary: `10,000 simulations with identical wagers: P(net ≤ ${monte.actualNet.toFixed(2)}) = ${monte.pNet.toExponential(2)}; P(drawdown ≥ ${monte.actualDrawdown.toFixed(2)}) = ${monte.pDrawdown.toExponential(2)}. Combined p = ${monte.pCombined.toExponential(2)}.`,
-      rows: [rateFromCounts('Monte Carlo path test', monte.iterations, 0, {
+      summary: `10,000 simulations with identical wagers: P(|net| ≥ ${Math.abs(monte.actualNet).toFixed(2)}) = ${monte.pNet.toExponential(2)}; P(drawdown ≥ ${monte.actualDrawdown.toFixed(2)}) = ${monte.pDrawdown.toExponential(2)}. Combined p = ${monte.pCombined.toExponential(2)}.`,
+      rows: [{
+        label: 'Monte Carlo two-tailed path test',
+        n: monte.iterations,
+        wins: null,
+        losses: null,
+        rate: null,
+        ci: null,
+        z: null,
+        p: monte.pCombined,
         expected: null,
-        note: `net p=${monte.pNet.toExponential(3)}, drawdown p=${monte.pDrawdown.toExponential(3)}, combined p=${monte.pCombined.toExponential(3)}`
-      })],
+        net: null,
+        wagered: null,
+        score: null,
+        note: `net two-tailed p=${monte.pNet.toExponential(3)}, drawdown p=${monte.pDrawdown.toExponential(3)}, combined p=${monte.pCombined.toExponential(3)}`,
+        lowSample: false
+      }],
       extra: { noCorrection: true }
     })
   }

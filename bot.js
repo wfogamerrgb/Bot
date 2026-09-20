@@ -2752,23 +2752,30 @@ logFor(id, `{magenta-fg}[state] -> ${newState}{/magenta-fg}`)
 // of protocol state, which the backend rejects as a protocol violation and kicks
 // us for with "An internal error occurred during your connection."
 //
-// We must coordinate with the velocity plugin's inConfigurationPhase flag,
-// which is what the physics plugin actually checks in updatePosition().
-// The velocity plugin sets it on start_configuration/finish_configuration packets,
-// but there's a gap between the state change and those packets arriving.
-// Also, the initial login configuration is not tracked by velocity plugin
-// (hasInitiallySpawned is false), so we must also handle that case.
-const hasSpawned = bots[id]?.spawnTime
+// The velocity plugin owns bot.inConfigurationPhase and bot.physicsEnabled
+// (it sets them on start_configuration/finish_configuration packets). We must
+// NOT write those flags directly — that races with the plugin's delayed
+// exitConfigurationPhase (2s timeout). Instead we only disable physics on
+// entering configuration, and on 'play' we defer to the velocity plugin's
+// exit handler when it is active (post-spawn reconfigure), or re-enable
+// immediately for the initial login (velocity plugin not active yet).
 if (newState === 'configuration') {
 bot.physicsEnabled = false
-if (hasSpawned) {
-bot.inConfigurationPhase = true
-}
 } else if (newState === 'play') {
-bot.physicsEnabled = true
-if (hasSpawned) {
-bot.inConfigurationPhase = false
+// Only re-enable if the velocity plugin hasn't taken us into
+// configuration (initial login). Otherwise let its exit handler
+// re-enable physics after the server finishes setup.
+if (!bot.inConfigurationPhase) bot.physicsEnabled = true
 }
+})
+
+// Coordinate with the velocity plugin's configurationPhase events so we
+// never race its delayed exitConfigurationPhase (2s timeout).
+bot.on('configurationPhase', (phase) => {
+if (phase === 'start') {
+bot.physicsEnabled = false
+} else if (phase === 'end') {
+bot.physicsEnabled = true
 }
 })
 
@@ -6314,10 +6321,11 @@ if (trimmed === '/analyze' || trimmed.startsWith('/analyze ')) {
     const url = `${baseUrl}/`
     logInfo(`Opening analytics page: ${url}`)
     log(' {gray-fg}This page shows coinflip fairness tests, time-series charts (shards/coins/balance), fleet stats, ban events, and rank changes.{/gray-fg}')
-    // Try to open in browser (works on most systems)
-    const { exec } = require('child_process')
+    // Use execFile with an argument array — never interpolate user/env-controlled
+    // values into a shell string (command injection via ANALYTICS_HOST).
+    const { execFile } = require('child_process')
     const openCmd = process.platform === 'win32' ? 'start' : process.platform === 'darwin' ? 'open' : 'xdg-open'
-    exec(`${openCmd} "${url}"`, (err) => {
+    execFile(openCmd, [url], (err) => {
       if (err) logWarn(`Could not auto-open browser: ${sanitize(err.message)} — please visit ${url} manually`)
       else log(`Opened ${url} in default browser`)
     })
