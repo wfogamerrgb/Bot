@@ -978,8 +978,9 @@ const b = e.bot
 const ping = b && b.player ? b.player.ping : null
 const histArr = e.pingHist || (e.pingHist = [])
 if (typeof ping === 'number') { histArr.push(Math.max(0, ping)); if (histArr.length > 60) histArr.shift() }
+const online = !!(b && b.entity)
 return {
-id, online: !!(b && b.entity),
+id, online,
 ping: typeof ping === 'number' ? Math.max(0, ping) : null,
 health: b ? (b.health ?? null) : null, food: b ? (b.food ?? null) : null,
 uptimeSec: e.spawnTime ? Math.floor((Date.now() - e.spawnTime) / 1000) : null,
@@ -994,7 +995,9 @@ authKind: authState.get(id)?.failure ? escHtml(sanitize(authState.get(id).failur
 authReason: authState.get(id)?.failure ? escHtml(sanitize(authState.get(id).failure.reason)) : null,
 coinflip: coinflipSessions.get(id) || coinflipLastRun.get(id) || null,
 pingHist: histArr,
-manual: manual.snapshotFor(e)
+manual: manual.snapshotFor(e),
+// connecting: bot exists but hasn't spawned yet (useful for filtering in web UI)
+connecting: !online && !!b
 }
 })
 }
@@ -1262,10 +1265,12 @@ aside{grid-area:side;background:var(--panel);border-right:1px solid var(--line);
 .vchip.on{color:var(--acc);border-color:var(--acc);background:rgba(45,212,191,.08)}
 .bot{border:1px solid var(--line);border-radius:8px;padding:8px 9px;margin-bottom:6px;cursor:pointer;background:var(--panel2)}
 .bot.on{border-color:rgba(74,222,128,.45)}
+.bot.connecting{border-color:rgba(255,200,0,.45);background:rgba(255,200,0,.04)}
 .bot.sel{outline:1px solid var(--acc)}
 .bhead{display:flex;align-items:center;gap:7px}
 .dot{width:8px;height:8px;border-radius:50%;background:#39434f;flex:none}
 .bot.on .dot{background:var(--grn);box-shadow:0 0 6px rgba(74,222,128,.7)}
+.bot.connecting .dot{background:var(--yel);box-shadow:0 0 6px rgba(255,200,0,.5)}
 .bname{font-weight:600;color:#dbe6ee;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .batt{margin-left:auto;font-size:10px;color:var(--yel)}
 .bmeta{display:flex;gap:10px;margin-top:5px;font-size:11px;color:var(--dim);flex-wrap:wrap}
@@ -1362,7 +1367,7 @@ button.tb:hover{color:var(--txt);border-color:var(--acc)}
 </style><script src="/chart.js"></script><script src="/coinflip-dashboard.js"></script></head><body>
 <div id="app">
 <header><div class="logo">⛏ AFK<b>CONSOLE</b></div><div id="chips"></div><div id="wsstate" class="wsstate down">offline</div><button id="logout">sign out</button></header>
-<aside><div class="views"><div class="vchip on" data-view="all">ALL</div><div class="vchip" data-view="system">SYSTEM</div><button class="vchip" id="terminalbtn" type="button">TERMINAL</button><button class="vchip" id="envbtn" type="button" title="Temporary .env overrides — nothing is written to disk">.ENV</button><button class="vchip" id="coinflipbtn" type="button" title="Coinflip fleet analytics">COINFLIP</button><!--PLAYBTN--></div><div id="botlist"></div></aside>
+<aside><div class="views"><div class="vchip on" data-view="all">ALL</div><div class="vchip" data-view="system">SYSTEM</div><button class="vchip" id="terminalbtn" type="button">TERMINAL</button><button class="vchip" id="envbtn" type="button" title="Temporary .env overrides — nothing is written to disk">.ENV</button><button class="vchip" id="coinflipbtn" type="button" title="Coinflip fleet analytics">COINFLIP</button><!--PLAYBTN--></div><label style="display:flex;align-items:center;gap:6px;padding:4px 0;font-size:11px;color:var(--dim);cursor:pointer"><input type="checkbox" id="show-all-bots" style="accent-color:var(--acc)">Show offline bots</label><div id="botlist"></div></aside>
 <main>
 <div id="loghead"><span id="channame">ALL CHANNELS</span><span id="newchip"></span>
 <input id="search" placeholder="filter logs…"><button class="tb" id="topbtn" type="button" title="scroll to top">↑ top</button><button class="tb" id="bottombtn" type="button" title="scroll to newest">↓ bottom</button><button class="tb" id="followbtn" type="button">⏸ pause</button>
@@ -1638,13 +1643,21 @@ releaseManualKey(control,document.querySelector('.mkey[data-control="'+control+'
 })
 }
 function renderBots(bs){var box=el('botlist');box.innerHTML='';botStates={}
-for(var i=0;i<bs.length;i++){var b=bs[i];botStates[b.id]=b
+var showAll = el('show-all-bots')?.checked || false
+for(var i=0;i<bs.length;i++){var b=bs[i]
+// Filter out offline non-connecting bots unless showAll is checked
+if(!showAll && !b.online && !b.connecting) continue
+botStates[b.id]=b
 var old=prevOnline[b.id]
 if(old===true&&!b.online)toast(b.id+(b.banned?' was banned':' went offline')+(b.kick?' — '+b.kick:''),'bad')
 if(old===false&&b.online)toast(b.id+' is online','good')
 prevOnline[b.id]=b.online
 var d=document.createElement('div')
-d.className='bot'+(b.online?' on':'')+(b.id===view?' sel':'')
+var cls = 'bot'
+if(b.online) cls += ' on'
+else if(b.connecting) cls += ' connecting'
+if(b.id===view) cls += ' sel'
+d.className = cls
 d.setAttribute('data-id',b.id)
 var up=b.uptimeSec==null?'':fmtUp(b.uptimeSec)
 var manualHtml=b.manual&&b.manual.mode?'<span class="manual-badge">manual</span>':''
@@ -1653,7 +1666,8 @@ var bannedHtml=b.banned?'<span class="manual-badge" style="color:var(--red);bord
 var authHtml=b.authFailed?'<span class="manual-badge" style="color:var(--red);border-color:rgba(248,113,113,.45)">🔑 '+b.authKind+'</span>':''
 var viewerHtml=b.manual&&b.manual.viewerPort?'<button class="manual-viewer" type="button" data-port="'+String(b.manual.viewerPort)+'">🌐 viewer</button>':''
 var cfHtml=b.coinflip?'<span class="manual-badge" style="color:var(--cyan);border-color:rgba(103,232,249,.4)">🎲 '+b.coinflip.flips+'/'+b.coinflip.planned+'</span>':''
-d.innerHTML='<div class="bhead"><div class="dot"></div><div class="bname"></div>'+bannedHtml+authHtml+cfHtml+manualHtml+guiHtml+viewerHtml+(b.attempts?'<div class="batt">↻'+b.attempts+'</div>':'')+'</div>'
+var connectingHtml = b.connecting ? '<span class="manual-badge" style="color:var(--yellow);border-color:rgba(255,200,0,.4)">⏳ connecting</span>' : ''
+d.innerHTML='<div class="bhead"><div class="dot"></div><div class="bname"></div>'+bannedHtml+authHtml+cfHtml+manualHtml+guiHtml+viewerHtml+connectingHtml+(b.attempts?'<div class="batt">↻'+b.attempts+'</div>':'')+'</div>'
 +'<div class="bmeta"><span>'+(b.ping==null?'—':b.ping)+'ms</span><span>'+(b.health==null?'—':b.health)+'❤</span><span>'+(b.food==null?'—':b.food)+'🍗</span>'+(up?'<span>'+up+'</span>':'')+'</div>'
 +'<canvas width="220" height="16"></canvas>'
 d.querySelector('.bname').textContent=b.id
@@ -1661,6 +1675,7 @@ if(b.banned)d.title='Banned'+(b.banKind?' ('+b.banKind+')':'')+(b.kick?' — '+b
 else if(b.authFailed)d.title='Login rejected: '+b.authReason+' — fix the password and run /auth-retry '+b.id
 else if(b.coinflip)d.title='Coinflip run: '+b.coinflip.flips+' of '+b.coinflip.planned+' flips, net '+(b.coinflip.net>=0?'+':'')+b.coinflip.net+' — '+b.coinflip.stopped
 else if(b.kick)d.title=b.kick
+else if(b.connecting)d.title='Connecting to server...'
 d.onclick=(function(id){return function(){setView(id)}})(b.id)
 var viewerButton=d.querySelector('.manual-viewer')
 if(viewerButton)viewerButton.onclick=(function(port){return function(e){e.preventDefault();e.stopPropagation();window.open('http://'+location.hostname+':'+port+'/','_blank','noopener')}})(b.manual.viewerHostPort||b.manual.viewerPort)
@@ -2735,13 +2750,25 @@ logFor(id, `{magenta-fg}[state] -> ${newState}{/magenta-fg}`)
 // registry_data / a resource pack). mineflayer's physics tick has no idea this
 // happened and keeps writing play-phase 'position' packets every tick regardless
 // of protocol state, which the backend rejects as a protocol violation and kicks
-// us for with "An internal error occurred during your connection." Pausing
-// physics for the duration of any configuration phase (including this mid-game
-// reconfigure, not just the initial login one) fixes it.
+// us for with "An internal error occurred during your connection."
+//
+// We must coordinate with the velocity plugin's inConfigurationPhase flag,
+// which is what the physics plugin actually checks in updatePosition().
+// The velocity plugin sets it on start_configuration/finish_configuration packets,
+// but there's a gap between the state change and those packets arriving.
+// Also, the initial login configuration is not tracked by velocity plugin
+// (hasInitiallySpawned is false), so we must also handle that case.
+const hasSpawned = bots[id]?.spawnTime
 if (newState === 'configuration') {
 bot.physicsEnabled = false
+if (hasSpawned) {
+bot.inConfigurationPhase = true
+}
 } else if (newState === 'play') {
 bot.physicsEnabled = true
+if (hasSpawned) {
+bot.inConfigurationPhase = false
+}
 }
 })
 
@@ -3292,6 +3319,7 @@ const COMMANDS = {
   '/coinflip …': 'The game\'s own coinflip command, owned by the server. The console never intercepts it — /coinflip, /coinflip create 10k and /coinflip delete all reach the selected bot (or every bot with /all-slow) untouched',
   '/timeseries [sample [ranks]|series <metric> [bucket] [bot]|events|clear confirm|status]': 'The recorded samples of shards, coins, balance, rank and bans over time — a sparkline, the last buckets, and where the JSON lives. \`sample\` records one right now',
   '/analytics': 'Where the read-only analytics page is, plus the JSON endpoints behind it (/api/analytics, /api/coinflip, /api/timeseries, /api/export)',
+  '/analyze [open|url|json]': 'Open the analytics page in browser (default), print the URL, or output the full JSON report. The page shows coinflip fairness tests, time-series charts (shards/coins/balance), fleet stats, ban events, and rank changes.',
   '/env [list [filter]|get KEY|set KEY VALUE|reset KEY|reset-all]': 'Show or change a configuration value for THIS run only — nothing is ever written to the .env file and a restart forgets it. Keys marked startup-only were read once at boot. The dashboard has the same thing as the .ENV tab',
 '/spawners': `Without moving, right-click every ${SPAWNER_BLOCK.replace(/_/g, ' ')} already within reach (${SPAWNER_REACH} blocks), clicking GUI slot ${SPAWNER_SLOT_FIRST} then slot ${SPAWNER_SLOT_SECOND} on each one`,
 '/data': 'Compile all saved bot/spawner data, save the local JSON snapshot, and push the current snapshot to the Google Sheets Apps Script webhook. Subcommands: /data check (verify the webhook deployment end-to-end), /data status (show webhook config + tracked counts)',
@@ -6273,6 +6301,39 @@ if (trimmed === '/analytics' || trimmed === '/analytics open') {
   log(` coinflip history: ${coinflipStore.all().length} flip(s) → ${COINFLIP_FILE}`)
   log(` coinflip dissection: ${COINFLIP_DEEP_FILE}`)
   log(' {gray-fg}JSON: /api/analytics · /api/coinflip · /api/coinflip/deep · /api/timeseries?metric=shards&bucket=1h · /api/export (everything){/gray-fg}')
+  return
+}
+
+if (trimmed === '/analyze' || trimmed.startsWith('/analyze ')) {
+  const args = trimmed.slice('/analyze'.length).trim().split(/\s+/)
+  const sub = args[0] || 'open'
+  const port = settings.get('ANALYTICS_PORT')
+  const baseUrl = `http://${hostForLink()}:${port}`
+
+  if (sub === 'open') {
+    const url = `${baseUrl}/`
+    logInfo(`Opening analytics page: ${url}`)
+    log(' {gray-fg}This page shows coinflip fairness tests, time-series charts (shards/coins/balance), fleet stats, ban events, and rank changes.{/gray-fg}')
+    // Try to open in browser (works on most systems)
+    const { exec } = require('child_process')
+    const openCmd = process.platform === 'win32' ? 'start' : process.platform === 'darwin' ? 'open' : 'xdg-open'
+    exec(`${openCmd} "${url}"`, (err) => {
+      if (err) logWarn(`Could not auto-open browser: ${sanitize(err.message)} — please visit ${url} manually`)
+      else log(`Opened ${url} in default browser`)
+    })
+    return
+  }
+  if (sub === 'url') {
+    const page = args[1] || '/'
+    logInfo(`${baseUrl}${page}`)
+    return
+  }
+  if (sub === 'json') {
+    const report = buildAnalyticsReport({ recent: 100 })
+    log(JSON.stringify(report, null, 2))
+    return
+  }
+  logWarn(`Unknown /analyze subcommand "${sanitize(sub)}" — try: open, url, json`)
   return
 }
 

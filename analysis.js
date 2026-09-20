@@ -609,6 +609,239 @@ function moneyCurve (ordered) {
   }
 }
 
+/** Helper to format numbers for row notes. */
+function fmt (value) {
+  if (value == null || !Number.isFinite(value)) return '–'
+  const n = Number(value)
+  if (Math.abs(n) >= 1e9) return (n / 1e9).toFixed(2) + 'B'
+  if (Math.abs(n) >= 1e6) return (n / 1e6).toFixed(2) + 'M'
+  if (Math.abs(n) >= 1e4) return (n / 1e3).toFixed(1) + 'k'
+  return n.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 2 })
+}
+
+/**
+ * 1. Session-Level Monte Carlo Simulation
+ * Simulates 10,000 fair-coin sessions with the exact observed wager sequence.
+ * Measures how likely the observed net loss and max drawdown are under a fair coin.
+ */
+function sessionMonteCarlo (ordered, iterations = 10000) {
+  if (!ordered.length) return { pNet: null, pDrawdown: null, simSummary: null }
+  const wagers = ordered.map(row => Number(row.wager) || 0)
+  const actualNet = sumOf(ordered.map(recordNet))
+  const actualCurve = moneyCurve(ordered)
+  const actualDrawdown = actualCurve.maxDrawdown
+
+  let worseNetCount = 0
+  let worseDrawdownCount = 0
+
+  for (let sim = 0; sim < iterations; sim++) {
+    let simNet = 0
+    let simPeak = 0
+    let simMaxDD = 0
+    for (let i = 0; i < wagers.length; i++) {
+      const win = Math.random() < 0.5
+      const outcome = win ? wagers[i] : -wagers[i]
+      simNet += outcome
+      if (simNet > simPeak) simPeak = simNet
+      const dd = simPeak - simNet
+      if (dd > simMaxDD) simMaxDD = dd
+    }
+    if (simNet <= actualNet) worseNetCount++
+    if (simMaxDD >= actualDrawdown) worseDrawdownCount++
+  }
+
+  // Use (count + 1) / (iterations + 1) for continuity correction so p=0 is never returned
+  const pNet = (worseNetCount + 1) / (iterations + 1)
+  const pDrawdown = (worseDrawdownCount + 1) / (iterations + 1)
+
+  return {
+    iterations,
+    actualNet,
+    actualDrawdown,
+    pNet,
+    pDrawdown,
+    pCombined: Math.min(pNet, pDrawdown)
+  }
+}
+
+/**
+ * 2. Kelly Criterion Efficiency / Bet Sizing Optimality
+ * Compares actual wager fractions (wager/balance) against Kelly-optimal fractions.
+ */
+function kellyEfficiency (ordered) {
+  const validFlips = ordered.filter(r => r.balanceBefore != null && r.balanceBefore > 0 && r.wager != null)
+  if (validFlips.length < 5) return { efficiency: null, rows: [] }
+
+  const fractions = validFlips.map(r => Number(r.wager) / Number(r.balanceBefore))
+  const avgFraction = mean(fractions)
+  const wins = validFlips.filter(r => r.result === STREAK.WON).length
+  const winRate = wins / validFlips.length
+
+  // Kelly fraction f* = 2p - 1 for 1:1 odds
+  const kellyOptimal = Math.max(0, 2 * winRate - 1)
+
+  // Growth rate: E[log(1 + f * X)] where X in {+1, -1}
+  let actualLogGrowth = 0
+  for (const f of fractions) {
+    actualLogGrowth += winRate * Math.log(Math.max(0.001, 1 + f)) + (1 - winRate) * Math.log(Math.max(0.001, 1 - f))
+  }
+  actualLogGrowth /= validFlips.length
+
+  let kellyLogGrowth = 0
+  if (kellyOptimal > 0) {
+    kellyLogGrowth = winRate * Math.log(1 + kellyOptimal) + (1 - winRate) * Math.log(1 - kellyOptimal)
+  }
+
+  const efficiency = kellyOptimal === 0
+    ? (avgFraction > 0 ? 0 : 1)
+    : Math.min(1, Math.max(0, actualLogGrowth / (kellyLogGrowth || 1)))
+
+  const rows = bucketRecords(validFlips, r => Number(r.wager) / Number(r.balanceBefore), [0.05, 0.2, 0.5], index => (
+    index === 0 ? 'conservative (<5% balance)' : index === 1 ? 'moderate (5–20% balance)' : index === 2 ? 'aggressive (20–50% balance)' : 'all-in (>50% balance)'
+  ))
+
+  return {
+    n: validFlips.length,
+    winRate,
+    avgFraction,
+    kellyOptimal,
+    actualLogGrowth,
+    kellyLogGrowth,
+    efficiency,
+    rows
+  }
+}
+
+/**
+ * 3. Change-Point / Structural Break Detection
+ * Scans candidate split points to detect mid-session win rate shifts.
+ */
+function changePointAnalysis (ordered, minSegment = 15) {
+  const outcomes = ordered.map(row => row.result)
+  const n = outcomes.length
+  if (n < minSegment * 2) return { breakPoint: null, rows: [] }
+
+  let bestSplit = null
+  let minP = 1.0
+  const candidateRows = []
+
+  for (let split = minSegment; split <= n - minSegment; split += 5) {
+    const leftWins = outcomes.slice(0, split).filter(o => o === STREAK.WON).length
+    const leftN = split
+    const rightWins = outcomes.slice(split).filter(o => o === STREAK.WON).length
+    const rightN = n - split
+
+    const test = twoProportionTest(leftWins, leftN, rightWins, rightN)
+    if (test.p != null && test.p < minP) {
+      minP = test.p
+      bestSplit = { split, leftWins, leftN, rightWins, rightN, p: test.p, z: test.z, diff: test.diff }
+    }
+  }
+
+  if (bestSplit) {
+    candidateRows.push(rateFromCounts(`segment 1 (flips 1…${bestSplit.split})`, bestSplit.leftN, bestSplit.leftWins))
+    candidateRows.push(rateFromCounts(`segment 2 (flips ${bestSplit.split + 1}…${n})`, bestSplit.rightN, bestSplit.rightWins))
+  }
+
+  return {
+    breakPoint: bestSplit,
+    rows: candidateRows
+  }
+}
+
+/**
+ * 4. Adversarial Opponent Clustering
+ * Groups opponents by behavioral similarity (win rate, average wager) to detect opponent rings.
+ */
+function opponentClusterAnalysis (ordered, minFlips = 5) {
+  const byOpponent = new Map()
+  for (const row of ordered) {
+    const opp = row.opponent || '(unnamed)'
+    if (!byOpponent.has(opp)) byOpponent.set(opp, [])
+    byOpponent.get(opp).push(row)
+  }
+
+  const qualified = [...byOpponent.entries()]
+    .filter(([_, rows]) => rows.length >= minFlips)
+    .map(([opp, rows]) => {
+      const wins = rows.filter(r => r.result === STREAK.WON).length
+      const wagers = rows.map(r => Number(r.wager) || 0)
+      return {
+        opp,
+        n: rows.length,
+        wins,
+        winRate: wins / rows.length,
+        avgWager: mean(wagers),
+        rows
+      }
+    })
+
+  if (qualified.length < 2) return { clusters: [], rows: [] }
+
+  // Simple feature-based 2-cluster partitioning (aggressive vs passive)
+  const medianWager = quantile(qualified.map(q => q.avgWager), 0.5) || 0
+  const highWagerGroup = qualified.filter(q => q.avgWager >= medianWager)
+  const lowWagerGroup = qualified.filter(q => q.avgWager < medianWager)
+
+  const rows = []
+  if (highWagerGroup.length) {
+    const totalN = sumOf(highWagerGroup.map(g => g.n))
+    const totalWins = sumOf(highWagerGroup.map(g => g.wins))
+    rows.push(rateFromCounts(`high-wager opponents (≥${fmt(medianWager)})`, totalN, totalWins, { note: `${highWagerGroup.length} opponent accounts` }))
+  }
+  if (lowWagerGroup.length) {
+    const totalN = sumOf(lowWagerGroup.map(g => g.n))
+    const totalWins = sumOf(lowWagerGroup.map(g => g.wins))
+    rows.push(rateFromCounts(`low-wager opponents (<${fmt(medianWager)})`, totalN, totalWins, { note: `${lowWagerGroup.length} opponent accounts` }))
+  }
+
+  return {
+    opponentsTested: qualified.length,
+    rows
+  }
+}
+
+/**
+ * 5. Sequential Probability Ratio Test (SPRT) Live Monitor
+ * Wald's SPRT: H0 (p = 0.5) vs H1 (p = 0.45 house edge).
+ */
+function sprtMonitor (ordered, p0 = 0.5, p1 = 0.45, alpha = 0.01, beta = 0.10) {
+  const outcomes = ordered.map(row => row.result)
+  const n = outcomes.length
+  if (!n) return { llr: 0, decision: 'continue', rows: [] }
+
+  const wins = outcomes.filter(o => o === STREAK.WON).length
+  const losses = n - wins
+
+  // Log-Likelihood Ratio
+  const llr = wins * Math.log(p1 / p0) + losses * Math.log((1 - p1) / (1 - p0))
+
+  const lowerBound = Math.log(beta / (1 - alpha)) // Reject H1 (accept H0 = fair)
+  const upperBound = Math.log((1 - beta) / alpha) // Accept H1 (reject H0 = rigged)
+
+  let decision = 'continue'
+  if (llr <= lowerBound) decision = 'accept_fair (H0)'
+  else if (llr >= upperBound) decision = 'reject_fair (H1)'
+
+  const rows = [
+    rateFromCounts(`SPRT sequential test (n=${n})`, n, wins, {
+      expected: p0,
+      note: `LLR=${llr.toFixed(3)}, bounds [${lowerBound.toFixed(2)}, ${upperBound.toFixed(2)}], state: ${decision}`
+    })
+  ]
+
+  return {
+    n,
+    wins,
+    losses,
+    llr,
+    lowerBound,
+    upperBound,
+    decision,
+    rows
+  }
+}
+
 /**
  * Every dissection, in one report. `sections` is a uniform shape on purpose, so
  * the chat digest and the HTML page render the same numbers without either of
@@ -650,6 +883,22 @@ function deepAnalysis (records = [], opts = {}) {
       : 'Not enough runs to test.',
     rows: streakRows
   })
+
+  // NEW — Session Monte Carlo: how likely is this path under a fair coin?
+  const monte = sessionMonteCarlo(ordered)
+  if (monte.pNet != null) {
+    sections.push({
+      key: 'montecarlo',
+      title: 'Monte Carlo path test',
+      question: 'How likely is the observed net and drawdown under a fair coin with these exact wagers?',
+      summary: `10,000 simulations with identical wagers: P(net ≤ ${monte.actualNet.toFixed(2)}) = ${monte.pNet.toExponential(2)}; P(drawdown ≥ ${monte.actualDrawdown.toFixed(2)}) = ${monte.pDrawdown.toExponential(2)}. Combined p = ${monte.pCombined.toExponential(2)}.`,
+      rows: [rateFromCounts('Monte Carlo path test', monte.iterations, 0, {
+        expected: null,
+        note: `net p=${monte.pNet.toExponential(3)}, drawdown p=${monte.pDrawdown.toExponential(3)}, combined p=${monte.pCombined.toExponential(3)}`
+      })],
+      extra: { noCorrection: true }
+    })
+  }
 
   // 2 — the transition table.
   const markov = markovAnalysis(outcomes)
@@ -720,6 +969,18 @@ function deepAnalysis (records = [], opts = {}) {
     rows: lagRows
   })
 
+  // NEW — Change-point detection: did the win rate shift mid-session?
+  const changePoint = changePointAnalysis(ordered)
+  if (changePoint.breakPoint) {
+    sections.push({
+      key: 'changepoint',
+      title: 'Structural break detection',
+      question: 'Did the win rate change abruptly during the session (server change, account switch)?',
+      summary: `Most likely break at flip #${changePoint.breakPoint.split}: before ${pctText(changePoint.breakPoint.leftWins / changePoint.breakPoint.leftN)} (n=${changePoint.breakPoint.leftN}) vs after ${pctText(changePoint.breakPoint.rightWins / changePoint.breakPoint.rightN)} (n=${changePoint.breakPoint.rightN}), p=${changePoint.breakPoint.p.toExponential(3)}.`,
+      rows: changePoint.rows
+    })
+  }
+
   // 5 — the share of the balance staked.
   const ratioEdges = [0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.35, 0.5, 1]
   const ratioLabel = (index) => {
@@ -761,6 +1022,18 @@ function deepAnalysis (records = [], opts = {}) {
     rows: ratioRows,
     extra: { trend: ratioTrend }
   })
+
+  // NEW — Kelly Criterion Efficiency: are we overbetting relative to optimal?
+  const kelly = kellyEfficiency(ordered)
+  if (kelly.efficiency != null) {
+    sections.push({
+      key: 'kelly',
+      title: 'Kelly criterion efficiency',
+      question: 'Is the bet sizing optimal for long-term growth, or are we overbetting?',
+      summary: `Average fraction staked: ${pctText(kelly.avgFraction, 2)}; Kelly-optimal: ${pctText(kelly.kellyOptimal, 2)}; growth efficiency: ${pctText(kelly.efficiency, 1)}. ${kelly.efficiency < 1 ? `Overbetting costs ${((1 - kelly.efficiency) * 100).toFixed(1)}% in growth per flip.` : 'Sizing is Kelly-optimal or conservative.'}`,
+      rows: kelly.rows
+    })
+  }
 
   // 6 — absolute wager size.
   const wagerEdges = [10000, 50000, 250000, 1000000, 5000000]
@@ -908,6 +1181,18 @@ function deepAnalysis (records = [], opts = {}) {
     extra: { curve }
   })
 
+  // NEW — SPRT Live Monitor: sequential decision boundaries for live monitoring
+  const sprt = sprtMonitor(ordered)
+  if (sprt.decision !== 'continue') {
+    sections.push({
+      key: 'sprt',
+      title: 'SPRT sequential test',
+      question: 'Can we already reject the fair-coin hypothesis with statistical rigor?',
+      summary: `LLR = ${sprt.llr.toFixed(3)}, bounds [${sprt.lowerBound.toFixed(2)}, ${sprt.upperBound.toFixed(2)}]; decision: ${sprt.decision.replace('_', ' ')}. ${sprt.decision === 'reject_fair (H1)' ? 'Stop the session — statistically significant evidence of house edge.' : 'Session passes sequential fairness test so far.'}`,
+      rows: sprt.rows
+    })
+  }
+
   // 14 — fleet homogeneity: are all accounts on the same luck curve?
   const fleetHomogeneity = fleetHomogeneityTest(ordered)
   sections.push({
@@ -971,6 +1256,18 @@ function deepAnalysis (records = [], opts = {}) {
     rows: opponentDisparity
   })
 
+  // NEW — Adversarial Opponent Clustering: find coordinated opponent rings
+  const opponentClusters = opponentClusterAnalysis(ordered)
+  if (opponentClusters.rows.length) {
+    sections.push({
+      key: 'opponent_clusters',
+      title: 'Opponent behavioral clusters',
+      question: 'Do opponent accounts cluster into coordinated groups with different win rates?',
+      summary: `Found ${opponentClusters.opponentsTested} opponents with enough flips; split into ${opponentClusters.rows.length} behavioral clusters by wager style. ${opponentClusters.rows.map(r => `${r.label}: ${pctText(r.rate)} (n=${r.n})`).join(' · ')}.`,
+      rows: opponentClusters.rows
+    })
+  }
+
   // 14 — per bot, which is only a dissection when there is a fleet.
   const byBot = new Map()
   for (const row of ordered) {
@@ -990,9 +1287,13 @@ function deepAnalysis (records = [], opts = {}) {
   }
 
   // One family of tests, one correction. Every bucket p-value above is in here.
+  // Sections marked with extra.noCorrection are excluded from the BH family.
   const flat = []
   for (const section of sections) {
-    for (const row of section.rows) flat.push(row)
+    if (section.extra && section.extra.noCorrection) continue
+    if (Array.isArray(section.rows)) {
+      for (const row of section.rows) flat.push(row)
+    }
     if (section.extra && section.extra.chi2p != null) flat.push({ p: section.extra.chi2p })
     if (section.extra && section.extra.trend && section.extra.trend.p != null) flat.push({ p: section.extra.trend.p })
   }
@@ -1002,8 +1303,8 @@ function deepAnalysis (records = [], opts = {}) {
     if (row.n != null && row.n < minBucket) row.lowSample = true
   })
 
-  const survivors = sections.flatMap(section => section.rows.map(row => ({ section: section.key, ...row })))
-    .filter(row => row.significant && row.q != null)
+  const survivors = sections.flatMap(section => (Array.isArray(section.rows) ? section.rows : []).map(row => ({ section: section.key, ...row })))
+    .filter(row => row && row.significant && row.q != null)
     .sort((a, b) => a.q - b.q)
 
   const takeaways = []
@@ -1085,6 +1386,11 @@ module.exports = {
   martingaleEntries,
   quantile,
   recordNet,
+  sessionMonteCarlo,
+  kellyEfficiency,
+  changePointAnalysis,
+  sprtMonitor,
+  opponentClusterAnalysis,
   sumOf,
   pctText
 }
