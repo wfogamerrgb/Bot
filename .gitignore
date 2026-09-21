@@ -1,4 +1,5 @@
 .env
+.claude/
 auto-hack.js
 botnames.txt
 passwords.txt

@@ -50,6 +50,7 @@ const analysis = require(path.join(__dirname, 'analysis'))
 const timeseries = require(path.join(__dirname, 'timeseries'))
 const analytics = require(path.join(__dirname, 'analytics'))
 const { handleChartJs, handleCoinflipDashboardJs } = require('./coinflip-dashboard-static')
+const { callFreeLLMChat, getAvailableModels } = require('./ai-chat')
 const mineflayer = require('mineflayer')
 const armorManager = require('mineflayer-armor-manager')
 const { pathfinder, Movements, goals: { GoalNear } } = require('mineflayer-pathfinder')
@@ -804,7 +805,7 @@ const coinflipStore = coinflip.createCoinflipStore({ file: COINFLIP_FILE, maxRec
 const timeseriesStore = timeseries.createTimeseriesStore({ file: TIMESERIES_FILE })
 
 
-const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dump-spawners', '/dc', '/reconnect', '/crates', '/crates-loop', '/spawners', '/data', '/shardshop-loop', '/closeBot', '/bot-coinflip', '/bot-coinflip-all']
+const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dump-spawners', '/dc', '/reconnect', '/crates', '/crates-loop', '/spawners', '/data', '/shardshop-loop', '/closeBot', '/bot-coinflip', '/bot-coinflip-all', '/ai-chat']
 
 const logSubscribers = new Set()
 function subscribeLog(fn) { logSubscribers.add(fn); return () => logSubscribers.delete(fn) }
@@ -2647,6 +2648,7 @@ suppressWindowTimer: null, // clears the above when no window opens within 5s
 manualSession: false, // sticky manual GUI session (set when a /gui window opens)
 guiSessionTimer: null, // 20-min auto-close timer for the manual GUI session
 lastPlayerChatAt: Date.now(), // chat activity watchdog — last time a player message was seen
+lastPlayerChat: '', // latest player chat message
 }
 const entry = bots[id]
 
@@ -2895,7 +2897,10 @@ pushT(() => bot.chat(payload), 220 + Math.random() * 400)
 bot.on('messagestr', (text) => {
   try {
     const who = detectPlayerChat(text)
-    if (who && !(who.name in bots)) bots[id].lastPlayerChatAt = Date.now()
+    if (who && !(who.name in bots)) {
+      bots[id].lastPlayerChatAt = Date.now()
+      bots[id].lastPlayerChat = text
+    }
   } catch (_) {}
 })
 
@@ -3381,7 +3386,8 @@ const COMMANDS = {
 '/dump-gui': 'Shift-click the whole inventory into the open GUI window',
 'anything else': 'Sent directly as a chat message/command from the active bot',
 '/dump [home|hidden|cancel]': 'Dump inventory: TPA to the configured main player, use /home stash, run the hidden chain, or cancel',
-'/dump-spawners': 'Same as /dump, but only transfers SPAWNERS into the chests (everything else stays in the inventory)'
+'/dump-spawners': 'Same as /dump, but only transfers SPAWNERS into the chests (everything else stays in the inventory)',
+'/ai-chat [start|stop|status] [bot]': 'Start AI chat for a bot — uses FreeLLM API to generate Minecraft-themed messages every 40-150 seconds with occasional grammar mistakes. Start a chat loop for the current bot (or a specific one), stop an active AI chat, or check status. Requires FREE_LLM_API_KEY and FREE_LLM_BASE_URL in .env'
 }
 
 // True when an item is a spawner (mob/monster spawner). Matches the registry
@@ -4538,6 +4544,115 @@ const COINFLIP_ALL_USAGE = '/bot-coinflip-all run [PRICE] [AMOUNT] [MAX_CONCURRE
 const coinflipObservers = new Map()
 const coinflipSessions = new Map() // bot -> session in flight (guards against a second run)
 const coinflipLastRun = new Map() // bot -> the finished session, for the bot card
+
+
+// ── AI Chat configuration ───────────────────────────────────────────────────
+const AI_CHAT_ENABLED = true  // Enable AI chat by default
+const AI_CHAT_INTERVAL_MIN_MS = parseInt(process.env.AI_CHAT_INTERVAL_MIN_MS || '40000', 10) // 40 seconds
+const AI_CHAT_INTERVAL_MAX_MS = parseInt(process.env.AI_CHAT_INTERVAL_MAX_MS || '150000', 10) // 150 seconds
+const AI_CHAT_WORD_LIMIT = parseInt(process.env.AI_CHAT_WORD_LIMIT || '15', 10)
+
+// ── AI Chat state ────────────────────────────────────────────────────────────
+const aiChatSessions = new Map() // bot -> active AI chat session
+const aiChatModelsCache = { models: [], lastFetched: 0 } // Cache for available models
+const AI_CHAT_MODELS_CACHE_TTL_MS = 3600000 // Cache for 1 hour
+
+// ── AI Chat functions ─────────────────────────────────────────────────────────
+function startAIChatForBot(id) {
+  if (!AI_CHAT_ENABLED) return false
+  const entry = bots[id]
+  if (!entry?.bot?.entity) {
+    logFor(id, '{yellow-fg}⚠ AI chat requires the bot to be spawned.{/yellow-fg}')
+    return false
+  }
+  
+  if (aiChatSessions.has(id)) {
+    logFor(id, '{yellow-fg}⚠ AI chat is already running for this bot.{/yellow-fg}')
+    return false
+  }
+  
+  aiChatSessions.set(id, true)
+
+  // Get the bot's actual name from BOT_NAMES
+  const botIndex = BOT_NAMES.indexOf(id)
+  const botName = botIndex >= 0 ? BOT_NAMES[botIndex] : id
+  
+  // Start the loop
+  const loop = async () => {
+    while (aiChatSessions.has(id)) {
+      try {
+        // Get latest player chat if available
+        const latestChat = entry.lastPlayerChat || ''
+        const message = await callFreeLLMChat(latestChat, botName)
+        if (message && entry.bot?.entity) {
+          const words = message.split(/\s+/).filter(Boolean);
+          const limited = words.slice(0, 8).join(' ');
+          logFor(id, `{cyan-fg}AI → ${limited}{/cyan-fg}`)
+          entry.bot.chat(limited)
+        }
+      } catch (err) {
+        // Log different error types with appropriate messages
+        if (err.message?.includes('404') || err.message?.includes('Not Found')) {
+          logFor(id, `{yellow-fg}⚠ AI chat endpoint not found (404) — check FREE_LLM_BASE_URL in .env{/yellow-fg}`)
+          logFor(id, `{gray-fg}⚠ Falling back to random Minecraft messages{/gray-fg}`)
+        } else if (err.message?.includes('ECONNREFUSED') || err.message?.includes('connection refused')) {
+          logFor(id, `{yellow-fg}⚠ AI chat server unreachable — check FREE_LLM_BASE_URL{/yellow-fg}`)
+          logFor(id, `{gray-fg}⚠ Falling back to random Minecraft messages{/gray-fg}`)
+        } else {
+          logFor(id, `{red-fg}✗ AI chat error: ${sanitize(err.message)}{/red-fg}`)
+        }
+      }
+
+      // Wait random interval between 40-150 seconds
+      const delay = Math.floor(Math.random() * (AI_CHAT_INTERVAL_MAX_MS - AI_CHAT_INTERVAL_MIN_MS)) + AI_CHAT_INTERVAL_MIN_MS
+      await new Promise(resolve => setTimeout(resolve, delay))
+    }
+  }
+  
+  loop().catch(err => {
+    logFor(id, `{red-fg}✗ AI chat loop failed: ${sanitize(err.message)}{/red-fg}`)
+    aiChatSessions.delete(id)
+  })
+
+  return true
+}
+
+function stopAIChatForBot(id) {
+  if (!aiChatSessions.has(id)) return false
+  aiChatSessions.delete(id)
+  logFor(id, '{yellow-fg}⚠ AI chat stopped.{/yellow-fg}')
+  return true
+}
+
+// ── /ai-chat command ─────────────────────────────────────────────────────────
+const AI_CHAT_USAGE = '/ai-chat [start|stop|status] [bot] — starts or stops AI chat for a bot. With no args, starts AI chat for the current bot.'
+
+function handleAIChatCommand (cmd, ctx) {
+  const parts = cmd.trim().split(/\s+/)
+  const action = parts[1]?.toLowerCase()
+  const targetBot = parts[2] || ctx?.selectedId
+  
+  if (!action || action === 'start') {
+    if (!targetBot) {
+      logFor(ctx?.selectedId || SYSTEM_ID, `{yellow-fg}⚠ Specify a bot: ${AI_CHAT_USAGE}{/yellow-fg}`)
+      return
+    }
+    startAIChatForBot(targetBot)
+  } else if (action === 'stop') {
+    if (!targetBot) {
+      logFor(ctx?.selectedId || SYSTEM_ID, `{yellow-fg}⚠ Specify a bot: ${AI_CHAT_USAGE}{/yellow-fg}`)
+      return
+    }
+    stopAIChatForBot(targetBot)
+  } else if (action === 'status') {
+    const status = aiChatSessions.has(targetBot)
+      ? '{green-fg}running{/green-fg}'
+      : '{yellow-fg}not running{/yellow-fg}'
+    logFor(targetBot || SYSTEM_ID, `{cyan-fg}AI chat status for ${targetBot || 'current bot'}: ${status}{/cyan-fg}`)
+  } else {
+    logFor(ctx?.selectedId || SYSTEM_ID, `{yellow-fg}⚠ Unknown action "${action}". ${AI_CHAT_USAGE}{/yellow-fg}`)
+  }
+}
 
 // ── /bot-coinflip-all concurrency-pooled fleet engine ───────────────────────
 // Runs coinflips across the fleet with a concurrency pool: at most
@@ -6296,6 +6411,70 @@ if (coinflipCall && coinflipCall.sub === 'unknown') {
   logWarn(`Unknown /bot-coinflip subcommand "${sanitize(coinflipCall.args.split(/\s+/)[0])}" — try /bot-coinflip for the list. The game's own command is plain /coinflip (e.g. /coinflip create 10000) and always reaches the selected bot untouched.`)
   return
 }
+// ── AI Chat ───────────────────────────────────────────────────────────────────
+const aiChatMatch = trimmed.match(/^\/ai-chat(?:\[([^\]]+)\])?\s*(.*)/i)
+if (aiChatMatch) {
+  const sub = (aiChatMatch[1] || 'start').toLowerCase()
+  const botArg = aiChatMatch[2]?.trim()
+
+  if (sub === 'start') {
+    const targetBot = botArg || ctxId || currentActiveId()
+    if (!targetBot) {
+      logWarn('/ai-chat [start|stop|status] [bot] — specify a bot to start AI chat')
+      return
+    }
+    startAIChatForBot(targetBot)
+  } else if (sub === 'stop') {
+    const targetBot = botArg || ctxId || currentActiveId()
+    if (!targetBot) {
+      logWarn('/ai-chat [start|stop|status] [bot] — specify a bot to stop AI chat')
+      return
+    }
+    stopAIChatForBot(targetBot)
+  } else if (sub === 'models') {
+    // Query available models from FreeLLM API
+    (async () => {
+      try {
+        logInfo('Querying FreeLLM API for available models...');
+        const models = await getAvailableModels();
+
+        if (models.length === 0) {
+          logWarn('Could not retrieve models from FreeLLM API. Check FREE_LLM_BASE_URL and FREE_LLM_API_KEY in .env');
+        } else {
+          models.forEach(model => {
+            const fields = [];
+            if (model.owned_by) fields.push(`- ${model.owned_by}`);
+            if (model.max_model_len) fields.push(`(max: ${model.max_model_len})`);
+            if (model.description) fields.push(`- ${model.description}`);
+
+            log(` {cyan-fg}${model.id}{/cyan-fg} ${fields.join(' ')}`);
+          });
+          log(` {gray-fg}Total: ${models.length} model(s) available{/gray-fg}`);
+        }
+      } catch (error) {
+        logWarn(`Model query failed: ${sanitize(error.message)}`);
+      }
+    })();
+  } else if (sub === 'model-set') {
+    const modelArg = botArg?.split(/\s+/)[0];
+    if (!modelArg) {
+      logWarn('/ai-chat model-set <model> — specify a model name to use');
+      return;
+    }
+    settings.set('AI_CHAT_MODEL', modelArg);
+    logSuccess(`AI chat model set to: ${modelArg}`);
+  } else if (sub === 'status') {
+    const targetBot = botArg || ctxId || currentActiveId()
+    const status = aiChatSessions.has(targetBot)
+      ? '{green-fg}running{/green-fg}'
+      : '{yellow-fg}not running{/yellow-fg}'
+    logInfo(`AI chat status for ${sanitize(targetBot || 'current bot')}: ${status}`)
+  } else {
+    logWarn(`Unknown /ai-chat subcommand "${sub}" — try: start, stop, status, models, model-set`)
+  }
+  return
+}
+
 if (trimmed === '/analytics' || trimmed === '/analytics open') {
   const port = settings.get('ANALYTICS_PORT')
   const summary = coinflipStore.summary({ recent: 0, minSample: settings.get('COINFLIP_MIN_SAMPLE'), suspicionP: settings.get('COINFLIP_SUSPICION_P') })
