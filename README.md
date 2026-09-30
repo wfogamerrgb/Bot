@@ -1,5 +1,11 @@
 # Minecraft Multi-Bot Console
 
+> ## ⛔ DO NOT KILL or RUN `/exit`
+> `/exit`, `/all /dc`, and killing the `node bot.js` process end the **entire
+> fleet** at once. Guarded commands print `DO NOT RUN!` and only run when the
+> exact same command is repeated within 60 seconds. Read
+> **[DO-NOT-KILL.md](DO-NOT-KILL.md)** before touching anything.
+
 Node.js tools for running and supervising multiple Mineflayer bots. The main
 entry point, `bot.js`, provides both a browser dashboard and an optional
 terminal UI. `bot-rtp.js` is the exploration-oriented variant with RTP,

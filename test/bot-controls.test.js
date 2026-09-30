@@ -1,7 +1,7 @@
 'use strict'
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const { readDelayMs, readInt, readNumber, parseDumpMode, parseDataArgs, parseCratesAllDump, parseCratesAllAfk, parseCratesAllFlags, shuffledCopy, createSlowBroadcast, createSlowBroadcastManager, parseProxyGroups, resolveBotProxy, hasProxyAuth, proxyAuthHeader, buildHttpConnectRequest, describeProxy, resolveLoginPassword, parseBotPasswords, classifyAuthReply, nextAuthFailure, isAuthBlocked, findIgnoredProxyGroupVars } = require('../bot-controls')
+const { readDelayMs, readInt, readNumber, parseDumpMode, parseDataArgs, parseCratesAllDump, parseCratesAllAfk, parseCratesAllFlags, shuffledCopy, createSlowBroadcast, createSlowBroadcastManager, parseProxyGroups, resolveBotProxy, hasProxyAuth, proxyAuthHeader, buildHttpConnectRequest, describeProxy, resolveLoginPassword, parseBotPasswords, classifyAuthReply, nextAuthFailure, isAuthBlocked, findIgnoredProxyGroupVars, destructiveCommandEffect, createCommandConfirmation } = require('../bot-controls')
 
 function clock() {
   let time = 0, sequence = 0
@@ -44,6 +44,27 @@ test('parseDumpMode flags a typo instead of silently starting a TPA dump', () =>
   assert.deepEqual(parseDumpMode('hidden'), { mode: 'hidden', unknown: null })
   assert.deepEqual(parseDumpMode('cancel'), { mode: 'cancel', unknown: null })
   assert.deepEqual(parseDumpMode('hiden'), { mode: 'tpa', unknown: 'hiden' })
+})
+
+test('destructiveCommandEffect names the fleet-killers and nothing else', () => {
+  assert.equal(destructiveCommandEffect('/exit'), 'kills the bot process and disconnects every bot')
+  for (const cmd of ['/all /dc', '/all-slow /dc', '/all-slow 30 /dc', '/all-slow 500ms /disconnect', '/all /dc now']) {
+    assert.equal(destructiveCommandEffect(cmd), 'disconnects every bot at once', cmd)
+  }
+  for (const cmd of ['/dc', '/status', '/all /status', '/all !hello', '/exitish', '/alliance', '', undefined]) {
+    assert.equal(destructiveCommandEffect(cmd), null, String(cmd))
+  }
+})
+
+test('createCommandConfirmation runs only on an exact repeat inside the window', () => {
+  let now = 0
+  const confirm = createCommandConfirmation(60000, () => now)
+  assert.equal(confirm.confirm('/exit'), false, 'first run warns')
+  assert.equal(confirm.confirm('/all /dc'), false, 'a different command warns too')
+  assert.equal(confirm.confirm('/exit'), true, 'the exact repeat confirms')
+  assert.equal(confirm.confirm('/exit'), false, 'a confirmation is one-shot')
+  now = 120000
+  assert.equal(confirm.confirm('/exit'), false, 'an expired window warns again')
 })
 
 test('crates-all dump= picks the dump step, and a bare value is a TPA target', () => {

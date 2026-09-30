@@ -660,6 +660,50 @@ function describeProxy(proxy) {
   return `${type} ${creds}${proxy.host}:${proxy.port}`
 }
 
+// ── Destructive-command confirmation ────────────────────────────────────────
+// /exit kills the whole process and `/all /dc` disconnects every bot at once.
+// Neither may happen on one keystroke or one typo: these commands warn first
+// ("DO NOT RUN!") and only run when the SAME command is repeated within the
+// confirmation window. Any other command always warns first.
+function destructiveCommandEffect(command) {
+  const trimmed = String(command ?? '').trim()
+  if (!trimmed) return null
+  if (trimmed.toLowerCase() === '/exit') return 'kills the bot process and disconnects every bot'
+  const m = trimmed.match(/^\/(all|all-slow)(?:\s+([\s\S]*))?$/)
+  if (m) {
+    // /all-slow's optional leading delay token ("30", "500ms") belongs to the
+    // dispatcher, not to what the bots would run — strip it first, exactly the
+    // way the /all-slow handler parses it.
+    let body = (m[2] || '').trim()
+    const splitAt = body.search(/\s/)
+    const first = splitAt === -1 ? body : body.slice(0, splitAt)
+    if (/^\d+(?:\.\d+)?(?:ms|s)?$/i.test(first)) body = splitAt === -1 ? '' : body.slice(splitAt + 1).trim()
+    const dispatched = (body.split(/\s+/)[0] || '').toLowerCase()
+    if (dispatched === '/dc' || dispatched === '/disconnect') return 'disconnects every bot at once'
+  }
+  return null
+}
+
+// One pending confirmation per command text (trimmed, lower-cased). `now` is
+// injectable so tests can expire the window without waiting a real minute.
+function createCommandConfirmation(windowMs = 60000, now = () => Date.now()) {
+  const pending = new Map() // command → expiry timestamp
+  return {
+    // true → this repeat is the go-ahead; false → warn only (and arm the window)
+    confirm(command) {
+      const key = String(command ?? '').trim().toLowerCase()
+      const at = now()
+      for (const [k, expires] of pending) if (expires <= at) pending.delete(k)
+      if (pending.has(key)) {
+        pending.delete(key)
+        return true
+      }
+      pending.set(key, at + windowMs)
+      return false
+    }
+  }
+}
+
 module.exports = {
   readDelayMs,
   readInt,
@@ -691,5 +735,7 @@ module.exports = {
   parseSleepDuration,
   fmtDuration,
   parseCommandChain,
-  executeCommandChain
+  executeCommandChain,
+  destructiveCommandEffect,
+  createCommandConfirmation
 }

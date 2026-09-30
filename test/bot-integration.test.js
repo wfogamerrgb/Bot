@@ -194,8 +194,33 @@ test('actual router handles slow chat, removed/offline bots, local arguments, an
   r.run(`bots.C.bot.entity = {}; runCrateRoutine = (id, color) => chats.push([id, color]); handleCommand('/all-slow /crates purple')`)
   assert.deepEqual(plain(r.context.chats.at(-1)), ['A', 'purple_shulker_box'])
   tick(); assert.deepEqual(plain(r.context.chats.at(-1)), ['C', 'purple_shulker_box'])
-  r.run(`handleCommand('/all-slow hello'); handleCommand('/exit')`)
+  r.run(`handleCommand('/all-slow hello'); handleCommand('/exit'); handleCommand('/exit')`)
   assert.equal(r.run('slowBroadcast.running'), false)
+})
+
+test('destructive commands warn first and run only on an exact repeat', () => {
+  const r = runtime({ ALL_SLOW_DELAY_MS: '25' })
+  const allLogs = () => r.run(`Object.values(bots).flatMap(b => b.logs.map(l => l.text)).join('|')`)
+  // First /exit only warns: no exit timer is scheduled and dispatches survive.
+  r.run(`handleCommand('/all-slow !hello'); handleCommand('/exit')`)
+  assert.match(allLogs(), /DO NOT RUN/)
+  assert.ok([...r.timers.values()].every(t => t.delay !== 300), 'first /exit must not schedule the exit')
+  assert.equal(r.run('slowBroadcast.running'), true, 'first /exit must not cancel pending dispatches')
+  // The identical command again is the explicit go-ahead.
+  r.run(`handleCommand('/exit')`)
+  assert.ok([...r.timers.values()].some(t => t.delay === 300), 'repeated /exit runs')
+  assert.equal(r.run('slowBroadcast.running'), false)
+})
+
+test('/all /dc disconnects nothing until the exact command is repeated', () => {
+  const r = runtime()
+  const allLogs = () => r.run(`Object.values(bots).flatMap(b => b.logs.map(l => l.text)).join('|')`)
+  r.run(`handleCommand('/all /dc')`)
+  assert.match(allLogs(), /DO NOT RUN/)
+  assert.ok(!allLogs().includes('Disconnecting'), 'first /all /dc must not disconnect anyone')
+  assert.deepEqual(plain(r.context.chats), [], 'a guarded command never leaks to chat')
+  r.run(`handleCommand('/all /dc')`)
+  assert.match(allLogs(), /Disconnecting/, 'repeated /all /dc runs on every bot')
 })
 
 test('bare broadcasts give usage; normal /all stays immediate', () => {

@@ -29,7 +29,9 @@ const {
   parseDataArgs,
   hasInventoryItems,
   randomInt,
-  buildHiddenDumpPlan
+  buildHiddenDumpPlan,
+  destructiveCommandEffect,
+  createCommandConfirmation
 } = require('./bot-controls')
 const os = require('os')
 const { createMonitoring, classifyKick } = require('./monitoring')
@@ -153,6 +155,10 @@ const DUMP_TPA_MIN_DISTANCE = readNumber(process.env.DUMP_TPA_MIN_DISTANCE, 10, 
 const DUMP_SETTLE_MS = readDelayMs(process.env.DUMP_SETTLE_MS, 2500)
 const DUMP_WARP_DELAY_MS = readDelayMs(process.env.DUMP_WARP_DELAY_MS, 2500)
 const DUMP_CLICK_DELAY_MS = readDelayMs(process.env.DUMP_CLICK_DELAY_MS, 120)
+// How long to wait for the server to confirm a shift-click before deciding the
+// chest is full. Judging the click from stale slot state is what made /dump
+// stop after the first stack ("only dumps a little").
+const DUMP_CLICK_CONFIRM_MS = Math.max(250, readDelayMs(process.env.DUMP_CLICK_CONFIRM_MS, 1500))
 const DUMP_OPEN_TIMEOUT_MS = readDelayMs(process.env.DUMP_OPEN_TIMEOUT_MS, 15000)
 const CHEST_SCAN_RADIUS = readNumber(process.env.CHEST_SCAN_RADIUS, 30, 1, 256)
 const CHEST_SCAN_COUNT = readInt(process.env.CHEST_SCAN_COUNT, 50, 1, 500)
@@ -3652,20 +3658,36 @@ for (let s = invStart; s < invEnd; s++) {
   if (spawnersOnly && !isSpawnerItem(item)) continue
 
   const initialCount = item.count
-  try {
-    // Shift-click the item from bot inventory into the chest.
-    // Mode 1, button 0 = shift-click in Minecraft protocol.
-    await bot.clickWindow(s, 0, 1)
-    await new Promise(r => setTimeout(r, DUMP_CLICK_DELAY_MS))
-  } catch (err) {
-    logFor(id, `{yellow-fg}⚠ ${label}: shift-click failed on slot ${s}: ${sanitize(err && err.message ? err.message : err)}{/yellow-fg}`)
-    break
+  // The slot state only refreshes once the server's window update arrives.
+  // Judging "did it move?" right after the click reads stale state and declares
+  // the chest full after the first stack — the "only dumps a little" bug. Click,
+  // then WAIT for the count to change (one retry for a dropped click) before
+  // deciding anything.
+  let afterItem = null
+  let moved = false
+  let clickFailed = false
+  for (let attempt = 0; attempt < 2 && !moved; attempt++) {
+    try {
+      // Shift-click the item from bot inventory into the chest.
+      // Mode 1, button 0 = shift-click in Minecraft protocol.
+      await bot.clickWindow(s, 0, 1)
+    } catch (err) {
+      logFor(id, `{yellow-fg}⚠ ${label}: shift-click failed on slot ${s}: ${sanitize(err && err.message ? err.message : err)}{/yellow-fg}`)
+      clickFailed = true
+      break
+    }
+    const deadline = Date.now() + DUMP_CLICK_CONFIRM_MS
+    afterItem = chestContainer.slots[s]
+    while (afterItem && afterItem.count === initialCount && Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, DUMP_CLICK_DELAY_MS))
+      afterItem = chestContainer.slots[s]
+    }
+    moved = !(afterItem && afterItem.count === initialCount)
+    if (!moved) await new Promise(r => setTimeout(r, DUMP_CLICK_DELAY_MS))
   }
-
-  // Check if item moved into the chest
-  const afterItem = chestContainer.slots[s]
-  if (afterItem && afterItem.count === initialCount) {
-    // Nothing was deposited — chest is full!
+  if (clickFailed) break
+  if (!moved) {
+    // Nothing was deposited after two attempts — treat the chest as full.
     break
   }
   if (afterItem && afterItem.count > 0) {
@@ -3673,6 +3695,8 @@ for (let s = invStart; s < invEnd; s++) {
     break
   }
   chestMoved++
+  // Keep the click cadence gentle even when the server confirms instantly.
+  await new Promise(r => setTimeout(r, DUMP_CLICK_DELAY_MS))
 }
 
 stacksMoved += chestMoved
@@ -3752,8 +3776,13 @@ function startHiddenDump () {
   logFor(SYSTEM_ID, `{cyan-fg}› Hidden dump started: ${selected.length}/${plan.length} TPA actions over ${(duration / 60000).toFixed(1)} minutes; minimum gap ${(DUMP_MIN_TPA_GAP_MS / 60000).toFixed(1)} minutes.{/cyan-fg}`)
   if (selected.length < plan.length) logFor(SYSTEM_ID, `{yellow-fg}⚠ Hidden dump limited by the 3-minute TPA gap; ${plan.length - selected.length} bot(s) were skipped this run.{/yellow-fg}`)
 
+  // Delays are computed up front so the finish timer can be scheduled after the
+  // LAST action. Finishing at `duration` used to silently swallow any action
+  // whose gap×index + jitter landed later — when duration is a multiple of the
+  // gap, the final action never ran at all.
+  const delays = selected.map((_, index) => (index === 0 ? 0 : index * DUMP_MIN_TPA_GAP_MS + Math.floor(Math.random() * 15000)))
   selected.forEach((step, index) => {
-    const delay = index === 0 ? 0 : index * DUMP_MIN_TPA_GAP_MS + Math.floor(Math.random() * 15000)
+    const delay = delays[index]
     const timer = setTimeout(() => {
       if (!hiddenDumpRun || hiddenDumpRun.cancelled) return
       const entry = bots[step.bot]
@@ -3769,11 +3798,12 @@ function startHiddenDump () {
     const entry = bots[step.bot]
     if (entry) entry.dumpTimers.push(timer)
   })
+  const finishDelay = Math.max(duration, ...delays, 0) + 1000
   const finishTimer = setTimeout(() => {
     if (!hiddenDumpRun || hiddenDumpRun.cancelled) return
-    logFor(SYSTEM_ID, `{green-fg}✓ Hidden dump finished after ${(duration / 60000).toFixed(1)} minutes.{/green-fg}`)
+    logFor(SYSTEM_ID, `{green-fg}✓ Hidden dump finished after ${(finishDelay / 60000).toFixed(1)} minutes.{/green-fg}`)
     hiddenDumpRun = null
-  }, duration)
+  }, finishDelay)
   hiddenDumpRun.timers.push(finishTimer)
   return true
 }
@@ -5586,6 +5616,14 @@ function executeCommandChain(chain, ctx, overrides = {}) {
 // so /repeat stop can cancel what is still queued without touching other tabs.
 const repeatTimers = new Map()
 
+// ── Destructive-command confirmation (see DO-NOT-KILL.md) ───────────────────
+// /exit kills the whole process and `/all /dc` / `/all-slow /dc` disconnects
+// every bot at once. Neither may happen on one keystroke: the first run only
+// warns ("DO NOT RUN!"), and the SAME command repeated within the window is
+// the explicit go-ahead.
+const DANGER_CONFIRM_MS = 60000
+const dangerConfirm = createCommandConfirmation(DANGER_CONFIRM_MS)
+
 // ── Broadcast chat guard ─────────────────────────────────────────────────────
 // A mistyped /all must never reach public chat: "/all .server lifesteal"
 // (meant "/all /server lifesteal") would have EVERY bot say the same typo and
@@ -5801,6 +5839,15 @@ const logError = (msg) => logFor(activeId || SYSTEM_ID, `{red-fg}✗ ${msg}{/red
 // Echo the run command so the log is self-documenting (the web console needs it)
 if (!options.isChained) {
 log(`{bold}{green-fg}❯ ${sanitize(trimmed)}{/green-fg}{/bold}`)
+}
+
+// ── Destructive-command confirmation (see DO-NOT-KILL.md) ───────────────────
+// /exit and "/all /dc" end the entire fleet. The first run only warns; the
+// SAME command repeated within DANGER_CONFIRM_MS is the explicit go-ahead.
+const dangerEffect = destructiveCommandEffect(trimmed)
+if (dangerEffect && !dangerConfirm.confirm(trimmed)) {
+  logWarn(`⚠ WARNING! DO NOT RUN ${sanitize(trimmed)} — it ${dangerEffect}. Repeat the command 1 more time if you want to (within ${Math.round(DANGER_CONFIRM_MS / 1000)}s). WARNING!`)
+  return
 }
 
 // ── /repeat [n|duration] [delay] <command> ─────────────────────────────────
