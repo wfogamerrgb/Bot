@@ -466,6 +466,59 @@ test('only the removed list blocks connecting; data-file ban flags do not', () =
   assert.match(r.run(`bots.B.logs.map(l => l.text).join('|')`), /removed list/)
 })
 
+// /unban-all empties the removed list and walks the bots back one at a time —
+// every restored bot at once would trip the server's login rate limit.
+test('/unban-all restores everyone with a stagger between reconnects', () => {
+  const r = runtime({ UNBAN_ALL_STAGGER_MS: '100' })
+  r.timers.clear()
+  r.run(`removedBots = removedBotsStore.addRemovedBot(removedBots, { bot: 'A', kind: 'permanent', reason: 'cheating' }, { addedBy: 'ban-detection' }).list`)
+  r.run(`removedBots = removedBotsStore.addRemovedBot(removedBots, { bot: 'B', kind: 'temporary', reason: 'alt farming' }, { addedBy: 'ban-detection' }).list`)
+  r.run(`dataState.bots.A = { banned: true, banKind: 'permanent', banExpiresAt: 0 }`)
+  r.run(`createBotInstance = (id) => chats.push([id, 'connect'])`)
+
+  r.run(`handleCommand('/unban-all')`)
+  assert.equal(r.run('removedBots.bots.length'), 0, 'the list is emptied')
+  assert.equal(r.run('dataState.bots.A.banned'), false, 'and the data-file report flags are cleared too')
+  assert.deepEqual([...r.timers.values()].map(t => t.delay).sort((a, b) => a - b), [0, 100], 'one reconnect per bot, UNBAN_ALL_STAGGER_MS apart — never all at once')
+
+  while (r.timers.size) { const t = [...r.timers.keys()][0]; r.timers.delete(t); t.fn() }
+  assert.deepEqual(plain(r.context.chats), [['A', 'connect'], ['B', 'connect']], 'both bots come back, each on its own timer')
+
+  // An empty list must not schedule anything.
+  r.timers.clear()
+  r.run(`handleCommand('/unban-all')`)
+  assert.equal(r.timers.size, 0, 'nothing to restore means nothing to reconnect')
+})
+
+// The chat-game default pace is a gameplay decision: too fast looks scripted.
+test('chat game guesses default to one every 350ms', () => {
+  const r = runtime()
+  assert.equal(r.run("settings.get('CHAT_GAME_GUESS_MS')"), 350)
+  const tuned = runtime({ CHAT_GAME_GUESS_MS: '50' })
+  assert.equal(tuned.run("settings.get('CHAT_GAME_GUESS_MS')"), 50, 'and stays overridable')
+})
+
+// The dashboard's "⟳ tor" button: per-port results, failures never throw.
+test('/api/tor/newnym and /tor-newnym report every control port', async () => {
+  const r = runtime({ TOR_CONTROL_PORTS: '59997' })
+  const cookie = await r.login()
+  const res = await r.request('/api/tor/newnym', '', cookie, 'POST')
+  assert.equal(res.status, 200)
+  const body = JSON.parse(res.body)
+  assert.equal(body.ok, false, 'a dead control port is a reported failure, not a crash')
+  assert.equal(body.results[0].port, 59997)
+  assert.ok(body.results[0].error, 'and it says why')
+
+  const result = await r.run(`handleCommand('/tor-newnym')`)
+  assert.equal(result.ok, false)
+  assert.equal(result.results.length, 1, 'the console command runs the same sweep')
+
+  const empty = runtime()
+  const bare = await empty.run(`handleCommand('/tor-newnym')`)
+  assert.equal(bare.ok, false)
+  assert.equal(bare.results.length, 0, 'with no local Tor there is nothing to signal — reported, not guessed at')
+})
+
 // The sweep only tidies reporting flags — it must never yank a connection
 // around (it used to force-reconnect, which could double up a live bot).
 test('the ban sweep clears lapsed flags without touching connections', () => {
@@ -508,6 +561,21 @@ test('chat game prompts are covered by the fleet in random order', () => {
   while (r.timers.size) { const t = [...r.timers.keys()][0]; r.timers.delete(t); t.fn() }
   assert.equal(r.context.chats.length, 1, 'only the immediate first guess is sent')
   assert.equal(r.run('chatGame.running'), false)
+})
+
+// An equation round has ONE exact answer, so exactly ONE randomly chosen bot
+// says it — computed, never guessed, and never twice.
+test('an equation chat game is answered exactly once by one bot', () => {
+  const r = runtime()
+  r.timers.clear()
+  r.run(`feedChatGameLine('Solve: 3x+5=20 | Reward: $2,500')`)
+  const chats = plain(r.context.chats)
+  assert.equal(chats.length, 1, 'exactly one bot answers')
+  assert.equal(chats[0][1], '5', 'the computed value of x, just the number')
+  r.run(`feedChatGameLine('Solve: 3x+5=20 | Reward: $2,500')`)
+  assert.equal(plain(r.context.chats).length, 1, 'a repeated banner is not answered twice')
+  r.run(`feedChatGameLine('I think x = 5 lol')`)
+  assert.equal(plain(r.context.chats).length, 1, 'player chatter never triggers an answer')
 })
 
 // bot-scripts: one command per line, "*<fragment>" targets bots by name.

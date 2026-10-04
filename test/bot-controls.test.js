@@ -4,7 +4,7 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { readDelayMs, readInt, readNumber, parseDumpMode, parseDataArgs, parseCratesAllDump, parseCratesAllAfk, parseCratesAllFlags, shuffledCopy, createSlowBroadcast, createSlowBroadcastManager, parseChatGameRange, isChatGameEnd, createChatGameManager, parseProxyGroups, resolveBotProxy, hasProxyAuth, proxyAuthHeader, buildHttpConnectRequest, describeProxy, resolveLoginPassword, resolveFallbackPassword, parseBotPasswords, classifyAuthReply, nextAuthFailure, isAuthBlocked, findIgnoredProxyGroupVars, destructiveCommandEffect, createCommandConfirmation, parseItemGlobs, itemMatchesGlobs, parseRewardSlots, parseScript, parseScriptLine, selectScriptBots, listBotScripts, loadBotScript, commandSuggestions } = require('../bot-controls')
+const { readDelayMs, readInt, readNumber, parseDumpMode, parseDataArgs, parseCratesAllDump, parseCratesAllAfk, parseCratesAllFlags, shuffledCopy, createSlowBroadcast, createSlowBroadcastManager, parseChatGameRange, parseChatGameEquation, isChatGameEnd, createChatGameManager, parseProxyGroups, resolveBotProxy, hasProxyAuth, proxyAuthHeader, buildHttpConnectRequest, describeProxy, resolveLoginPassword, resolveFallbackPassword, parseBotPasswords, classifyAuthReply, nextAuthFailure, isAuthBlocked, findIgnoredProxyGroupVars, destructiveCommandEffect, createCommandConfirmation, parseItemGlobs, itemMatchesGlobs, parseRewardSlots, parseScript, parseScriptLine, selectScriptBots, listBotScripts, loadBotScript, parseTorControlPorts, deriveTorControlPorts, sendTorSignal, commandSuggestions } = require('../bot-controls')
 
 function clock() {
   let time = 0, sequence = 0
@@ -174,6 +174,68 @@ test('empty broadcast finishes without a timer', () => {
   assert.equal(c.timers.size, 0)
 })
 
+// ── Tor control (fresh circuits) ───────────────────────────────────────────
+
+test('parseTorControlPorts reads a messy list and deriveTorControlPorts keeps local instances only', () => {
+  assert.deepEqual(parseTorControlPorts('9051,9151 9251;9051'), [9051, 9151, 9251])
+  assert.deepEqual(parseTorControlPorts(''), [])
+  assert.deepEqual(parseTorControlPorts('0,70000,abc,-1, 9051'), [9051], 'junk and out-of-range entries are dropped')
+  assert.deepEqual(parseTorControlPorts(null), [])
+  // The convention is scripts/restart-tor.sh's: control port = SOCKS + 1.
+  assert.deepEqual(deriveTorControlPorts(
+    [{ host: '127.0.0.1', port: 9150 }, { host: 'localhost', port: 9250 }, { host: 'proxy.example.com', port: 1080 }],
+    { host: '127.0.0.1', port: 9050 }
+  ), [9151, 9251, 9051])
+  assert.deepEqual(deriveTorControlPorts([{ host: '10.0.0.5', port: 9050 }], null), [], 'a remote proxy is nobody we can signal')
+  assert.deepEqual(deriveTorControlPorts([{ host: '127.0.0.1', port: 9050 }, { host: 'localhost', port: 9050 }], null, 2), [9052], 'the same instance is listed once')
+  assert.deepEqual(deriveTorControlPorts([], { host: 'localhost', port: 65535 }), [], 'offsetting past 65535 is not a port')
+})
+
+test('sendTorSignal authenticates and signals, and a dead or rude port is a result not a throw', async () => {
+  const net = require('node:net')
+  const listen = handler => new Promise(resolve => {
+    const server = net.createServer(handler)
+    server.listen(0, '127.0.0.1', () => resolve(server))
+  })
+  const close = server => new Promise(resolve => server.close(resolve))
+  const withServer = async (handler, fn) => {
+    const server = await listen(handler)
+    try { return await fn(server.address().port) } finally { await close(server) }
+  }
+
+  // The real conversation: AUTHENTICATE + SIGNAL + QUIT go out together, and
+  // both 250 answers come back before the connection closes.
+  await withServer(sock => sock.on('data', () => { sock.write('250 OK\r\n250 OK\r\n'); sock.end() }), async port => {
+    const result = await sendTorSignal(port)
+    assert.equal(result.ok, true, JSON.stringify(result))
+    assert.equal(result.port, port)
+    assert.match(result.reply, /250/)
+  })
+
+  await withServer(sock => sock.on('data', () => { sock.write('515 Authentication failed\r\n'); sock.end() }), async port => {
+    const result = await sendTorSignal(port)
+    assert.equal(result.ok, false, 'a refused AUTHENTICATE is a failure')
+    assert.match(result.error, /515/)
+  })
+
+  // The fake control port reads but never answers. It must consume the socket
+  // data — an ignored (paused) socket never sees the client's FIN, and the
+  // server would linger forever.
+  await withServer(sock => sock.on('data', () => {}), async port => {
+    const result = await sendTorSignal(port, { timeoutMs: 50 })
+    assert.equal(result.ok, false, 'a silent port times out instead of hanging')
+    assert.match(result.error, /no reply/)
+  })
+
+  // Nothing is listening: ECONNREFUSED comes back as a result too.
+  const spare = await listen(_sock => {})
+  const deadPort = spare.address().port
+  await close(spare)
+  const refused = await sendTorSignal(deadPort)
+  assert.equal(refused.ok, false)
+  assert.ok(refused.error, 'the failure says why')
+})
+
 // ── Chat games (guess the number) ──────────────────────────────────────────
 
 test('parseChatGameRange reads hint lines and never reads a countdown as a range', () => {
@@ -246,6 +308,71 @@ test('a chat game pool that cannot speak ends the round instead of spinning', ()
   c.tick(10000)
   assert.equal(job.running, false, 'every sender dead → the round gives up')
   assert.equal(c.timers.size, 0)
+})
+
+// ── Chat games (equation rounds) ────────────────────────────────────────────
+
+test('parseChatGameEquation computes the exact value of the variable, never guesses', () => {
+  assert.deepEqual(parseChatGameEquation('Solve: 3x+5=20'), { equation: '3x+5=20', variable: 'x', answer: 5, answerText: '5' })
+  assert.equal(parseChatGameEquation('\u2726 Solve: 3x+5=20 | Reward: $2,500').answerText, '5', 'the round banner is a prompt')
+  assert.equal(parseChatGameEquation('Solve for x: 2x-4=10').answerText, '7')
+  assert.equal(parseChatGameEquation('Quick math! 3(x+2)=15 | Reward: $1,000').answerText, '3', 'a factored side is distributed exactly')
+  assert.equal(parseChatGameEquation('What is x? 5x=25').answerText, '5')
+  assert.equal(parseChatGameEquation('Solve: x/2=4').answerText, '8')
+  assert.equal(parseChatGameEquation('Solve: 0.5x=3').answerText, '6', 'decimals are rationals, not guesses')
+  assert.equal(parseChatGameEquation('Solve: 2x+1=x+4').answerText, '3', 'variables on both sides')
+  assert.equal(parseChatGameEquation('Solve: 2x=7').answerText, '3.5', 'a non-integer answer is exact')
+  assert.equal(parseChatGameEquation('Solve: 2x+10=4').answerText, '-3', 'negative answers carry their sign')
+  assert.equal(parseChatGameEquation('Solve: 3x+5=20 (x=?)').answerText, '5', 'a "what is x" tag is not a second equation')
+  assert.equal(parseChatGameEquation('Solve: 3x+5=3x+9'), null, 'no unique solution — nothing is sent')
+  assert.equal(parseChatGameEquation('Solve: x=x'), null, 'an identity has no answer to compute')
+  assert.equal(parseChatGameEquation('Solve: x+y=5'), null, 'two variables — nothing is sent')
+  assert.equal(parseChatGameEquation('Solve: x^2=9'), null, 'non-linear is never guessed at')
+  assert.equal(parseChatGameEquation('Solve: 3x+5=?'), null, 'a blank is not an equation')
+  assert.equal(parseChatGameEquation('I think x = 5 lol'), null, 'player chatter is not a prompt')
+  assert.equal(parseChatGameEquation('Score = 5 | Reward: $100'), null, 'a scoreboard line is not an equation')
+  assert.equal(parseChatGameEquation('1+1=2'), null, 'nothing to solve')
+  assert.equal(parseChatGameEquation(''), null)
+  assert.equal(parseChatGameEquation(null), null)
+})
+
+test('isChatGameEnd also wraps up equation rounds before a reveal can be answered', () => {
+  for (const line of ['Nobody solved the equation in time', 'The correct answer was 5!', 'Steve solved the equation!', 'The answer was 5']) {
+    assert.equal(isChatGameEnd(line), true, line)
+  }
+})
+
+test('an equation round is answered exactly once, by one bot, with the computed answer', () => {
+  const c = clock(), sent = []
+  const job = createChatGameManager({ ...c, now: () => c.time, submit: (id, v) => { sent.push([id, v]); return true } })
+  job.feed('Solve: 3x+5=20 | Reward: $2,500', { bots: ['A', 'B', 'C', 'D'], maxBots: 3 })
+  assert.equal(sent.length, 1, 'exactly one message goes out')
+  assert.equal(sent[0][1], '5', 'the computed answer — just the number')
+  assert.equal(['A', 'B', 'C'].includes(sent[0][0]), true, 'from the first maxBots pool bots')
+  assert.equal(job.running, false, 'no number round is started')
+  job.feed('Solve: 3x+5=20 | Reward: $2,500', { bots: ['A', 'B', 'C', 'D'], maxBots: 3 })
+  assert.equal(sent.length, 1, 'a repeated banner line is not answered twice')
+  job.feed('Solve: 2x=10', { bots: ['A', 'B'], maxBots: 5 })
+  assert.equal(sent.length, 2, 'a new equation is a new round')
+  assert.equal(sent[1][1], '5')
+  assert.equal(c.timers.size, 0, 'an equation needs no timer')
+})
+
+test('an equation steals the round from a stale number game and skips dead bots', () => {
+  const c = clock(), sent = []
+  // Only B is connected: the manager walks the pool until a bot can speak,
+  // and only the message that actually goes out is recorded.
+  const job = createChatGameManager({ ...c, now: () => c.time, submit: (id, v) => {
+    if (id !== 'B') return false
+    sent.push([id, v])
+    return true
+  } })
+  job.feed('Hint: 1-100', { bots: ['A', 'B'], intervalMs: 100 })
+  assert.equal(job.running, true)
+  job.feed('Solve: 2x=10', { bots: ['A', 'B'], maxBots: 5 })
+  assert.equal(job.running, false, 'the stale number round is over')
+  assert.equal(sent.filter(([, v]) => v === '5').length, 1, 'still exactly one answer')
+  assert.equal(sent.find(([, v]) => v === '5')[0], 'B', 'it comes from the one bot that can speak')
 })
 
 // ── /ege allowlists & bot-scripts ─────────────────────────────────────────

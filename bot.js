@@ -40,7 +40,10 @@ const {
   loadBotScript,
   commandSuggestions,
   destructiveCommandEffect,
-  createCommandConfirmation
+  createCommandConfirmation,
+  parseTorControlPorts,
+  deriveTorControlPorts,
+  sendTorSignal
 } = require('./bot-controls')
 const os = require('os')
 const { createMonitoring, classifyKick } = require('./monitoring')
@@ -482,6 +485,36 @@ const PROXY_DEFAULT = PROXY_ENABLED ? { host: PROXY_HOST, port: PROXY_PORT, type
 const PROXY_GROUPS = parseProxyGroups()
 const PROXY_GROUPS_ENABLED = PROXY_GROUPS.length > 0
 
+// ── Tor control ports ───────────────────────────────────────────────────────
+// scripts/restart-tor.sh gives each local Tor instance a control port at its
+// SOCKS port + 1 with CookieAuthentication 0 ("ControlPort <socks+1>" in the
+// generated torrc). TOR_CONTROL_PORTS overrides the list; empty means "derive
+// it from the local proxies", which is exactly the script's convention.
+function torControlPorts () {
+  const explicit = parseTorControlPorts(settings.get('TOR_CONTROL_PORTS'))
+  return explicit.length ? explicit : deriveTorControlPorts(PROXY_GROUPS, PROXY_DEFAULT)
+}
+
+// SIGNAL NEWNYM on every local Tor instance: the NEXT connection (each bot's
+// next reconnect) leaves through a fresh circuit — a live connection keeps the
+// circuit it is already on. Shared by /tor-newnym and the dashboard button,
+// and reported per port: one dead instance must not hide the others' results.
+async function requestTorCircuits () {
+  const ports = torControlPorts()
+  if (!ports.length) {
+    logFor(SYSTEM_ID, '{yellow-fg}⚠ No Tor control ports known — set TOR_CONTROL_PORTS (or point PROXY_* / PROXY_GROUP_* at a local Tor).{/yellow-fg}')
+    return { ok: false, results: [], error: 'no Tor control ports configured' }
+  }
+  const results = []
+  for (const port of ports) {
+    const r = await sendTorSignal(port)
+    results.push(r)
+    if (r.ok) logFor(SYSTEM_ID, `{green-fg}✓ Tor control :${port} — new circuits requested; reconnects leave through a new path.{/green-fg}`)
+    else logFor(SYSTEM_ID, `{red-fg}✗ Tor control :${port} — ${sanitize(r.error)}{/red-fg}`)
+  }
+  return { ok: results.every(r => r.ok), results }
+}
+
 // ── Proxy stall watchdog ────────────────────────────────────────────────────
 const PROXY_STALL_ENABLED = PROXY_ENABLED && process.env.PROXY_STALL_WATCHDOG !== '0'
 const PROXY_STALL_TIMEOUT_MS = readDelayMs(process.env.PROXY_STALL_TIMEOUT_MS, 90000)
@@ -810,6 +843,7 @@ cfDefine('ANALYTICS_BUCKET_MS', { type: 'ms', def: 3600000, min: 60000, group: '
 // picture of the configuration rather than only the new half of it.
 cfDefine('ALL_SLOW_DELAY_MS', { type: 'ms', def: 15000, min: 0, group: 'Timing', desc: 'Default gap between bots in /all-slow (live)' })
 cfDefine('REPEAT_DELAY_MS', { type: 'ms', def: 2000, min: 0, group: 'Timing', desc: 'Gap between /repeat runs (live); a per-run delay token overrides it for that run' })
+cfDefine('UNBAN_ALL_STAGGER_MS', { type: 'ms', def: 30000, min: 0, group: 'Timing', desc: 'Gap between the reconnects /unban-all schedules, so restored bots don\'t all hit the server at once (live)' })
 cfDefine('ALL_CHAT_GUARD', { type: 'bool', def: true, group: 'Safety', desc: 'Refuse /all and /all-slow broadcasts that are not /commands — a typo like "/all .server lifesteal" would make every bot say it in chat and expose the fleet. Prefix with "!" to send chat deliberately ( /all !hello )' })
 cfDefine('BOOK_AUTO', { type: 'bool', def: false, group: 'Book', desc: 'Run /use-book automatically whenever a GUI opens with a matching item in it — when there is no match, nothing happens at all' })
 cfDefine('BOOK_ITEM_QUERY', { type: 'string', def: 'book', group: 'Book', desc: 'What /use-book scans for: a substring of the display, custom or registry name' })
@@ -820,8 +854,8 @@ cfDefine('AUTH_MAX_THROTTLED_RETRIES', { type: 'int', def: 2, min: 1, group: 'Au
 cfDefine('AUTH_REPLY_WINDOW_MS', { type: 'ms', def: 30000, min: 1000, group: 'Auth', desc: 'How long a reply counts as an answer to our auth command (live)' })
 cfDefine('AUTH_FALLBACK_DELAY_MS', { type: 'ms', def: 6000, min: 0, group: 'Auth', desc: 'Wait after a rejected /login before the fallback password is tried (live)' })
 cfDefine('LOGIN_PASSWORD_FALLBACK', { type: 'string', def: '', group: 'Auth', desc: 'Second /login password tried once after a rejection, when no group fallback applies (live)' })
-cfDefine('CHAT_GAME_AUTO', { type: 'bool', def: true, group: 'Chat game', desc: 'Auto-play "guess the number" chat events: a random bot shouts one unguessed number per tick until the round ends' })
-cfDefine('CHAT_GAME_GUESS_MS', { type: 'ms', def: 100, min: 25, group: 'Chat game', desc: 'Gap between guesses — 100 ms is ten numbers per second (live)' })
+cfDefine('CHAT_GAME_AUTO', { type: 'bool', def: true, group: 'Chat game', desc: 'Auto-play chat events: "guess the number" rounds are covered number by number, equation rounds answered exactly by one random bot' })
+cfDefine('CHAT_GAME_GUESS_MS', { type: 'ms', def: 350, min: 25, group: 'Chat game', desc: 'Gap between guesses — 350 ms is about three numbers per second (live)' })
 cfDefine('CHAT_GAME_MAX_BOTS', { type: 'int', def: 30, min: 1, group: 'Chat game', desc: 'How many connected bots (roster order) are used as guessers (live)' })
 cfDefine('EAPPLE_KIT_SLOT', { type: 'int', def: 14, min: 0, group: 'Kits', desc: 'Slot clicked in the /kits GUI before the reward slot — /ege (live)' })
 cfDefine('EAPPLE_REWARD_SLOTS', { type: 'string', def: '21,15,13,11', group: 'Kits', desc: 'One /ege pass per slot: /kits → kit slot → this slot → /dispose (live)' })
@@ -846,6 +880,7 @@ cfDefine('TPA_MAIN_PLAYER', { type: 'string', def: (process.env.TPA_MAIN_PLAYER 
 cfDefine('WARP_COMMAND', { type: 'string', def: '/warp afk', group: 'Dump', live: false, desc: 'The AFK warp command (startup-only)' })
 cfDefine('WEB_PORT', { type: 'int', def: 80, min: 1, max: 65535, group: 'Dashboard', live: false, desc: 'Dashboard port (startup-only)' })
 cfDefine('WEB_PASSWORD', { type: 'string', group: 'Dashboard', live: false, desc: 'Dashboard login (startup-only; leave empty for a generated one)' })
+cfDefine('TOR_CONTROL_PORTS', { type: 'string', def: '', group: 'Tor', desc: 'Tor control ports for /tor-newnym and the dashboard button — empty = every local proxy SOCKS port + 1, matching scripts/restart-tor.sh (live)' })
 
 const COINFLIP_FILE = process.env.COINFLIP_FILE || path.join(__dirname, 'data', 'coinflip-history.jsonl')
 const COINFLIP_SUMMARY_FILE = process.env.COINFLIP_SUMMARY_FILE || path.join(__dirname, 'data', 'coinflip-stats.json')
@@ -1454,7 +1489,7 @@ button.tb:hover{color:var(--txt);border-color:var(--acc)}
 <main>
 <div id="loghead"><span id="channame">ALL CHANNELS</span><span id="newchip"></span>
 <input id="search" placeholder="filter logs…"><button class="tb" id="topbtn" type="button" title="scroll to top">↑ top</button><button class="tb" id="bottombtn" type="button" title="scroll to newest">↓ bottom</button><button class="tb" id="followbtn" type="button">⏸ pause</button>
-<button class="tb" id="clearbtn">clear</button><button class="tb" id="helpbtn">? cmds</button></div>
+<button class="tb" id="clearbtn">clear</button><button class="tb" id="torbtn" type="button" title="Request fresh Tor circuits — the next reconnects leave through a new path">⟳ tor</button><button class="tb" id="helpbtn">? cmds</button></div>
 <div id="logwrap"><div id="log"></div></div>
 <div id="guitui" hidden></div>
 <div id="manualbar" aria-label="Manual bot controls">
@@ -1878,6 +1913,11 @@ Object.keys(cmds).forEach(function(k){var r=document.createElement('div');r.clas
 var b=document.createElement('b');b.textContent=k
 var sp=document.createElement('span');sp.textContent=cmds[k]||''
 r.appendChild(b);r.appendChild(sp);h.appendChild(r)})}
+el('torbtn').onclick=function(){var b=el('torbtn');b.disabled=true;toast('requesting new Tor circuits…')
+fetch('/api/tor/newnym',{method:'POST',credentials:'same-origin'}).then(function(r){return r.json()}).then(function(m){
+var rs=m.results||[],ok=rs.filter(function(x){return x.ok}).length
+toast(m.ok?'new Tor circuits on all '+rs.length+' instance(s)':'new circuits on '+ok+' of '+rs.length+' Tor instance(s) — see the system log',m.ok?'good':'bad')
+b.disabled=false}).catch(function(){toast('could not request Tor circuits — see the system log','bad');b.disabled=false})}
 el('helpbtn').onclick=function(){el('help').hidden=!el('help').hidden}
 el('help').onclick=function(){el('help').hidden=true}
 el('clearbtn').onclick=function(){lines=[];el('log').innerHTML=''
@@ -2265,6 +2305,13 @@ let msg
 try { msg = JSON.parse(body || '{}') } catch (_) { msg = null }
 const result = msg && msg.all ? { ok: true, cleared: settings.resetAll().length } : settings.reset(msg && msg.key)
 res.writeHead(result.ok ? 200 : 400, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
+res.end(JSON.stringify(result))
+return
+}
+if (p === '/api/tor/newnym' && req.method === 'POST') {
+// The dashboard's "⟳ tor" button — the same code path as /tor-newnym.
+const result = await requestTorCircuits()
+res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
 res.end(JSON.stringify(result))
 return
 }
@@ -3457,6 +3504,7 @@ const COMMANDS = {
 '/auth-retry <bot>': 'Clear a recorded login/register failure for a bot and reconnect it so it can authenticate again (the failure is otherwise only cleared by a restart)',
 '/removed': 'List the removed / permanently-banned bots (the removed-bots.json roster)',
 '/unban <bot>': 'Take a bot off the removed list and reconnect it',
+'/unban-all': 'Empty the removed list and bring EVERY removed bot back, reconnecting them UNBAN_ALL_STAGGER_MS apart so they don\'t all hit the server at once',
 '/chat <msg>': 'Send a chat message from the active bot (avoids triggering local commands); /-prefixed server commands open their GUI without auto-clicking',
 '/disconnect': 'Disconnect the active bot (stops auto-reconnect). Alias: /dc',
 '/closeBot': 'Disconnect the active bot and completely remove it from the UI',
@@ -3480,6 +3528,7 @@ const COMMANDS = {
 '/switch <id>': 'Switch view to a different bot by name or number',
 '/uptime': 'Show uptime for all bots',
 '/proxy': 'Show the currently configured outbound proxy',
+'/tor-newnym': 'Ask every local Tor instance for fresh circuits (control port = the SOCKS port + 1, or TOR_CONTROL_PORTS) — reconnects leave through a new path; live connections keep theirs until they reconnect',
 '/manual-interact': 'Toggle manual interact mode for the active bot (3D view, movement pad, direct world actions); disabled while crate/shardshop routines run',
 '/manual-stop': 'Stop manual interact mode, release held controls, stop pathfinding, close viewer',
 '/drop [count]': 'Drop the held stack (all of it, or [count] items from it)',
@@ -4979,11 +5028,13 @@ function feedCoinflipLine (id, message) {
   try { coinflipObserverFor(id).feed(message) } catch (_) {}
 }
 
-// ── Chat games (guess the number) ───────────────────────────────────────────
+// ── Chat games (guess the number & equations) ───────────────────────────────
 // The server announces a timed round ("A chat event has started! … Hint: 1-15
 // | Reward: $2,500"); the fleet covers the range as fast as it can: every tick
 // a random connected bot says one number that has not been guessed yet, in
-// random order. See createChatGameManager for the round lifecycle.
+// random order. Equation rounds ("Solve: 3x+5=20") instead get exactly one
+// answer — computed, never guessed — from exactly one random bot. See
+// createChatGameManager for the round lifecycle.
 const chatGame = createChatGameManager({
   submit: (botId, value) => {
     const entry = bots[botId]
@@ -4994,6 +5045,9 @@ const chatGame = createChatGameManager({
   onEvent: (ev) => {
     if (ev.kind === 'start') {
       logFor(SYSTEM_ID, `{magenta-fg}🎮 chat game ${ev.min}-${ev.max}: ${ev.guesses} numbers from ${ev.bots} bot(s) at ${Math.round(1000 / ev.intervalMs)}/s{/magenta-fg}`)
+    } else if (ev.kind === 'equation') {
+      if (ev.bot) logFor(SYSTEM_ID, `{magenta-fg}🧮 chat game equation ${ev.equation} → ${ev.variable} = ${ev.answer} (${ev.bot}){/magenta-fg}`)
+      else logFor(SYSTEM_ID, `{magenta-fg}🧮 chat game equation ${ev.equation} → ${ev.variable} = ${ev.answer}, but no bot could speak{/magenta-fg}`)
     } else if (ev.kind === 'stop') {
       logFor(SYSTEM_ID, `{magenta-fg}🎮 chat game over (${ev.reason}) — guessed ${ev.guessed.length ? ev.guessed.join(', ') : 'nothing'}{/magenta-fg}`)
     }
@@ -6605,6 +6659,31 @@ notifyBotsChanged()
 return
 }
 
+// ── /unban-all ──────────────────────────────
+if (trimmed === '/unban-all') {
+const entries = (removedBots.bots || []).slice()
+if (!entries.length) { logInfo('Nothing on the removed list — there is nobody to bring back.'); return }
+removedBots = removedBotsStore.emptyList()
+persistRemovedBots()
+// Same as /unban: clear the data-file report flag too, or /list and the
+// dashboard would keep calling them banned while they walk back in.
+entries.forEach(entry => dataStore.upsertBot(dataState, { bot: entry.bot, banned: false, bannedAt: null, banKind: null, banReason: null, banExpiresAt: 0 }))
+persistData()
+const staggerMs = settings.get('UNBAN_ALL_STAGGER_MS')
+logSuccess(`Removed ${entries.length} bot(s) from the removed list — reconnecting ${staggerMs ? `${staggerMs / 1000}s apart` : 'immediately'} so they don't all hit the server at once. Put any name back in BOT_NAMES if you had removed it from there.`)
+entries.forEach((entry, index) => {
+setTimeout(() => {
+const name = entry.bot
+const { host, port, version } = bots[name] || { host: HOST, port: PORT, version: VERSION }
+logFor(SYSTEM_ID, `{green-fg}↻ ${sanitize(name)} is off the removed list — reconnecting.{/green-fg}`)
+try { bots[name]?.disconnectManually() } catch (_) {}
+setTimeout(() => createBotInstance(name, host, port, version), 1000)
+}, index * staggerMs)
+})
+notifyBotsChanged()
+return
+}
+
 // ── /list ───────────────────────────────────
 if (trimmed === '/list') {
 const names = Object.keys(bots)
@@ -6664,6 +6743,17 @@ logInfo('{bold}Stall watchdog:{/bold} off (set PROXY_STALL_WATCHDOG=1, or unset 
 logInfo('No outbound proxy configured — bots connect directly. Set PROXY_HOST or PROXY_GROUP_1_* in .env to enable one.')
 }
 return
+}
+
+// ── /tor-newnym ─────────────────────────────
+if (trimmed === '/tor-newnym') {
+return requestTorCircuits().then(result => {
+if (!result.results.length) return result
+const okCount = result.results.filter(r => r.ok).length
+if (result.ok) logSuccess(`New Tor circuits requested on all ${result.results.length} instance(s) — reconnects leave through a new path.`)
+else logWarn(`New circuits on ${okCount} of ${result.results.length} Tor instance(s) — the system log says which one failed.`)
+return result
+})
 }
 
 // ── /stats (added) ──────────────────────────
