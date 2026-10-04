@@ -73,9 +73,6 @@ function runtime(env = {}) {
         ...controls,
         createSlowBroadcast: () => controls.createSlowBroadcast({ setTimer, clearTimer }),
         createSlowBroadcastManager: () => controls.createSlowBroadcastManager({ setTimer, clearTimer }),
-        // Same reason as the broadcasts: the chat-game round must tick on the
-        // harness clock, not on real setTimeout.
-        createChatGameManager: (opts = {}) => controls.createChatGameManager({ ...opts, setTimer, clearTimer }),
         // bot-controls reads the real process.env by default, but inside this
         // harness bot.js reads processMock.env — so the group vars have to be
         // parsed from the same object bot.js sees, exactly as they would be in
@@ -427,7 +424,7 @@ test('the removed list gates reconnecting and /unban puts a bot back', () => {
   assert.equal(r.run('dropFromRoster("A")'), false, 'dropping it twice is harmless')
 
   // The commands must survive being called, and /unban must clear both the list
-  // and the ban flag (otherwise the data file keeps reporting a ban).
+  // and the ban hold (otherwise the next reconnect is held again).
   r.run(`handleCommand('/removed')`)
   r.run(`handleCommand('/unban')`)
   r.run(`handleCommand('/unban ghost')`)
@@ -436,107 +433,26 @@ test('the removed list gates reconnecting and /unban puts a bot back', () => {
   r.run('dataState.bots.A = { banned: true, banKind: "permanent", banExpiresAt: 0 }')
   r.run(`handleCommand('/unban A')`)
   assert.equal(r.run('removedEntryFor("A")'), null, 'the bot is off the removed list')
-  assert.equal(r.run('dataState.bots.A.banned'), false, 'and its ban flag is cleared')
+  assert.equal(r.run('dataState.bots.A.banned'), false, 'and its ban hold is cleared')
 
   assert.equal(r.run('PERMANENT_BAN_ACTION'), 'remove', 'a permanent ban defaults to leaving the roster')
 })
 
-// The connect gate is removed-bots.json and nothing else. Ban flags in the data
-// file are reporting — a flagged bot must keep dialling, or one bad verdict (or
-// a stale flag left in data/ from an old session) strands the account forever.
-test('only the removed list blocks connecting; data-file ban flags do not', () => {
+// activeBan is what both the startup loop and scheduleReconnect ask before
+// dialling, so it is worth pinning down through bot.js rather than only in isolation.
+test('activeBan holds a live ban and releases an expired one', () => {
   const r = runtime()
   r.run(`
-    dataState.bots.A = { banned: true, banKind: 'temporary', banExpiresAt: Date.now() + 60000 }
     dataState.bots.B = { banned: true, banKind: 'permanent', banExpiresAt: 0 }
+    dataState.bots.C = { banned: true, banKind: 'temporary', banExpiresAt: Date.now() - 1000 }
+    dataState.bots.D = { banned: true, banKind: 'temporary', banExpiresAt: Date.now() + 60000 }
   `)
-  assert.equal(r.run('connectBlockReason("A")'), null, 'a live data-file ban flag is not a gate')
-  assert.equal(r.run('connectBlockReason("B")'), null, 'not even a permanent-looking one')
-
-  r.timers.clear()
-  r.run(`handleCommand('/reconnect')`)
-  assert.ok([...r.timers.values()].some(t => t.delay === 1000), 'a data-banned bot is still reconnected on demand')
-
-  r.run(`removedBots = removedBotsStore.addRemovedBot(removedBots, { bot: 'B', kind: 'permanent', reason: 'cheating' }, { addedBy: 'ban-detection' }).list`)
-  assert.match(String(r.run('connectBlockReason("B")')), /removed list/, 'the removed list is the gate')
-  r.run(`handleCommand('/switch 2')`)
-  r.timers.clear()
-  r.run(`handleCommand('/reconnect')`)
-  assert.equal(r.timers.size, 0, 'a removed bot is never reconnected')
-  assert.match(r.run(`bots.B.logs.map(l => l.text).join('|')`), /removed list/)
+  assert.equal(r.run('activeBan("B").permanent'), true, 'no expiry is a permanent hold')
+  assert.equal(r.run('activeBan("C")'), null, 'an elapsed ban is no longer held')
+  assert.equal(r.run('activeBan("D").permanent'), false)
+  assert.ok(r.run('activeBan("D").expiresAt') > Date.now())
+  assert.equal(r.run('activeBan("A")'), null, 'an unbanned bot is never held')
 })
-
-// The sweep only tidies reporting flags — it must never yank a connection
-// around (it used to force-reconnect, which could double up a live bot).
-test('the ban sweep clears lapsed flags without touching connections', () => {
-  const r = runtime()
-  r.timers.clear()
-  r.run(`
-    dataState.bots.A = { banned: true, banKind: 'temporary', banExpiresAt: Date.now() - 1000 }
-    dataState.bots.B = { banned: true, banKind: 'temporary', banExpiresAt: Date.now() + 60000 }
-    dataState.bots.C = { banned: true, banKind: 'permanent', banExpiresAt: 0 }
-  `)
-  r.run('releaseExpiredBans()')
-  assert.equal(r.run('dataState.bots.A.banned'), false, 'an elapsed flag is cleared')
-  assert.equal(r.run('dataState.bots.B.banned'), true, 'a live one is kept')
-  assert.equal(r.run('dataState.bots.C.banned'), true, 'a permanent one is kept')
-  assert.equal(r.timers.size, 0, 'clearing report flags must never force a reconnect')
-})
-
-// A "guess the number" chat game is answered by the fleet: every number in the
-// range exactly once, from more than one bot, as fast as the timer allows.
-test('chat game prompts are covered by the fleet in random order', () => {
-  const r = runtime()
-  r.timers.clear()
-  r.run(`feedChatGameLine('A chat event has started! You have 20 seconds to guess the number')`)
-  assert.equal(r.run('chatGame.running'), false, 'a countdown alone starts nothing')
-  r.run(`feedChatGameLine('\u2726 Hint: 1-15 | Reward: $2,500')`)
-  assert.equal(r.run('chatGame.running'), true)
-  let guard = 1000
-  while (r.timers.size && guard--) { const t = [...r.timers.keys()][0]; r.timers.delete(t); t.fn() }
-  const chats = plain(r.context.chats)
-  const values = chats.map(([, msg]) => Number(msg)).filter(Number.isFinite)
-  assert.deepEqual([...values].sort((a, b) => a - b), Array.from({ length: 15 }, (_, i) => i + 1), 'every number 1-15, exactly once')
-  assert.equal(new Set(chats.map(([id]) => id)).size > 1, true, 'from more than one bot')
-  assert.equal(r.run('chatGame.running'), false, 'the round ends when the range is covered')
-
-  // A reveal mid-round stops it after the guess already in flight.
-  r.timers.clear()
-  r.context.chats.length = 0
-  r.run(`feedChatGameLine('Hint: 1-100')`)
-  r.run(`feedChatGameLine('Steve guessed the number!')`)
-  while (r.timers.size) { const t = [...r.timers.keys()][0]; r.timers.delete(t); t.fn() }
-  assert.equal(r.context.chats.length, 1, 'only the immediate first guess is sent')
-  assert.equal(r.run('chatGame.running'), false)
-})
-
-// bot-scripts: one command per line, "*<fragment>" targets bots by name.
-test('/run-script runs lines in order with * targeting', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bot-scripts-'))
-  fs.writeFileSync(path.join(dir, 'demo.txt'), '# demo\nhello\n*B one\n* two\n')
-  const r = runtime({ BOT_SCRIPTS_DIR: dir })
-  r.timers.clear()
-  await r.run(`handleCommand('/run-script demo')`)
-  assert.deepEqual(plain(r.context.chats), [
-    ['A', 'hello'], ['B', 'one'], ['A', 'two'], ['B', 'two'], ['C', 'two']
-  ], 'bare lines run on the invoker, *name on matching bots, * on everyone')
-  const before = plain(r.context.chats).length
-  await r.run(`handleCommand('/run-script ../demo')`)
-  await r.run(`handleCommand('/run-script missing')`)
-  assert.equal(plain(r.context.chats).length, before, 'bad or missing scripts send nothing')
-  r.run(`handleCommand('/scripts')`)
-  assert.match(channelLogs(r, 'A'), /Scripts in/)
-  fs.rmSync(dir, { recursive: true, force: true })
-})
-
-test('/ege stops politely when the bot is not spawned', () => {
-  const r = runtime()
-  r.run(`bots.A.bot.entity = null`)
-  r.run(`handleCommand('/ege')`)
-  assert.match(channelLogs(r, 'A'), /not currently spawned/)
-  assert.ok(!r.run('bots.A.inAppleRoutine') && !r.run('bots.A.appleRoutineRunning'), 'and no routine flag is left set')
-})
-
 
 test('item name helpers prefer anvil custom names and expose the alternative name', () => {
   const r = runtime()

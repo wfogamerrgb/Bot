@@ -73,9 +73,6 @@ function runtime(env = {}) {
         ...controls,
         createSlowBroadcast: () => controls.createSlowBroadcast({ setTimer, clearTimer }),
         createSlowBroadcastManager: () => controls.createSlowBroadcastManager({ setTimer, clearTimer }),
-        // Same reason as the broadcasts: the chat-game round must tick on the
-        // harness clock, not on real setTimeout.
-        createChatGameManager: (opts = {}) => controls.createChatGameManager({ ...opts, setTimer, clearTimer }),
         // bot-controls reads the real process.env by default, but inside this
         // harness bot.js reads processMock.env — so the group vars have to be
         // parsed from the same object bot.js sees, exactly as they would be in
@@ -482,61 +479,6 @@ test('the ban sweep clears lapsed flags without touching connections', () => {
   assert.equal(r.run('dataState.bots.C.banned'), true, 'a permanent one is kept')
   assert.equal(r.timers.size, 0, 'clearing report flags must never force a reconnect')
 })
-
-// A "guess the number" chat game is answered by the fleet: every number in the
-// range exactly once, from more than one bot, as fast as the timer allows.
-test('chat game prompts are covered by the fleet in random order', () => {
-  const r = runtime()
-  r.timers.clear()
-  r.run(`feedChatGameLine('A chat event has started! You have 20 seconds to guess the number')`)
-  assert.equal(r.run('chatGame.running'), false, 'a countdown alone starts nothing')
-  r.run(`feedChatGameLine('\u2726 Hint: 1-15 | Reward: $2,500')`)
-  assert.equal(r.run('chatGame.running'), true)
-  let guard = 1000
-  while (r.timers.size && guard--) { const t = [...r.timers.keys()][0]; r.timers.delete(t); t.fn() }
-  const chats = plain(r.context.chats)
-  const values = chats.map(([, msg]) => Number(msg)).filter(Number.isFinite)
-  assert.deepEqual([...values].sort((a, b) => a - b), Array.from({ length: 15 }, (_, i) => i + 1), 'every number 1-15, exactly once')
-  assert.equal(new Set(chats.map(([id]) => id)).size > 1, true, 'from more than one bot')
-  assert.equal(r.run('chatGame.running'), false, 'the round ends when the range is covered')
-
-  // A reveal mid-round stops it after the guess already in flight.
-  r.timers.clear()
-  r.context.chats.length = 0
-  r.run(`feedChatGameLine('Hint: 1-100')`)
-  r.run(`feedChatGameLine('Steve guessed the number!')`)
-  while (r.timers.size) { const t = [...r.timers.keys()][0]; r.timers.delete(t); t.fn() }
-  assert.equal(r.context.chats.length, 1, 'only the immediate first guess is sent')
-  assert.equal(r.run('chatGame.running'), false)
-})
-
-// bot-scripts: one command per line, "*<fragment>" targets bots by name.
-test('/run-script runs lines in order with * targeting', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bot-scripts-'))
-  fs.writeFileSync(path.join(dir, 'demo.txt'), '# demo\nhello\n*B one\n* two\n')
-  const r = runtime({ BOT_SCRIPTS_DIR: dir })
-  r.timers.clear()
-  await r.run(`handleCommand('/run-script demo')`)
-  assert.deepEqual(plain(r.context.chats), [
-    ['A', 'hello'], ['B', 'one'], ['A', 'two'], ['B', 'two'], ['C', 'two']
-  ], 'bare lines run on the invoker, *name on matching bots, * on everyone')
-  const before = plain(r.context.chats).length
-  await r.run(`handleCommand('/run-script ../demo')`)
-  await r.run(`handleCommand('/run-script missing')`)
-  assert.equal(plain(r.context.chats).length, before, 'bad or missing scripts send nothing')
-  r.run(`handleCommand('/scripts')`)
-  assert.match(channelLogs(r, 'A'), /Scripts in/)
-  fs.rmSync(dir, { recursive: true, force: true })
-})
-
-test('/ege stops politely when the bot is not spawned', () => {
-  const r = runtime()
-  r.run(`bots.A.bot.entity = null`)
-  r.run(`handleCommand('/ege')`)
-  assert.match(channelLogs(r, 'A'), /not currently spawned/)
-  assert.ok(!r.run('bots.A.inAppleRoutine') && !r.run('bots.A.appleRoutineRunning'), 'and no routine flag is left set')
-})
-
 
 test('item name helpers prefer anvil custom names and expose the alternative name', () => {
   const r = runtime()

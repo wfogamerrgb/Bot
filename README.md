@@ -883,11 +883,17 @@ image, so you can rebuild the client inside a running container and it takes
 effect immediately:
 
 ```bash
+npm run minecraft             # the easy one: build if missing, then serve on :8090
 npm run web-client:build      # checkout upstream v2.3.0 + pnpm build → web-client/dist
 npm run web-client:serve      # optional standalone: serve it on :8090 by itself
 # inside a container (script ships in the image):
 docker exec <container> npm run web-client:build
 ```
+
+(`scripts/build-web-client.sh` also preloads `scripts/node-compat-slowbuffer.cjs`
+for every Node process it spawns: Node 25+ removed `buffer.SlowBuffer`, which
+old build-time deps like `buffer-equal-constant-time` still read at require
+time — without the shim the build dies on modern Node.)
 
 **Docker disk usage is kept small.** The Dockerfile runs the build in two
 cacheable phases — `prepare` (clone upstream + `pnpm install`, cached as its
@@ -1274,10 +1280,18 @@ FreeLLM API. Three rules make it safe to leave running:
 2. **Only the quoted message is sent.** The model must answer as a single
    double-quoted string; that string is extracted and verified — cleaned up,
    word-limited (`AI_CHAT_WORD_LIMIT`), never starting with `/` or `.` — and
-   only a message that passes ever reaches public chat.
+   only a message that passes ever reaches public chat. Verification also
+   rejects an echo of a recent chat line (a reasoning model quoting the room
+   back is how the bot used to repeat players verbatim) and a persona refusal
+   wrapped in quotes ("im not redstonepro"), which format checks alone pass. The log shows the
+   model's **full** response on every attempt (`AI said: …`), so you can read
+   everything it wrote — game chat only ever sees the verified quote.
 3. **No prerecorded fallback.** If the API is down or produces nothing
    verifiable, the turn is skipped and reported; a canned line dropped into a
-   live conversation is worse than silence.
+   live conversation is worse than silence. Every failed turn is reported as
+   a red error (`✗ AI chat error: …`) — a model that fails or errors is never
+   silently skipped, and a model that errors on every attempt is reported as
+   `AI chat model failed …`, distinct from `no verifiable message`.
 
 ```text
 /ai-chat                    # start for the current bot

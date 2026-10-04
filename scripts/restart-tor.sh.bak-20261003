@@ -28,7 +28,7 @@ die() {
 }
 
 # ---------------- config ----------------
-TOR_PORTS="${TOR_PORTS:-9050 9150 9250}"        # space-separated SOCKS ports — ALL of them!
+TOR_PORTS="${TOR_PORTS:-9050 9150}"        # space-separated SOCKS ports — ALL of them!
 TOR_HOME="${TOR_HOME:-/etc/tor-instances}" # torrc-<port> + data-<port> live here
 CONTROL_OFFSET="${CONTROL_OFFSET:-1}"      # control port = socks port + this
 BOOT_TIMEOUT="${BOOT_TIMEOUT:-25}"         # seconds for the whole fleet to answer

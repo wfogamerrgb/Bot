@@ -1,8 +1,5 @@
 'use strict'
 
-const fs = require('fs')
-const path = require('path')
-
 // Node timers clamp invalid/overflowing delays to 1ms; fall back instead.
 function readDelayMs(value, fallback = 15000) {
   if (value == null || String(value).trim() === '') return fallback
@@ -821,96 +818,6 @@ function createChatGameManager ({ setTimer = setTimeout, clearTimer = clearTimeo
   }
 }
 
-
-// ── Item allowlists (globs) ────────────────────────────────────────────────
-// The /ege dispose list names items as comma-separated globs: "golden_apple"
-// is an exact match (so enchanted_golden_apple is never touched) and
-// "*shulker_box" matches every coloured shulker. Matching is case-insensitive
-// and folds _/-/spaces into one separator, so a registry name (golden_apple)
-// and a display name ("Golden Apple") both hit the same glob.
-function normalizeItemTerm (value) {
-  return String(value ?? '').toLowerCase().replace(/[_\s-]+/g, ' ').trim()
-}
-
-function parseItemGlobs (value) {
-  return String(value ?? '').split(',').map(normalizeItemTerm).filter(Boolean)
-}
-
-function itemMatchesGlobs (item, globs) {
-  if (!item || !Array.isArray(globs) || !globs.length) return false
-  const names = [item.name, item.displayName].map(normalizeItemTerm).filter(Boolean)
-  return globs.some(glob => {
-    const re = new RegExp('^' + glob.split('*').map(part => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$')
-    return names.some(name => re.test(name))
-  })
-}
-
-// "21,15,13,11" → [21, 15, 13, 11]. Junk entries are dropped, order survives.
-function parseRewardSlots (value) {
-  return String(value ?? '').split(',').map(s => s.trim()).filter(Boolean).map(Number).filter(n => Number.isInteger(n) && n >= 0)
-}
-
-// ── bot-scripts ────────────────────────────────────────────────────────────
-// Plain-text command lists: one command per line, blank lines and # comments
-// skipped. A line may open with a target selector — "*<fragment> <cmd>" runs on
-// every bot whose name contains the fragment (case-insensitive), "* <cmd>" runs
-// on every bot, and a bare line runs on the invoking bot. The rest of the line
-// is an ordinary command, so the chain syntax (&&, ;, sleep) works inside a
-// script line exactly as typed.
-function parseScriptLine (line) {
-  const trimmed = String(line ?? '').replace(/\r$/, '').trim()
-  if (!trimmed || trimmed.startsWith('#')) return null
-  const m = trimmed.match(/^(\*[^ \t]*)[ \t]+([\s\S]*)$/)
-  // A lone selector ("*123") names bots but sends nothing — ignore it.
-  if (!m) return trimmed.startsWith('*') ? null : { target: { kind: 'self', pattern: '' }, command: trimmed }
-  const star = m[1]
-  const command = m[2].trim()
-  if (!command) return null
-  if (star === '*') return { target: { kind: 'all', pattern: '' }, command }
-  return { target: { kind: 'match', pattern: star.slice(1) }, command }
-}
-
-function parseScript (text) {
-  return String(text ?? '').split('\n').map(parseScriptLine).filter(Boolean)
-}
-
-function selectScriptBots (pattern, names) {
-  const needle = String(pattern ?? '').toLowerCase()
-  return (names || []).filter(name => String(name).toLowerCase().includes(needle))
-}
-
-function listBotScripts (dir) {
-  try {
-    return fs.readdirSync(dir).filter(f => /\.txt$/i.test(f)).map(f => f.replace(/\.txt$/i, ''))
-  } catch (_) { return [] }
-}
-
-// Loads bot-scripts/<name>.txt. The name is strictly [\w-] — no path separators,
-// no "..", no extension games — so a script can never escape its folder.
-function loadBotScript (dir, name) {
-  const n = String(name ?? '').trim()
-  if (!/^[\w-]+$/.test(n)) return { ok: false, error: `invalid script name "${String(name ?? '')}" — names are letters, digits, "-" and "_" only` }
-  try {
-    const text = fs.readFileSync(path.join(dir, `${n}.txt`), 'utf8')
-    return { ok: true, name: n, steps: parseScript(text) }
-  } catch (err) {
-    return { ok: false, error: `no script "${n}.txt" in ${dir} (${err.code || err.message})` }
-  }
-}
-
-// The web GUI's suggestion rule, shared with the terminal TUI: a command matches
-// when it starts with the typed text, or its first word does ("/all <cmd>" is
-// offered while you type "/all").
-function commandSuggestions (value, commands, limit = 8) {
-  const v = String(value ?? '').trimEnd()
-  if (!v.startsWith('/')) return []
-  const table = commands || {}
-  return Object.keys(table)
-    .filter(k => k.indexOf(v) === 0 || (k.split(' ')[0] || '').indexOf(v) === 0)
-    .slice(0, limit)
-    .map(k => ({ key: k, desc: String(table[k] ?? '') }))
-}
-
 module.exports = {
   readDelayMs,
   readInt,
@@ -948,14 +855,5 @@ module.exports = {
   parseCommandChain,
   executeCommandChain,
   destructiveCommandEffect,
-  createCommandConfirmation,
-  parseItemGlobs,
-  itemMatchesGlobs,
-  parseRewardSlots,
-  parseScript,
-  parseScriptLine,
-  selectScriptBots,
-  listBotScripts,
-  loadBotScript,
-  commandSuggestions
+  createCommandConfirmation
 }

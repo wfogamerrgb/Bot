@@ -14,17 +14,16 @@ function loadState (file) {
   } catch (_) { return emptyState() }
 }
 
-// Ban records exist for two readers: the ban sweep (bot.js clears a report flag
-// once its `banExpiresAt` lapses) and the `Bans` tab in the spreadsheet.
+// Ban records exist for two readers: the ban hold (bot.js reads `banExpiresAt`
+// to decide whether a bot may reconnect) and the `Bans` tab in the spreadsheet.
 //
 // One row per bot, not one per event: the sheet is a roster you act on, and an
 // event log would grow without bound. `count` plus the first/last timestamps keep
 // repeat bans visible without a second tab.
-// The lifecycle of a recorded ban flag: it is reported until its expiry passes,
-// and 0/absent expiry means "never ends" — a permanent ban, or one whose length
-// the server never stated — so it never clears itself rather than reading as
-// already expired. Reporting only: connecting is gated exclusively by the
-// removed list (removed-bots.json), never by rows in the data file.
+// Decides whether a banned bot may reconnect. Kept here (not in bot.js) so the
+// rule is unit-testable: a ban is held until its expiry passes, and 0/absent
+// expiry means "never ends" — a permanent ban, or one whose length the server
+// never stated — so it is held indefinitely rather than read as already expired.
 // Accepts either row shape: the bot row's `banExpiresAt` or a bans[] `expiresAt`.
 function isBanActive (row, now = Date.now()) {
   if (!row || !row.banned) return { held: false, expired: false, expiresAt: 0, permanent: false }
@@ -57,7 +56,7 @@ function recordBan (state, record) {
     caseId: record.caseId || '',
     duration: record.duration || '',
     // 0 means "never expires" — a permanent ban or one whose length the server
-    // never stated. Kept as a number so the ban sweep can compare against now.
+    // never stated. Kept as a number so the ban hold can compare against now.
     expiresAt: Number(record.expiresAt) || 0,
     permanent: Boolean(record.permanent),
     firstBannedAt: now,

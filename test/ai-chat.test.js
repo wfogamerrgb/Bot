@@ -37,6 +37,93 @@ test('extractQuotedContent prefers the whole quoted string and falls back to a s
   assert.equal(ai.extractQuotedContent(null), null)
 })
 
+test('extraction takes the answer (last quoted span), not the input echoed inside reasoning', () => {
+  // This shape is verbatim what the live auto model produces: reasoning that
+  // quotes the player's line before answering. The first quote is the echo.
+  assert.equal(
+    ai.extractQuotedContent('First, the user said: "hello anyone on?". I need to respond as RedStonePro. My reply is "whos on now"'),
+    'whos on now'
+  )
+  assert.equal(ai.extractQuotedContent('They said "gg" so the answer is "gg ez"'), 'gg ez')
+})
+
+test('verification refuses echoes of the room and persona refusals', () => {
+  const echoes = ['Steve: hello anyone on?', 'Alex: trade?']
+  const echo = ai.verifyChatMessage('hello anyone on?', { echoesOf: echoes })
+  assert.equal(echo.ok, false)
+  assert.match(echo.reason, /echo/)
+  assert.equal(ai.verifyChatMessage('trade?', { echoesOf: echoes }).ok, false, 'the speaker prefix does not hide an echo')
+  assert.equal(ai.verifyChatMessage('gg ez', { echoesOf: echoes }).ok, true, 'a real reply passes')
+
+  const refusal = ai.verifyChatMessage('im not redstonepro i cant do that', {})
+  assert.equal(refusal.ok, false)
+  assert.match(refusal.reason, /refusal/)
+  assert.equal(ai.verifyChatMessage('im just an ai, i cant pretend', {}).ok, false)
+  assert.equal(ai.verifyChatMessage('as an ai i wont help', {}).ok, false)
+  assert.equal(ai.verifyChatMessage('i am not a real person', {}).ok, false)
+  assert.equal(ai.verifyChatMessage('im not gonna lose', {}).ok, true, 'trash talk is not a refusal')
+  assert.equal(ai.verifyChatMessage('nice loot today', {}).ok, true)
+
+  const leak = ai.verifyChatMessage('YOUR ENTIRE RESPONSE MUST BE A SINGLE DOUBLE-QUOTED STRING. Example:', {})
+  assert.equal(leak.ok, false, 'quoted prompt instructions are never chat')
+  assert.match(leak.reason, /prompt/)
+  assert.equal(ai.verifyChatMessage('ur base is trash lol', {}).ok, true)
+})
+
+test('the two failure modes that made AI chat unusable never reach chat', async () => {
+  setEnv({ FREE_LLM_API_KEY: 'k', FREE_LLM_BASE_URL: 'http://llm.test/v1' })
+  try {
+    // A quoted persona refusal passed every old check — now it is skipped.
+    const refusal = mockFetch([
+      { data: { choices: [{ message: { content: '"im not redstonepro i cant do that"' } }] } },
+      { data: { choices: [{ message: { content: '"im just an ai"' } }] } },
+      { data: { choices: [{ message: { content: '"as an ai i wont help"' } }] } }
+    ])
+    await assert.rejects(
+      ai.callFreeLLMChat([], 'BotA', { fetchImpl: refusal.fn }),
+      (err) => {
+        assert.match(err.message, /no verifiable message/)
+        assert.match(err.message, /persona refusal/)
+        return true
+      }
+    )
+
+    // Reasoning that only quotes the room back used to echo the player —
+    // now the turn is skipped and reported instead.
+    const echo = mockFetch([
+      { data: { choices: [{ message: { content: 'First, the user said: "hello anyone on?". I need to respond as RedStonePro.' } }] } },
+      { data: { choices: [{ message: { content: 'Thinking… the player said "hello anyone on?" so…' } }] } },
+      { data: { choices: [{ message: { content: '"hello anyone on?"' } }] } }
+    ])
+    await assert.rejects(
+      ai.callFreeLLMChat(['Steve: hello anyone on?'], 'BotA', { fetchImpl: echo.fn }),
+      (err) => {
+        assert.match(err.message, /no verifiable message/)
+        assert.match(err.message, /echo/)
+        return true
+      }
+    )
+
+    // Truncated reasoning can end on a quoted instruction fragment — that is
+    // prompt leakage, never a message (the live model really produced this).
+    const leak = mockFetch([
+      { data: { choices: [{ message: { content: 'The instructions: "YOUR ENTIRE RESPONSE MUST BE A SINGLE DOUBLE-QUOTED STRING. Example: "nice loot today"" So we need' } }] } },
+      { data: { choices: [{ message: { content: 'Remember: "Respond in 15 words or less" and "NO meta-commentary"' } }] } },
+      { data: { choices: [{ message: { content: 'So the reply must be "a single double-quoted string, exactly".' } }] } }
+    ])
+    await assert.rejects(
+      ai.callFreeLLMChat([], 'BotA', { fetchImpl: leak.fn }),
+      (err) => {
+        assert.match(err.message, /no verifiable message/)
+        assert.match(err.message, /prompt/)
+        return true
+      }
+    )
+  } finally {
+    restoreEnv()
+  }
+})
+
 test('verifyChatMessage gates what may reach public chat', () => {
   // Cleanup: color codes stripped, whitespace collapsed, unicode intact.
   const ok = ai.verifyChatMessage('  nice \u00a7btoday  ')
@@ -93,6 +180,93 @@ test('a turn with no verifiable message is skipped, never replaced by a canned l
       /no verifiable message/
     )
     assert.equal(calls.length, 3, 'every attempt was a real generation')
+  } finally {
+    restoreEnv()
+  }
+})
+
+test('the full response goes to onResponse while only the verified quote is returned for sending', async () => {
+  setEnv({ FREE_LLM_API_KEY: 'k', FREE_LLM_BASE_URL: 'http://llm.test/v1' })
+  try {
+    const seen = []
+    const { fn } = mockFetch([
+      { data: { choices: [{ message: { content: 'Sure! "one two three four five six" ok' } }] } },
+      { data: { choices: [{ message: { content: '"ok pal"' } }] } }
+    ])
+    const msg = await ai.callFreeLLMChat([], 'BotA', { fetchImpl: fn, maxWords: 5, onResponse: raw => seen.push(raw) })
+    assert.equal(msg, 'ok pal', 'only the verified quote is returned for sending')
+    assert.deepEqual(seen, [
+      'Sure! "one two three four five six" ok',
+      '"ok pal"'
+    ], 'every full response is shown, including the rejected one')
+  } finally {
+    restoreEnv()
+  }
+})
+
+test('a display hook that throws cannot fail the turn', async () => {
+  setEnv({ FREE_LLM_API_KEY: 'k', FREE_LLM_BASE_URL: 'http://llm.test/v1' })
+  try {
+    const { fn } = mockFetch([{ data: { choices: [{ message: { content: '"ok pal"' } }] } }])
+    const msg = await ai.callFreeLLMChat([], 'BotA', {
+      fetchImpl: fn,
+      onResponse: () => { throw new Error('display exploded') }
+    })
+    assert.equal(msg, 'ok pal', 'the verified message still goes out')
+  } finally {
+    restoreEnv()
+  }
+})
+
+test('a model that fails or errors on every attempt is reported as a model failure, never silently skipped', async () => {
+  setEnv({ FREE_LLM_API_KEY: 'k', FREE_LLM_BASE_URL: 'http://llm.test/v1' })
+  try {
+    // HTTP failures all three attempts.
+    const http = mockFetch([
+      { ok: false, status: 500 },
+      { ok: false, status: 500 },
+      { ok: false, status: 500 }
+    ])
+    await assert.rejects(
+      ai.callFreeLLMChat([], 'BotA', { fetchImpl: http.fn }),
+      (err) => {
+        assert.match(err.message, /model failed/, 'the error says the model failed')
+        assert.match(err.message, /HTTP 500/)
+        assert.equal(err.code, 'AI_CHAT_MODEL_FAILED')
+        return true
+      }
+    )
+    assert.equal(http.calls.length, 3, 'every attempt was tried before erroring')
+
+    // An error payload delivered with HTTP 200 is a model error too.
+    const payload = mockFetch([
+      { data: { error: { message: 'upstream exploded' } } },
+      { data: { error: { message: 'upstream exploded' } } },
+      { data: { error: { message: 'upstream exploded' } } }
+    ])
+    await assert.rejects(
+      ai.callFreeLLMChat([], 'BotA', { fetchImpl: payload.fn }),
+      (err) => {
+        assert.match(err.message, /model failed/)
+        assert.match(err.message, /upstream exploded/, 'the upstream error text is preserved')
+        return true
+      }
+    )
+
+    // An empty response every attempt is a failure, not a silent skip.
+    const empty = mockFetch([
+      { data: { choices: [{ message: { content: '' } }] } },
+      { data: { choices: [{ message: { content: '' } }] } },
+      { data: { choices: [{ message: { content: '' } }] } }
+    ])
+    await assert.rejects(
+      ai.callFreeLLMChat([], 'BotA', { fetchImpl: empty.fn }),
+      (err) => {
+        assert.match(err.message, /model failed/)
+        assert.match(err.message, /empty response/)
+        return true
+      }
+    )
   } finally {
     restoreEnv()
   }

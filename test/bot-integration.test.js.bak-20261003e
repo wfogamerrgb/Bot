@@ -510,34 +510,6 @@ test('chat game prompts are covered by the fleet in random order', () => {
   assert.equal(r.run('chatGame.running'), false)
 })
 
-// bot-scripts: one command per line, "*<fragment>" targets bots by name.
-test('/run-script runs lines in order with * targeting', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bot-scripts-'))
-  fs.writeFileSync(path.join(dir, 'demo.txt'), '# demo\nhello\n*B one\n* two\n')
-  const r = runtime({ BOT_SCRIPTS_DIR: dir })
-  r.timers.clear()
-  await r.run(`handleCommand('/run-script demo')`)
-  assert.deepEqual(plain(r.context.chats), [
-    ['A', 'hello'], ['B', 'one'], ['A', 'two'], ['B', 'two'], ['C', 'two']
-  ], 'bare lines run on the invoker, *name on matching bots, * on everyone')
-  const before = plain(r.context.chats).length
-  await r.run(`handleCommand('/run-script ../demo')`)
-  await r.run(`handleCommand('/run-script missing')`)
-  assert.equal(plain(r.context.chats).length, before, 'bad or missing scripts send nothing')
-  r.run(`handleCommand('/scripts')`)
-  assert.match(channelLogs(r, 'A'), /Scripts in/)
-  fs.rmSync(dir, { recursive: true, force: true })
-})
-
-test('/ege stops politely when the bot is not spawned', () => {
-  const r = runtime()
-  r.run(`bots.A.bot.entity = null`)
-  r.run(`handleCommand('/ege')`)
-  assert.match(channelLogs(r, 'A'), /not currently spawned/)
-  assert.ok(!r.run('bots.A.inAppleRoutine') && !r.run('bots.A.appleRoutineRunning'), 'and no routine flag is left set')
-})
-
-
 test('item name helpers prefer anvil custom names and expose the alternative name', () => {
   const r = runtime()
   const out = r.run(`(() => {

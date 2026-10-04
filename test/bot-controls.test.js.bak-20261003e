@@ -1,10 +1,7 @@
 'use strict'
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const fs = require('node:fs')
-const os = require('node:os')
-const path = require('node:path')
-const { readDelayMs, readInt, readNumber, parseDumpMode, parseDataArgs, parseCratesAllDump, parseCratesAllAfk, parseCratesAllFlags, shuffledCopy, createSlowBroadcast, createSlowBroadcastManager, parseChatGameRange, isChatGameEnd, createChatGameManager, parseProxyGroups, resolveBotProxy, hasProxyAuth, proxyAuthHeader, buildHttpConnectRequest, describeProxy, resolveLoginPassword, resolveFallbackPassword, parseBotPasswords, classifyAuthReply, nextAuthFailure, isAuthBlocked, findIgnoredProxyGroupVars, destructiveCommandEffect, createCommandConfirmation, parseItemGlobs, itemMatchesGlobs, parseRewardSlots, parseScript, parseScriptLine, selectScriptBots, listBotScripts, loadBotScript, commandSuggestions } = require('../bot-controls')
+const { readDelayMs, readInt, readNumber, parseDumpMode, parseDataArgs, parseCratesAllDump, parseCratesAllAfk, parseCratesAllFlags, shuffledCopy, createSlowBroadcast, createSlowBroadcastManager, parseChatGameRange, isChatGameEnd, createChatGameManager, parseProxyGroups, resolveBotProxy, hasProxyAuth, proxyAuthHeader, buildHttpConnectRequest, describeProxy, resolveLoginPassword, resolveFallbackPassword, parseBotPasswords, classifyAuthReply, nextAuthFailure, isAuthBlocked, findIgnoredProxyGroupVars, destructiveCommandEffect, createCommandConfirmation } = require('../bot-controls')
 
 function clock() {
   let time = 0, sequence = 0
@@ -247,64 +244,6 @@ test('a chat game pool that cannot speak ends the round instead of spinning', ()
   assert.equal(job.running, false, 'every sender dead → the round gives up')
   assert.equal(c.timers.size, 0)
 })
-
-// ── /ege allowlists & bot-scripts ─────────────────────────────────────────
-
-test('item globs keep enchanted golden apples out of the dispose list', () => {
-  const globs = parseItemGlobs('experience_bottle,golden_apple,shield,totem_of_undying,*shulker_box')
-  const match = (name, displayName) => itemMatchesGlobs({ name, displayName: displayName || name }, globs)
-  assert.equal(match('golden_apple', 'Golden Apple'), true)
-  assert.equal(match('enchanted_golden_apple', 'Enchanted Golden Apple'), false, 'an exact glob must never eat the enchanted ones')
-  assert.equal(match('experience_bottle', 'Bottle o Enchanting'), true, 'the registry name is what matches')
-  assert.equal(match('shield'), true)
-  assert.equal(match('totem_of_undying', 'Totem of Undying'), true)
-  assert.equal(match('red_shulker_box', 'Red Shulker Box'), true, '*shulker_box catches every colour')
-  assert.equal(match('blue_shulker_box'), true)
-  assert.equal(match('diamond_sword', 'Diamond Sword'), false, 'only the allowed junk moves')
-  assert.equal(itemMatchesGlobs({ name: 'shield' }, []), false, 'an empty allowlist moves nothing')
-  assert.equal(itemMatchesGlobs(null, globs), false)
-})
-
-test('parseRewardSlots keeps order and drops junk', () => {
-  assert.deepEqual(parseRewardSlots('21,15,13,11'), [21, 15, 13, 11])
-  assert.deepEqual(parseRewardSlots(' 21 , nope , 15 '), [21, 15])
-  assert.deepEqual(parseRewardSlots(''), [])
-  assert.deepEqual(parseRewardSlots(undefined), [])
-})
-
-test('script lines carry target selectors and skip comments', () => {
-  assert.equal(parseScriptLine('# a comment'), null)
-  assert.equal(parseScriptLine('   '), null)
-  assert.equal(parseScriptLine('*123'), null, 'a selector with no command is ignored')
-  assert.deepEqual(parseScriptLine('hello'), { target: { kind: 'self', pattern: '' }, command: 'hello' })
-  assert.deepEqual(parseScriptLine('*123 /kits'), { target: { kind: 'match', pattern: '123' }, command: '/kits' })
-  assert.deepEqual(parseScriptLine('* say hi && sleep 1s && say bye'), { target: { kind: 'all', pattern: '' }, command: 'say hi && sleep 1s && say bye' })
-  assert.deepEqual(selectScriptBots('123', ['ab123cd', 'AB123', 'nope']), ['ab123cd', 'AB123'])
-  assert.deepEqual(selectScriptBots('', ['a', 'b']), ['a', 'b'], 'an empty pattern matches every name')
-  assert.equal(parseScript('# c\nhello\n\n*B one').length, 2)
-})
-
-test('loadBotScript reads a script and refuses to escape its folder', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bot-scripts-unit-'))
-  fs.writeFileSync(path.join(dir, 'demo.txt'), '# demo\nhello\n*B one\n')
-  const ok = loadBotScript(dir, 'demo')
-  assert.equal(ok.ok, true)
-  assert.equal(ok.steps.length, 2)
-  assert.deepEqual(listBotScripts(dir), ['demo'])
-  assert.equal(loadBotScript(dir, '../demo').ok, false, 'path tricks are rejected')
-  assert.equal(loadBotScript(dir, 'missing').ok, false)
-  fs.rmSync(dir, { recursive: true, force: true })
-})
-
-test('command suggestions follow the web GUI match rule', () => {
-  const commands = { '/all <cmd>': 'broadcast', '/all-slow [d] <cmd>': 'slow', '/kits': 'claim', '/list': 'status' }
-  assert.deepEqual(commandSuggestions('/al', commands).map(m => m.key), ['/all <cmd>', '/all-slow [d] <cmd>'])
-  assert.deepEqual(commandSuggestions('/kits', commands).map(m => m.key), ['/kits'])
-  assert.deepEqual(commandSuggestions('/kits ', commands).map(m => m.key), ['/kits'], 'a trailing space never hides the match')
-  assert.deepEqual(commandSuggestions('hello', commands), [])
-  assert.deepEqual(commandSuggestions('/zzz', commands), [])
-})
-
 
 test('parseProxyGroups reads indexed PROXY_GROUP_N_* vars and stops at the first gap', () => {
   const env = {

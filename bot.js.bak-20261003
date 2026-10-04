@@ -17,7 +17,6 @@ const {
   buildHttpConnectRequest,
   describeProxy,
   resolveLoginPassword,
-  resolveFallbackPassword,
   parseBotPasswords,
   classifyAuthReply,
   nextAuthFailure,
@@ -31,14 +30,6 @@ const {
   hasInventoryItems,
   randomInt,
   buildHiddenDumpPlan,
-  createChatGameManager,
-  parseItemGlobs,
-  itemMatchesGlobs,
-  parseRewardSlots,
-  selectScriptBots,
-  listBotScripts,
-  loadBotScript,
-  commandSuggestions,
   destructiveCommandEffect,
   createCommandConfirmation
 } = require('./bot-controls')
@@ -86,9 +77,6 @@ const BOT_PASSWORDS = parseBotPasswords()
 // Once a failure is recorded the bot stops sending auth commands, says which
 // variable to fix, and alerts Discord once. A restart (or /auth-retry) clears it,
 // deliberately: the fix is an edit to .env, and a restart is how that lands.
-// A configured fallback password (PROXY_GROUP_<N>_FALLBACK_LOGIN_PASSWORD /
-// LOGIN_PASSWORD_FALLBACK) is tried once — AUTH_FALLBACK_DELAY_MS after the
-// rejection — before any failure is recorded at all.
 const AUTH_REPLY_WINDOW_MS = readDelayMs(process.env.AUTH_REPLY_WINDOW_MS, 30000)
 const AUTH_THROTTLE_MS = readDelayMs(process.env.AUTH_RETRY_MS, 300000)
 const AUTH_ALREADY_MS = readDelayMs(process.env.AUTH_ALREADY_MS, 60000)
@@ -116,24 +104,6 @@ function planAuthAction(id, message, now = Date.now()) {
   if (state.sentAt && now - state.sentAt <= settings.get('AUTH_REPLY_WINDOW_MS') && !detectPlayerChat(message)) {
     const verdict = classifyAuthReply(message)
     if (verdict) {
-      // A rejected password with an untried fallback gets exactly one second
-      // chance: no failure is recorded yet, the fallback is handed to the caller
-      // with a delay, and a rejection of the fallback lands in the guard below
-      // like any other. usedFallback survives reconnects, so a working fallback
-      // becomes this bot's password instead of a re-run of the dance each time.
-      const fallback = resolveFallbackPassword(id, PROXY_GROUPS, process.env)
-      if (verdict.kind === 'bad-password' && fallback && !state.usedFallback) {
-        authState.set(id, { ...state, usedFallback: true, sentAt: 0 })
-        const kind = state.kind || 'login'
-        return {
-          fallback: {
-            command: kind === 'register' ? `/register ${fallback.password} ${fallback.password}` : `/login ${fallback.password}`,
-            source: fallback.source,
-            kind,
-            delayMs: settings.get('AUTH_FALLBACK_DELAY_MS')
-          }
-        }
-      }
       const next = nextAuthFailure(failure, verdict, now, {
         throttleMs: AUTH_THROTTLE_MS, alreadyMs: AUTH_ALREADY_MS, maxThrottled: AUTH_MAX_THROTTLED
       })
@@ -151,15 +121,11 @@ function planAuthAction(id, message, now = Date.now()) {
   if (isAuthBlocked(failure, now)) return { skip: failure }
 
   const auth = resolveLoginPassword(id, PROXY_GROUPS, process.env, BOT_PASSWORDS)
-  // Once the fallback has been sent it IS this bot's password until a restart:
-  // a reconnect must not re-run the rejected primary and re-wait the delay.
-  const used = state.usedFallback ? resolveFallbackPassword(id, PROXY_GROUPS, process.env) : null
-  const pick = used || auth
   const kind = wantsRegister ? 'register' : 'login'
   authState.set(id, { ...state, sentAt: now, kind })
   return {
-    command: wantsRegister ? `/register ${pick.password} ${pick.password}` : `/login ${pick.password}`,
-    source: pick.source,
+    command: wantsRegister ? `/register ${auth.password} ${auth.password}` : `/login ${auth.password}`,
+    source: auth.source,
     kind
   }
 }
@@ -222,8 +188,7 @@ const REMOVED_BOTS_FILE = (process.env.REMOVED_BOTS_FILE || '').trim() || path.j
 // What a permanent ban does to the live roster: 'remove' mirrors /closeBot,
 // 'hold' keeps the entry visible with the banned badge.
 const PERMANENT_BAN_ACTION = /^(hold|keep|visible)$/i.test(process.env.PERMANENT_BAN_ACTION || '') ? 'hold' : 'remove'
-// How long a ban flag stays in the data file when the server never stated a
-// length (then the sweep clears it). Reporting only — see the connect gate.
+// How long to wait before retrying a ban whose length the server never stated.
 const BAN_RETRY_MS = readDelayMs(process.env.BAN_RETRY_MS, 1800000)
 let removedBots = removedBotsStore.loadRemovedBots(REMOVED_BOTS_FILE)
 function persistRemovedBots () { removedBots = removedBotsStore.saveRemovedBots(REMOVED_BOTS_FILE, removedBots) }
@@ -243,30 +208,43 @@ function dropFromRoster (id) {
   return true
 }
 
-// ── Connect gate ────────────────────────────────────────────────────────────
-// removed-bots.json is the ONLY thing that stops a bot from connecting. Ban
-// flags in the data file are reporting only (dashboard, /list, /data, the
-// spreadsheet) — they must never gate dialling, because a bad verdict or a
-// stale flag would strand an account with no way back short of hand-editing
-// data/. If a ban should actually keep a bot out, it belongs on the removed
-// list (ban-detection puts permanent bans there automatically, /unban reverses).
-function connectBlockReason (id) {
-  const removal = removedEntryFor(id)
-  return removal ? `on the removed list (${removedBotsStore.describeRemovedBot(removal)})` : null
+// ── Ban hold ────────────────────────────────────────────────────────────────
+// A banned account must stop knocking, and a ban outlives the process: a 29-day
+// ban cannot live in a setTimeout, and a restart must not walk straight back into
+// the server. So the absolute expiry is the number that matters, it is stored in
+// the data file (surviving restarts), and a slow sweep is what ends the hold.
+function activeBan (id) {
+  const row = dataState.bots?.[id]
+  const state = dataStore.isBanActive(row)
+  if (!state.held) return null
+  return { expiresAt: state.expiresAt, permanent: state.permanent, kind: row.banKind || 'permanent' }
 }
 
-// Ban flags are reports, but a report must not lie forever: when a recorded
-// expiry lapses the flag is cleared so the dashboard and /data stop claiming the
-// bot is banned. This never touches connecting. Called on a timer rather than
-// scheduled per ban — one sweep handles every bot.
+// Called on a timer rather than scheduled per ban: one sweep handles every bot,
+// needs no long-lived timer, and re-reads the file state so a restart resumes the
+// hold correctly instead of losing it.
 function releaseExpiredBans () {
   Object.keys(dataState.bots || {}).forEach(id => {
-    const state = dataStore.isBanActive(dataState.bots[id])
-    // No expiry means permanent — that flag stays until /unban clears it.
-    if (!state.expired) return
+    const row = dataState.bots[id]
+    if (!row || !row.banned) return
+    const expiresAt = Number(row.banExpiresAt) || 0
+    // No expiry means permanent — that one is never released automatically.
+    if (!expiresAt || Date.now() < expiresAt) return
+    // Don't force-reconnect a bot that was manually disconnected — it will
+    // reconnect on its own if/when the operator runs /reconnect.
+    if (bots[id]?.manualDisconnect) {
+      dataStore.upsertBot(dataState, { bot: id, banned: false, bannedAt: null, banKind: null, banReason: null, banExpiresAt: 0 })
+      persistData()
+      logFor(id, `{green-fg}✓ ${sanitize(id)}'s ban has expired (was manually disconnected).{/green-fg}`)
+      notifyBotsChanged()
+      return
+    }
     dataStore.upsertBot(dataState, { bot: id, banned: false, bannedAt: null, banKind: null, banReason: null, banExpiresAt: 0 })
     persistData()
-    logFor(id, `{green-fg}✓ ${sanitize(id)}'s ban flag has expired — cleared.{/green-fg}`)
+    logFor(id, `{green-fg}✓ ${sanitize(id)}'s ban has expired — reconnecting.{/green-fg}`)
+    const { host, port, version } = bots[id] || { host: HOST, port: PORT, version: VERSION }
+    try { bots[id]?.disconnectManually() } catch (_) {}
+    setTimeout(() => createBotInstance(id, host, port, version), 1000)
     notifyBotsChanged()
   })
 }
@@ -818,15 +796,6 @@ cfDefine('AUTH_RETRY_MS', { type: 'ms', def: 300000, min: 1000, group: 'Auth', d
 cfDefine('AUTH_ALREADY_MS', { type: 'ms', def: 60000, min: 0, group: 'Auth', desc: 'Wait when the server says "already logged in" (live)' })
 cfDefine('AUTH_MAX_THROTTLED_RETRIES', { type: 'int', def: 2, min: 1, group: 'Auth', desc: 'Throttled retries before it becomes a wrong-password failure (live)' })
 cfDefine('AUTH_REPLY_WINDOW_MS', { type: 'ms', def: 30000, min: 1000, group: 'Auth', desc: 'How long a reply counts as an answer to our auth command (live)' })
-cfDefine('AUTH_FALLBACK_DELAY_MS', { type: 'ms', def: 6000, min: 0, group: 'Auth', desc: 'Wait after a rejected /login before the fallback password is tried (live)' })
-cfDefine('LOGIN_PASSWORD_FALLBACK', { type: 'string', def: '', group: 'Auth', desc: 'Second /login password tried once after a rejection, when no group fallback applies (live)' })
-cfDefine('CHAT_GAME_AUTO', { type: 'bool', def: true, group: 'Chat game', desc: 'Auto-play "guess the number" chat events: a random bot shouts one unguessed number per tick until the round ends' })
-cfDefine('CHAT_GAME_GUESS_MS', { type: 'ms', def: 100, min: 25, group: 'Chat game', desc: 'Gap between guesses — 100 ms is ten numbers per second (live)' })
-cfDefine('CHAT_GAME_MAX_BOTS', { type: 'int', def: 30, min: 1, group: 'Chat game', desc: 'How many connected bots (roster order) are used as guessers (live)' })
-cfDefine('EAPPLE_KIT_SLOT', { type: 'int', def: 14, min: 0, group: 'Kits', desc: 'Slot clicked in the /kits GUI before the reward slot — /ege (live)' })
-cfDefine('EAPPLE_REWARD_SLOTS', { type: 'string', def: '21,15,13,11', group: 'Kits', desc: 'One /ege pass per slot: /kits → kit slot → this slot → /dispose (live)' })
-cfDefine('EAPPLE_DISPOSE_ITEMS', { type: 'string', def: 'experience_bottle,golden_apple,shield,totem_of_undying,*shulker_box', group: 'Kits', desc: 'Comma-separated globs moved into /dispose — exact names keep enchanted_golden_apple safe (live)' })
-cfDefine('EAPPLE_STEP_DELAY_MS', { type: 'ms', def: 1200, min: 100, group: 'Kits', desc: 'Pause between /ege GUI clicks and window opens (live)' })
 cfDefine('LOGIN_PASSWORD', { type: 'string', def: '123456', group: 'Auth', desc: 'Global /register + /login password. Resolved at each auth attempt, so a change applies to the next /auth-retry — a per-bot or group password is read at boot and still wins for those bots' })
 cfDefine('HOST', { type: 'string', def: 'play.fatalmc.org', group: 'Server', live: false, desc: 'Default server host (startup-only)' })
 cfDefine('PORT', { type: 'int', def: 25565, group: 'Server', live: false, desc: 'Default server port (startup-only)' })
@@ -857,7 +826,7 @@ const coinflipStore = coinflip.createCoinflipStore({ file: COINFLIP_FILE, maxRec
 const timeseriesStore = timeseries.createTimeseriesStore({ file: TIMESERIES_FILE })
 
 
-const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dump-spawners', '/dc', '/reconnect', '/crates', '/crates-loop', '/spawners', '/data', '/shardshop-loop', '/closeBot', '/bot-coinflip', '/bot-coinflip-all', '/ai-chat', '/repeat', '/use-book', '/enchanted-golden-apple-extract', '/ege', '/scripts', '/run-script']
+const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dump-spawners', '/dc', '/reconnect', '/crates', '/crates-loop', '/spawners', '/data', '/shardshop-loop', '/closeBot', '/bot-coinflip', '/bot-coinflip-all', '/ai-chat', '/repeat', '/use-book']
 
 const logSubscribers = new Set()
 function subscribeLog(fn) { logSubscribers.add(fn); return () => logSubscribers.delete(fn) }
@@ -1152,37 +1121,9 @@ inputOnFocus: true
 })
 inputBox.setLabel(' {green-fg}{bold}❯{/bold}{/green-fg} Command ')
 
-// ── Command suggestions (the web GUI's list, in the terminal) ─────────────
-// A live panel above the input: as soon as the value looks like a command, the
-// matching commands and their descriptions are listed, exactly like the web
-// GUI's suggestion dropdown. Tab cycles through the matches.
-const suggestionBox = blessed.box({
-bottom: 3, left: 0, width: '100%', height: 0,
-border: { type: 'line' },
-label: ' Commands ',
-tags: true,
-hidden: true,
-style: { border: { fg: 'gray' }, label: { fg: 'cyan', bold: true } }
-})
-let tabCyclePrefix = null
-let tabCycleIndex = -1
-function updateSuggestions () {
-const val = inputBox.getValue()
-const matches = commandSuggestions(val, COMMANDS, 8)
-if (!matches.length) {
-if (!suggestionBox.hidden) { suggestionBox.hide(); debouncedRender() }
-return
-}
-suggestionBox.setContent(matches.map(m => ` {white-fg}${escBlessed(m.key)}{/white-fg} {gray-fg}${escBlessed(m.desc.slice(0, 140))}{/gray-fg}`).join('\n'))
-suggestionBox.height = Math.min(matches.length, 8) + 2
-if (suggestionBox.hidden) suggestionBox.show()
-debouncedRender()
-}
-
 screen.append(header)
 screen.append(logBox)
 screen.append(inputBox)
-screen.append(suggestionBox)
 inputBox.focus()
 
 screen.key(['C-c'], () => process.exit(0))
@@ -1198,9 +1139,6 @@ inputBox.focus()
 if (ch && ch.length === 1 && !key.ctrl && !key.meta) inputBox.setValue(inputBox.getValue() + ch)
 screen.render()
 }
-// Every keystroke ends here first, so refresh the suggestion panel after the
-// textbox has processed the key (typing, history, tab cycles alike).
-setImmediate(updateSuggestions)
 })
 
 function updateHeader() {
@@ -1247,18 +1185,19 @@ debouncedRender()
 
 inputBox.key('tab', () => {
 const val = inputBox.getValue()
-if (!val.startsWith('/')) return
-const matches = commandSuggestions(val, COMMANDS, 20)
-if (!matches.length) return
-// Repeated Tab cycles through the matches; typing anything else starts fresh.
-if (val !== tabCyclePrefix) { tabCyclePrefix = val; tabCycleIndex = -1 }
-tabCycleIndex = (tabCycleIndex + 1) % matches.length
+if (val.startsWith('/')) {
+const available = Object.keys(COMMANDS)
+const prefix = val.split(' ')[0]
+const matches = available.filter(c => c.startsWith(prefix))
+if (matches.length === 1) {
 // Strip parameter hints (e.g. "/warp <place>" → "/warp ")
-const base = matches[tabCycleIndex].key.replace(/ [<\[].*$/, '')
+const base = matches[0].replace(/ [<\[].*$/, '')
 inputBox.setValue(base + ' ')
-tabCyclePrefix = base + ' '
 debouncedRender()
-updateSuggestions()
+} else if (matches.length > 1) {
+logInfo(`{cyan-fg}Matches:{/cyan-fg} ${matches.map(m => m.split(' ')[0]).join(', ')}`)
+}
+}
 })
 
 inputBox.on('submit', (input) => {
@@ -2724,8 +2663,6 @@ inCrateRoutine: false, // suppresses windowOpen handler during /crates
   dumpTimers: [],
   dumpCancelRequested: false,
 inSpawnerRoutine: false, // suppresses windowOpen handler during /spawners (slots 13/53 are clicked by the routine)
-inAppleRoutine: false, // suppresses windowOpen handler during /ege (its windows are clicked by the routine)
-appleRoutineRunning: false, // prevents concurrent /ege runs
 shardshopLoopRunning: false, // prevents concurrent /shardshop-loop runs
 lastActivity: Date.now(), // updated on every inbound packet — used by the proxy stall watchdog
 forceKilled: false, // set by the watchdog so scheduleReconnect logs it distinctly
@@ -2771,11 +2708,23 @@ if (manualDisconnect || bots[id]?.reconnectTimer) {
 return;
 }
 
-// The removed list is the only gate: whatever ban flags the data file carries,
-// a bot that is not on removed-bots.json keeps dialling.
-const blocked = connectBlockReason(id)
-if (blocked) {
-e(`${id} is ${blocked} — not reconnecting. Run /unban ${id} to put it back.`)
+// The removed list outranks everything: a permanently banned bot is not yours
+// to reconnect any more, whatever BOT_NAMES still says.
+const removal = removedEntryFor(id)
+if (removal) {
+e(`${id} is on the removed list (${removedBotsStore.describeRemovedBot(removal)}) — not reconnecting. Run /unban ${id} to put it back.`)
+notifyBotsChanged()
+return
+}
+
+// A banned account must stop knocking: repeated logins during a ban look like
+// evasion and are pointless anyway. The expiry is an absolute time in the data
+// file, so this holds across restarts, and the ban sweep reconnects when it
+// lapses. Switching proxy is irrelevant — the ban follows the account.
+const ban = activeBan(id)
+if (ban) {
+if (ban.permanent) e(`${id} is permanently banned (${ban.kind}) — not reconnecting. Remove it from BOT_NAMES, or run /closeBot ${id}.`)
+else w(`${id} is banned (${ban.kind}) — holding off until ${new Date(ban.expiresAt).toLocaleString()}.`)
 notifyBotsChanged()
 return
 }
@@ -2944,7 +2893,6 @@ bot.on('messagestr', (message) => {
 const text = message.toLowerCase()
 monitoring?.inspectServerMessage(id, message)
 feedCoinflipLine(id, message)
-feedChatGameLine(message)
 
 const requester = detectTpaRequester(message)
 if (requester && bots[id]?.tpautoEnabled) {
@@ -2969,11 +2917,6 @@ else w(`${id}: repeated throttling escalates to a wrong-password failure after $
 monitoring?.onAuthFailure(id, f)
 notifyBotsChanged()
 }
-}
-if (authAction.fallback) {
-w(`${id}: auth ${authAction.fallback.kind} rejected — trying the fallback password (from ${authAction.fallback.source}) in ${Math.round(authAction.fallback.delayMs / 1000)}s`)
-const fallbackPayload = authAction.fallback.command
-pushT(() => bot.chat(fallbackPayload), authAction.fallback.delayMs)
 }
 if (authAction.skip) {
 i(`Auth prompt ignored for ${id} — ${authAction.skip.kind}: ${sanitize(authAction.skip.reason)} (fix it, then /auth-retry ${id})`)
@@ -3077,7 +3020,7 @@ if (manual.onWindowOpen(id, window)) return
 // window. /dump opens chests to deposit items — the GUI item search, slot
 // auto-click, and delayed AFK warp must never run on them (it would grab
 // items out of the chest and warp away mid-dump).
-if (bots[id]?.inCrateRoutine || bots[id]?.inDumpRoutine || bots[id]?.inSpawnerRoutine || bots[id]?.inAppleRoutine) return
+if (bots[id]?.inCrateRoutine || bots[id]?.inDumpRoutine || bots[id]?.inSpawnerRoutine) return
 
 // Book auto mode (BOOK_AUTO): a GUI that holds a matching item hands the
 // window to /use-book (scan → hotbar slot 1 → /use && /use) and nothing else
@@ -3195,17 +3138,15 @@ bots[id].lastDisconnectReason = text
 e(`Kicked: ${sanitize(text)}`)
 // A ban arrives as an ordinary kick, so the wording is the only evidence. The
 // verdict is written to the persisted data state (not just memory) so a banned
-// bot is still reported as banned after a restart, and /data publishes it. That
-// record is reporting only — connecting is gated exclusively by the removed
-// list (removed-bots.json); a permanent ban is put there automatically below.
+// bot is still reported as banned after a restart, and /data publishes it.
 const banVerdict = classifyKick(text)
 if (banVerdict.banned) {
 const alreadyBanned = Boolean(dataState.bots[id]?.banned)
 // The FIRST detection sets the clock. Later kicks from the same ban keep it, so a
 // reconnect attempt twenty minutes in cannot push the release time further out.
 const knownExpiry = Number(dataState.bots[id]?.banExpiresAt) || 0
-// A permanent ban never expires. Everything else needs a real expiry or its
-// report flag would never clear: a stated length is authoritative, and when the server
+// A permanent ban never expires. Everything else needs a real expiry or the bot
+// would be held forever: a stated length is authoritative, and when the server
 // says "temporary" (or only "possibly banned") without saying for how long, retry
 // after BAN_RETRY_MS rather than writing the account off.
 const unknownLength = !banVerdict.permanent && !banVerdict.durationMs && !banVerdict.expiresAt
@@ -3236,9 +3177,8 @@ permanent: banVerdict.permanent
 })
 persistData()
 if (!alreadyBanned) {
-const note = banVerdict.permanent ? '' : (expiresAt ? ` — flag clears ${new Date(expiresAt).toLocaleString()}` : '')
-logFor(id, `{red-fg}⛔ ${sanitize(id)} is ${banVerdict.kind === 'suspected' ? 'possibly ' : ''}banned${banVerdict.duration ? ' for ' + sanitize(banVerdict.duration) : ''} (${sanitize(banVerdict.kind)})${note}{/red-fg}`)
-if (!banVerdict.permanent) logFor(id, `{yellow-fg}   Recorded in the data file for reporting only — it does not stop ${sanitize(id)} from reconnecting; only ${REMOVED_BOTS_FILE} does.{/yellow-fg}`)
+const hold = expiresAt ? ` — held until ${new Date(expiresAt).toLocaleString()}` : (banVerdict.permanent ? ' — permanent, will NOT reconnect' : '')
+logFor(id, `{red-fg}⛔ ${sanitize(id)} is ${banVerdict.kind === 'suspected' ? 'possibly ' : ''}banned${banVerdict.duration ? ' for ' + sanitize(banVerdict.duration) : ''} (${sanitize(banVerdict.kind)})${hold}{/red-fg}`)
 if (banVerdict.reason && banVerdict.reason !== text) logFor(id, `{red-fg}   reason: ${sanitize(banVerdict.reason)}${banVerdict.caseId ? ' [case ' + sanitize(banVerdict.caseId) + ']' : ''}{/red-fg}`)
 if (banVerdict.permanent) {
 const moved = removedBotsStore.addRemovedBot(removedBots, { bot: id, kind: banVerdict.kind, reason: banVerdict.reason, caseId: banVerdict.caseId }, { addedBy: 'ban-detection' })
@@ -3367,11 +3307,20 @@ let currentConnectDelay = 0
 const initialConnectTimers = []
 const initialBotOrder = RANDOMIZE_BOT_ORDER ? shuffledCopy(BOT_NAMES) : BOT_NAMES.slice()
 initialBotOrder.forEach((name, index) => {
-// removed-bots.json is the only gate at startup too: a ban flag in the data
-// file does not stop a bot from coming up at restart.
-const blocked = connectBlockReason(name)
-if (blocked) {
-logFor(SYSTEM_ID, `{red-fg}⛔ ${sanitize(name)} is ${sanitize(blocked)} — not connecting. Run /unban ${sanitize(name)} to put it back.{/red-fg}`)
+// The removed list wins over everything: a permanently banned bot is not yours
+// to reconnect any more, even if it is still named in BOT_NAMES.
+const removal = removedEntryFor(name)
+if (removal) {
+logFor(SYSTEM_ID, `{red-fg}⛔ ${sanitize(name)} is on the removed list (${sanitize(removedBotsStore.describeRemovedBot(removal))}) — not connecting. Run /unban ${sanitize(name)} to put it back.{/red-fg}`)
+return
+}
+
+// A ban outlives the process, so a restart must not walk straight back into it.
+const held = activeBan(name)
+if (held) {
+logFor(SYSTEM_ID, held.permanent
+? `{red-fg}⛔ ${sanitize(name)} is permanently banned (${sanitize(held.kind)}) — not connecting. Remove it from BOT_NAMES to stop this warning.{/red-fg}`
+: `{red-fg}⛔ ${sanitize(name)} is banned (${sanitize(held.kind)}) — not connecting until ${new Date(held.expiresAt).toLocaleString()}.{/red-fg}`)
 return
 }
 const timer = setTimeout(() => {
@@ -3435,10 +3384,6 @@ const COMMANDS = {
 '/all-slow [delay] <cmd>': `Like /all (chat guard included), but starts each bot ${ALL_SLOW_DELAY_MS / 1000}s apart (ALL_SLOW_DELAY_MS). An optional leading delay overrides it for that run, in the same units as sleep: /all-slow 30 /spawners, /all-slow 500ms /status`,
 '/all-slow-cancel [id]': 'Cancel a specific running /all-slow broadcast task by ID (e.g. /all-slow-cancel 1), or all tasks if no ID is specified',
 '/overview': 'Dashboard of every bot\'s health, food, ping, rank (via /fix + /rank), shards, coins, balance, and inventory slots',
-'/enchanted-golden-apple-extract': 'The full kit-extract routine (alias /ege): one pass per EAPPLE_REWARD_SLOTS entry — /kits, click EAPPLE_KIT_SLOT, click the reward slot, /dispose — moving ONLY the EAPPLE_DISPOSE_ITEMS junk each pass so the enchanted golden apples stay in the inventory',
-'/ege': 'Alias for /enchanted-golden-apple-extract',
-'/scripts': 'List the bot-scripts/*.txt files available to /run-script',
-'/run-script <name>': 'Run bot-scripts/<name>.txt: one command per line, in order. \"*<fragment> <cmd>\" = every bot whose name contains the fragment, \"* <cmd>\" = all bots, a bare line = the invoking bot. &&, ; and sleep work inside a line',
 '/stats': 'Runtime stats: memory, event-loop lag, log rate, web viewers, uptime',
 '/crates [color]': `Warp to crates, find + walk to the nearest shulker box of [color] (default: ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')}, within ${CRATE_SCAN_RADIUS} blocks) and right-click it; falls back to ${WARP_AFK} if not found or unreachable. [color] can be a name like "purple" or a full block id like "purple_shulker_box"`,
 '/crates-loop [n] [color]': 'Run /crates repeatedly (default: until failure). Specify n for a fixed count and/or a crate [color]',
@@ -3982,10 +3927,15 @@ return true
 
 case '/reconnect': {
 const { host, port, version } = entry
-// The removed list gates manual reconnects too — /unban first.
-const blocked = connectBlockReason(id)
-if (blocked) {
-  logFor(id, `{red-fg}✗ ${id} is ${sanitize(blocked)} — cannot reconnect. Run /unban ${id} to put it back.{/red-fg}`)
+// Don't reconnect into an active ban — the ban sweep will handle it when it
+// expires, and repeated logins during a ban look like evasion.
+const ban = activeBan(id)
+if (ban) {
+  if (ban.permanent) {
+    logFor(id, `{red-fg}✗ ${id} is permanently banned (${ban.kind}) — cannot reconnect. Remove it from BOT_NAMES, or run /closeBot ${id}.{/red-fg}`)
+  } else {
+    logFor(id, `{yellow-fg}⚠ ${id} is banned (${ban.kind}) — held off until ${new Date(ban.expiresAt).toLocaleString()}.{/yellow-fg}`)
+  }
   return true
 }
 logFor(id, `{yellow-fg}⚠ Reconnecting ${id}…{/yellow-fg}`)
@@ -3997,25 +3947,6 @@ return true
 case '/crates': {
 if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
 return runCrateRoutine(id)
-}
-
-case '/enchanted-golden-apple-extract':
-case '/ege': {
-return runAppleExtractRoutine(id)
-}
-
-case '/scripts': {
-const names = listBotScripts(SCRIPTS_DIR)
-if (!names.length) { logFor(id, `{yellow-fg}⚠ No scripts in ${sanitize(SCRIPTS_DIR)} — add <name>.txt there.{/yellow-fg}`); return true }
-logFor(id, `{cyan-fg}› Scripts in ${sanitize(SCRIPTS_DIR)}:{/cyan-fg} ${names.map(sanitize).join(', ')}`)
-logFor(id, `{gray-fg}Run one with /run-script <name>. Line syntax: "*<fragment> <cmd>" targets matching bots, "* <cmd>" all bots, a bare line the invoking bot.{/gray-fg}`)
-return true
-}
-
-case '/run-script': {
-const name = parts[1]
-if (!name) { logFor(id, `{yellow-fg}⚠ Usage: /run-script <name> — scripts live in ${sanitize(SCRIPTS_DIR)} as <name>.txt.{/yellow-fg}`); return true }
-return runBotScript(name, id)
 }
 
 case '/crates-loop': {
@@ -4253,117 +4184,6 @@ if (bots[id]) {
 bots[id].crateRoutineRunning = false
 bots[id].inCrateRoutine = false
 }
-}
-}
-
-// ── /enchanted-golden-apple-extract (/ege) ─────────────────────────────────
-// One pass per EAPPLE_REWARD_SLOTS entry: /kits → left-click the kit slot →
-// left-click the reward slot → /dispose → move ONLY the EAPPLE_DISPOSE_ITEMS
-// junk in → close. The enchanted golden apples stay in the inventory: the
-// "golden_apple" glob is exact, so enchanted_golden_apple is never matched.
-// All clicks are left-clicks; every wait is EAPPLE_STEP_DELAY_MS.
-async function moveItemsToDispose (bot, id, win, globs) {
-const invStart = win.inventoryStart
-const invEnd = win.inventoryEnd
-let moved = 0, kept = 0
-for (let s = invStart; s < invEnd; s++) {
-const item = win.slots[s]
-if (!item) continue
-const shown = itemDisplayName(item) || item.name || 'item'
-if (!itemMatchesGlobs({ name: item.name, displayName: shown }, globs)) { kept++; continue }
-const initialCount = item.count
-// Same "did it really move?" confirm dance as /dump: the slot state only
-// refreshes when the server's window update arrives, so judging the click
-// immediately reads stale state. Click, wait for the count to change, retry once.
-let after = null, ok = false
-for (let attempt = 0; attempt < 2 && !ok; attempt++) {
-try {
-// Mode 1, button 0 = shift-click: straight into the dispose GUI.
-await bot.clickWindow(s, 0, 1)
-} catch (err) {
-logFor(id, `{yellow-fg}⚠ /ege: shift-click failed on slot ${s}: ${sanitize(err.message || String(err))}{/yellow-fg}`)
-return { moved, kept, failed: true }
-}
-const deadline = Date.now() + DUMP_CLICK_CONFIRM_MS
-after = win.slots[s]
-while (after && after.count === initialCount && Date.now() < deadline) {
-await new Promise(r => setTimeout(r, DUMP_CLICK_DELAY_MS))
-after = win.slots[s]
-}
-ok = !(after && after.count === initialCount)
-}
-if (!ok) { logFor(id, `{yellow-fg}⚠ /ege: ${sanitize(shown)} did not move — leaving it.{/yellow-fg}`); kept++; continue }
-moved++
-await new Promise(r => setTimeout(r, DUMP_CLICK_DELAY_MS))
-}
-return { moved, kept, failed: false }
-}
-
-async function runAppleExtractRoutine (id) {
-const entry = bots[id]
-if (!entry) return false
-if (entry.manualMode) { logFor(id, `{yellow-fg}⚠ Stop manual interact (/manual-stop) before starting /ege.{/yellow-fg}`); return false }
-if (!entry.bot?.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return false }
-if (entry.inAppleRoutine || entry.appleRoutineRunning) { logFor(id, `{yellow-fg}⚠ /ege is already running for ${id}.{/yellow-fg}`); return false }
-// A GUI session armed by /chat or /gui must not swallow this routine's windows
-if (entry.suppressNextWindowClick) entry.suppressNextWindowClick = false
-if (entry.suppressWindowTimer) { clearTimeout(entry.suppressWindowTimer); entry.suppressWindowTimer = null }
-if (entry.manualWindow) entry.manualWindow = null
-if (entry.manualSession) entry.manualSession = false
-if (entry.guiSessionTimer) { clearTimeout(entry.guiSessionTimer); entry.guiSessionTimer = null }
-
-const kitSlot = settings.get('EAPPLE_KIT_SLOT')
-const rewardSlots = parseRewardSlots(settings.get('EAPPLE_REWARD_SLOTS'))
-const globs = parseItemGlobs(settings.get('EAPPLE_DISPOSE_ITEMS'))
-const stepMs = settings.get('EAPPLE_STEP_DELAY_MS')
-if (!rewardSlots.length) { logFor(id, `{red-fg}✗ EAPPLE_REWARD_SLOTS has no valid slots — nothing to do.{/red-fg}`); return false }
-
-entry.appleRoutineRunning = true
-entry.inAppleRoutine = true
-const { bot } = entry
-const pause = () => new Promise(r => setTimeout(r, stepMs))
-const closeWindow = () => { if (bot.currentWindow) { try { bot.closeWindow(bot.currentWindow) } catch (_) {} } }
-const clickLeft = async (win, slot, label) => {
-if (!win) return false
-if (slot >= win.slots.length) { logFor(id, `{yellow-fg}⚠ /ege: ${label} slot ${slot} out of bounds — the window has ${win.slots.length} slots.{/yellow-fg}`); return false }
-try { await bot.clickWindow(slot, 0, 0); logFor(id, `{cyan-fg}› /ege: clicked ${label} slot ${slot}.{/cyan-fg}`); return true }
-catch (err) { logFor(id, `{red-fg}✗ /ege: click on ${label} slot ${slot} failed: ${sanitize(err.message || String(err))}{/red-fg}`); return false }
-}
-
-try {
-for (let pass = 0; pass < rewardSlots.length; pass++) {
-const rewardSlot = rewardSlots[pass]
-if (!bot.entity) { logFor(id, `{red-fg}✗ ${id} despawned — /ege stopped after ${pass} pass(es).{/red-fg}`); return false }
-logFor(id, `{cyan-fg}› /ege pass ${pass + 1}/${rewardSlots.length}: /kits → slot ${kitSlot} → slot ${rewardSlot} → /dispose.{/cyan-fg}`)
-closeWindow()
-bot.chat('/kits')
-const kitWin = await waitForWindowOpen(bot)
-if (!kitWin) { logFor(id, `{red-fg}✗ /ege: no GUI opened after /kits — stopping.{/red-fg}`); return false }
-await pause()
-if (!(await clickLeft(kitWin, kitSlot, 'kit'))) return false
-await pause()
-// The reward click targets whatever window is current after the wait: the kit
-// click may update the GUI in place or swap in a new window.
-const rewardWin = bot.currentWindow || await waitForWindowOpen(bot)
-if (!rewardWin) { logFor(id, `{red-fg}✗ /ege: no reward window after the kit click — stopping.{/red-fg}`); return false }
-if (!(await clickLeft(rewardWin, rewardSlot, 'reward'))) return false
-await pause()
-closeWindow()
-
-bot.chat('/dispose')
-const disposeWin = await waitForWindowOpen(bot)
-if (!disposeWin) { logFor(id, `{yellow-fg}⚠ /ege: no GUI opened after /dispose — skipping the dispose step.{/yellow-fg}`); continue }
-await pause()
-const { moved, kept, failed } = await moveItemsToDispose(bot, id, disposeWin, globs)
-logFor(id, `{green-fg}✓ /ege pass ${pass + 1}: moved ${moved} junk stack(s) into /dispose, kept ${kept}.{/green-fg}`)
-closeWindow()
-if (failed) { logFor(id, `{yellow-fg}⚠ /ege: a click failed — stopping.{/yellow-fg}`); return false }
-await pause()
-}
-logFor(id, `{green-fg}✓ /ege done — ${rewardSlots.length} pass(es) complete. The enchanted golden apples are still in the inventory.{/green-fg}`)
-return true
-} finally {
-if (bots[id]) { bots[id].inAppleRoutine = false; bots[id].appleRoutineRunning = false }
 }
 }
 
@@ -4977,37 +4797,6 @@ function coinflipObserverFor (id) {
 
 function feedCoinflipLine (id, message) {
   try { coinflipObserverFor(id).feed(message) } catch (_) {}
-}
-
-// ── Chat games (guess the number) ───────────────────────────────────────────
-// The server announces a timed round ("A chat event has started! … Hint: 1-15
-// | Reward: $2,500"); the fleet covers the range as fast as it can: every tick
-// a random connected bot says one number that has not been guessed yet, in
-// random order. See createChatGameManager for the round lifecycle.
-const chatGame = createChatGameManager({
-  submit: (botId, value) => {
-    const entry = bots[botId]
-    if (!entry?.bot?.entity) return false
-    entry.bot.chat(String(value))
-    return true
-  },
-  onEvent: (ev) => {
-    if (ev.kind === 'start') {
-      logFor(SYSTEM_ID, `{magenta-fg}🎮 chat game ${ev.min}-${ev.max}: ${ev.guesses} numbers from ${ev.bots} bot(s) at ${Math.round(1000 / ev.intervalMs)}/s{/magenta-fg}`)
-    } else if (ev.kind === 'stop') {
-      logFor(SYSTEM_ID, `{magenta-fg}🎮 chat game over (${ev.reason}) — guessed ${ev.guessed.length ? ev.guessed.join(', ') : 'nothing'}{/magenta-fg}`)
-    }
-  }
-})
-function feedChatGameLine (message) {
-  if (!settings.get('CHAT_GAME_AUTO')) return
-  try {
-    chatGame.feed(message, {
-      bots: Object.keys(bots).filter(id => bots[id]?.bot?.entity),
-      intervalMs: settings.get('CHAT_GAME_GUESS_MS'),
-      maxBots: settings.get('CHAT_GAME_MAX_BOTS')
-    })
-  } catch (_) {}
 }
 
 function describeWagerSpec (spec) {
@@ -5875,8 +5664,8 @@ function guardBroadcastText (text, commandName) {
 const BOOK_AUTO_COOLDOWN_MS = 3000 // one auto-run per window-open burst
 
 function bookRoutineBusy (entry) {
-  return !!(entry && (entry.inCrateRoutine || entry.inDumpRoutine || entry.inSpawnerRoutine || entry.inAppleRoutine ||
-    entry.crateRoutineRunning || entry.crateLoopRunning || entry.shardshopLoopRunning || entry.bookRoutineRunning || entry.appleRoutineRunning))
+  return !!(entry && (entry.inCrateRoutine || entry.inDumpRoutine || entry.inSpawnerRoutine ||
+    entry.crateRoutineRunning || entry.crateLoopRunning || entry.shardshopLoopRunning || entry.bookRoutineRunning))
 }
 
 // First slot in the window (or inventory) whose display, custom or registry
@@ -6005,36 +5794,6 @@ function copyTextToClipboard (text, done) {
   } catch (err) {
     done(false, err)
   }
-}
-
-// ── bot-scripts: /run-script <name> ───────────────────────────────────────
-// Scripts live in bot-scripts/*.txt (BOT_SCRIPTS_DIR overrides the folder). One
-// command per line; each line finishes before the next starts, so a line that
-// opens a routine waits for that routine. Target selectors: "*<fragment> …"
-// runs on every bot whose name contains the fragment, "* …" runs on every bot,
-// and a bare line runs on the invoking bot. The chain syntax (&&, ;, sleep)
-// works inside a line exactly as typed.
-const SCRIPTS_DIR = (process.env.BOT_SCRIPTS_DIR || '').trim() || path.join(__dirname, 'bot-scripts')
-
-async function runBotScript (name, invokerId) {
-const log = (msg) => logFor(invokerId || SYSTEM_ID, msg)
-const loaded = loadBotScript(SCRIPTS_DIR, name)
-if (!loaded.ok) { logFor(invokerId || SYSTEM_ID, `{yellow-fg}⚠ ${sanitize(loaded.error)}{/yellow-fg}`); return false }
-log(`{cyan-fg}› Running script ${sanitize(loaded.name)}.txt — ${loaded.steps.length} step(s).{/cyan-fg}`)
-for (const step of loaded.steps) {
-const targets = step.target.kind === 'self'
-? (invokerId ? [invokerId] : [])
-: step.target.kind === 'all'
-? Object.keys(bots)
-: selectScriptBots(step.target.pattern, Object.keys(bots))
-if (!targets.length) { log(`{yellow-fg}⚠ no bot matches "${sanitize(step.target.pattern || '*')}" — skipped: ${sanitize(step.command)}{/yellow-fg}`); continue }
-await Promise.all(targets.map(botId => {
-const out = handleCommand(step.command, { selectedId: botId })
-return out && typeof out.then === 'function' ? out.catch(() => {}) : Promise.resolve()
-}))
-}
-log(`{green-fg}✓ Script ${sanitize(loaded.name)} finished.{/green-fg}`)
-return true
 }
 
 function handleCommand(raw, ctx) {
