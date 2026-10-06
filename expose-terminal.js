@@ -1,6 +1,7 @@
 'use strict'
 
 const fs = require('fs')
+const dns = require('dns')
 const crypto = require('crypto')
 const { Client } = require('ssh2')
 
@@ -92,8 +93,7 @@ stream.stderr?.on('data',handler)
           }
         }
 
-        client.connect({
-          host: config.host,
+        const connectOptions = {
           port: config.port,
           username: config.username,
           password: config.password || undefined,
@@ -104,6 +104,19 @@ stream.stderr?.on('data',handler)
             : key => `SHA256:${crypto.createHash('sha256').update(key).digest('base64').replace(/=+$/, '')}` === config.hostKeyFingerprint,
           readyTimeout: config.readyTimeout,
           tryKeyboard: false
+        }
+        // host.docker.internal only resolves inside Docker (Desktop). When the
+        // bot runs directly on the host, fall back to loopback so the SSH
+        // terminal keeps working outside Docker without an .env change.
+        dns.lookup(config.host, (err, address) => {
+          if (err) {
+            if (config.host !== 'host.docker.internal') {
+              reject(new Error(`SSH host could not be resolved: ${config.host}`))
+              return
+            }
+            address = '127.0.0.1'
+          }
+          client.connect({ ...connectOptions, host: address })
         })
       })
     },

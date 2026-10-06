@@ -1,5 +1,8 @@
 'use strict'
 
+const fs = require('fs')
+const path = require('path')
+
 // Node timers clamp invalid/overflowing delays to 1ms; fall back instead.
 function readDelayMs(value, fallback = 15000) {
   if (value == null || String(value).trim() === '') return fallback
@@ -414,6 +417,8 @@ async function executeCommandChain(chain, ctx, { executeSingle = () => {}, sleep
 // PROXY_GROUP_<N>_HOST / _PORT / _TYPE = proxy target for that group
 // PROXY_GROUP_<N>_USER / _PASS = credentials for that group (optional)
 // PROXY_GROUP_<N>_LOGIN_PASSWORD = the Minecraft account password for those bots
+// PROXY_GROUP_<N>_FALLBACK_LOGIN_PASSWORD = the second account password, tried
+//   once after the primary one is rejected (see AUTH_FALLBACK_DELAY_MS)
 // Unassigned bots fall back to the caller-provided default (global PROXY_* or direct).
 function parseProxyGroups(env = process.env) {
   const groups = []
@@ -437,13 +442,17 @@ function parseProxyGroups(env = process.env) {
     // space, and silently altering it would lock the account out.
     const rawLogin = env[`PROXY_GROUP_${n}_LOGIN_PASSWORD`]
     const loginPassword = rawLogin == null ? '' : String(rawLogin)
+    // The SECOND account password for these bots, tried once when the primary is
+    // rejected. Same rule as the primary: not trimmed, empty means unset.
+    const rawFallback = env[`PROXY_GROUP_${n}_FALLBACK_LOGIN_PASSWORD`]
+    const fallbackPassword = rawFallback == null ? '' : String(rawFallback)
     // A group is defined by its BOT LIST, not by its host. Requiring a host here
     // used to discard the whole group — including its LOGIN_PASSWORD — for
     // anyone using a group only to separate accounts, and the only symptom was
     // bots logging in with the wrong password. `host: ''` now means "no dedicated
     // proxy": the group exists, its login password applies, and its bots use the
     // default connection.
-    if (bots.length) groups.push({ index: n, bots, host, port, type, user, pass, loginPassword })
+    if (bots.length) groups.push({ index: n, bots, host, port, type, user, pass, loginPassword, fallbackPassword })
     n++
   }
   return groups
@@ -547,6 +556,23 @@ function resolveLoginPassword(username, groups, env = process.env, botPasswords 
   }
   if (env && env.LOGIN_PASSWORD) return { password: String(env.LOGIN_PASSWORD), source: 'LOGIN_PASSWORD' }
   return { password: '123456', source: 'built-in default' }
+}
+
+// The second password for a bot whose primary the server rejects: the group's
+// FALLBACK_LOGIN_PASSWORD first, then LOGIN_PASSWORD_FALLBACK. There is no
+// per-bot spelling because a per-bot primary (BOT_PASSWORDS) is already the most
+// specific answer. Returns null when nothing is configured, so the failure guard
+// behaves exactly as before for setups that never set one.
+function resolveFallbackPassword(username, groups, env = process.env) {
+  if (Array.isArray(groups)) {
+    for (const group of groups) {
+      if (group.bots.includes(username) && group.fallbackPassword) {
+        return { password: group.fallbackPassword, source: `PROXY_GROUP_${group.index}_FALLBACK_LOGIN_PASSWORD` }
+      }
+    }
+  }
+  if (env && env.LOGIN_PASSWORD_FALLBACK) return { password: String(env.LOGIN_PASSWORD_FALLBACK), source: 'LOGIN_PASSWORD_FALLBACK' }
+  return null
 }
 
 // ── Login / register failure guard ───────────────────────────────────────────
@@ -660,6 +686,551 @@ function describeProxy(proxy) {
   return `${type} ${creds}${proxy.host}:${proxy.port}`
 }
 
+// ── Destructive-command confirmation ────────────────────────────────────────
+// /exit kills the whole process and `/all /dc` disconnects every bot at once.
+// Neither may happen on one keystroke or one typo: these commands warn first
+// ("DO NOT RUN!") and only run when the SAME command is repeated within the
+// confirmation window. Any other command always warns first.
+function destructiveCommandEffect(command) {
+  const trimmed = String(command ?? '').trim()
+  if (!trimmed) return null
+  if (trimmed.toLowerCase() === '/exit') return 'kills the bot process and disconnects every bot'
+  const m = trimmed.match(/^\/(all|all-slow)(?:\s+([\s\S]*))?$/)
+  if (m) {
+    // /all-slow's optional leading delay token ("30", "500ms") belongs to the
+    // dispatcher, not to what the bots would run — strip it first, exactly the
+    // way the /all-slow handler parses it.
+    let body = (m[2] || '').trim()
+    const splitAt = body.search(/\s/)
+    const first = splitAt === -1 ? body : body.slice(0, splitAt)
+    if (/^\d+(?:\.\d+)?(?:ms|s)?$/i.test(first)) body = splitAt === -1 ? '' : body.slice(splitAt + 1).trim()
+    const dispatched = (body.split(/\s+/)[0] || '').toLowerCase()
+    if (dispatched === '/dc' || dispatched === '/disconnect') return 'disconnects every bot at once'
+  }
+  return null
+}
+
+// One pending confirmation per command text (trimmed, lower-cased). `now` is
+// injectable so tests can expire the window without waiting a real minute.
+function createCommandConfirmation(windowMs = 60000, now = () => Date.now()) {
+  const pending = new Map() // command → expiry timestamp
+  return {
+    // true → this repeat is the go-ahead; false → warn only (and arm the window)
+    confirm(command) {
+      const key = String(command ?? '').trim().toLowerCase()
+      const at = now()
+      for (const [k, expires] of pending) if (expires <= at) pending.delete(k)
+      if (pending.has(key)) {
+        pending.delete(key)
+        return true
+      }
+      pending.set(key, at + windowMs)
+      return false
+    }
+  }
+}
+
+// ── Chat games (guess the number) ───────────────────────────────────────────
+// Servers run these as timed chat events: "A chat event has started! You have
+// 20 seconds to guess the number … Hint: 1-15 | Reward: $2,500". Covering a
+// small range is a race, so the manager fires one guess per tick: each guess is
+// a number not yet guessed, sent by a randomly chosen bot, in random order —
+// 1, 2, 3, 4 in the chat log is trivially obvious to a watching admin.
+
+// Pulls the range out of a prompt line: "Hint: 1-15", "between 1 and 15", or a
+// bare "1-15" on a line that is clearly about the number. Lines that merely
+// count time ("You have 20 seconds…") must not parse as a range.
+function parseChatGameRange (text) {
+  const s = String(text ?? '')
+  let m = s.match(/hint[^0-9]{0,12}(\d+)\s*(?:-|–|—|to)\s*(\d+)/i) ||
+    s.match(/between\s+(\d+)\s+(?:and|to)\s+(\d+)/i)
+  if (!m && /guess|number|range/i.test(s)) m = s.match(/(\d+)\s*[-–—]\s*(\d+)/)
+  if (!m) return null
+  const a = Number(m[1]), b = Number(m[2])
+  if (!Number.isFinite(a) || !Number.isFinite(b) || a === b) return null
+  const min = Math.min(a, b), max = Math.max(a, b)
+  // Guard against scraping a date or a price as a "range".
+  if (min < 1 || max - min > 1000) return null
+  return { min, max }
+}
+
+// While a round is running these mean it is over: the reveal ("the correct
+// number was 7"), a winner ("… guessed the number!"), or a wrap-up. Kept narrow
+// on purpose — a stray "won" from a coinflip must not kill a live round. The
+// equation-round wrap-ups ("nobody solved it", "the correct answer was …") are
+// here too, and they must fire BEFORE a reveal line can be parsed as a prompt.
+function isChatGameEnd (text) {
+  return /correct number|guessed the number|chat event (?:has )?end|nobody guessed|nobody (?:solved|answered|got)|too late|(?:correct|right) (?:answer|solution)|answer was|equation was|solved (?:it\b|the\b|this\b|:)/i.test(String(text ?? ''))
+}
+
+// ── Chat games (equation rounds) ────────────────────────────────────────────
+// Equation rounds ("Solve: 3x+5=20 …") have ONE exact answer, so exactly one
+// randomly chosen bot says it — a chorus of identical answers is a dead
+// giveaway, and unlike "guess the number" there is no range to cover. The
+// answer is COMPUTED here with exact rational arithmetic, never guessed: a
+// prompt that does not reduce to one computable value stays silent.
+
+function gcdInt (a, b) {
+  a = Math.abs(a); b = Math.abs(b)
+  while (b) { const t = a % b; a = b; b = t }
+  return a || 1
+}
+
+// n/d in lowest terms, integers only — 0.5 becomes 1/2, so nothing rounds.
+function rat (n, d = 1) {
+  if (!d) return null
+  if (d < 0) { n = -n; d = -d }
+  const g = gcdInt(n, d)
+  return { n: n / g, d: d / g }
+}
+const ratAdd = (x, y) => rat(x.n * y.d + y.n * x.d, x.d * y.d)
+const ratSub = (x, y) => rat(x.n * y.d - y.n * x.d, x.d * y.d)
+const ratMul = (x, y) => rat(x.n * y.n, x.d * y.d)
+const ratDiv = (x, y) => (y.n === 0 ? null : rat(x.n * y.d, x.d * y.n))
+
+// "Just the number" for chat: integers plain ("5"), finite decimals exact
+// ("0.5"), anything else the exact fraction ("2/3") — a rounded decimal would
+// be a guess, and this feature must never guess.
+function formatRat (r) {
+  if (r.d === 1) return String(r.n)
+  let d = r.d, twos = 0, fives = 0
+  while (d % 2 === 0) { d /= 2; twos++ }
+  while (d % 5 === 0) { d /= 5; fives++ }
+  if (d !== 1) return `${r.n}/${r.d}`
+  const places = Math.max(twos, fives)
+  const scaled = Math.round(r.n * Math.pow(10, places) / r.d)
+  const sign = scaled < 0 ? '-' : ''
+  const digits = String(Math.abs(scaled)).padStart(places + 1, '0')
+  return `${sign}${digits.slice(0, digits.length - places)}.${digits.slice(digits.length - places)}`
+}
+
+// One side of the equation as a·v + b with exact rational a and b. Anything
+// non-linear (x², x·y, x/x) or not a complete expression returns null — a
+// wrong parse is worse than silence. Handles "3x", "3 x", "3(x+2)", "x/2",
+// unary signs and implicit products. No eval anywhere: a tiny recursive
+// descent over the prompt itself.
+function parseLinearSide (text, variable) {
+  const s = String(text)
+  const v = String(variable).toLowerCase()
+  let i = 0
+  function skipWs () { while (i < s.length && /\s/.test(s[i])) i++ }
+  function number () {
+    skipWs()
+    const m = /^\d+(?:\.\d+)?|^\.\d+/.exec(s.slice(i))
+    if (!m) return null
+    i += m[0].length
+    const raw = m[0]
+    const dot = raw.indexOf('.')
+    if (dot < 0) return rat(Number(raw), 1)
+    return rat(Number(raw.replace('.', '')), Math.pow(10, raw.length - dot - 1))
+  }
+  function primary () {
+    skipWs()
+    const c = s[i]
+    if (c === '(') {
+      i++
+      const e = expr()
+      if (!e) return null
+      skipWs()
+      if (s[i] !== ')') return null
+      i++
+      return e
+    }
+    if (c && /[a-z]/i.test(c)) {
+      // A lone letter is the variable; a longer word is not an expression.
+      if (c.toLowerCase() !== v || /[a-z]/i.test(s[i + 1] || '')) return null
+      i++
+      return { a: rat(1), b: rat(0) }
+    }
+    const num = number()
+    if (!num) return null
+    skipWs()
+    if (s[i] && /[a-z]/i.test(s[i])) { // "3x" — a coefficient
+      if (s[i].toLowerCase() !== v || /[a-z]/i.test(s[i + 1] || '')) return null
+      i++
+      return { a: num, b: rat(0) }
+    }
+    return { a: rat(0), b: num }
+  }
+  function mulPair (p, q) {
+    if (p.a.n !== 0 && q.a.n !== 0) return null // x² — not linear, never guessed at
+    return { a: ratAdd(ratMul(p.a, q.b), ratMul(q.a, p.b)), b: ratMul(p.b, q.b) }
+  }
+  function divPair (p, q) {
+    if (q.a.n !== 0 || q.b.n === 0) return null
+    return { a: ratDiv(p.a, q.b), b: ratDiv(p.b, q.b) }
+  }
+  function factor () {
+    skipWs()
+    let sign = 1
+    while (s[i] === '+' || s[i] === '-') { if (s[i] === '-') sign = -sign; i++ }
+    const p = primary()
+    if (!p) return null
+    return { a: ratMul(rat(sign), p.a), b: ratMul(rat(sign), p.b) }
+  }
+  function term () {
+    let p = factor()
+    if (!p) return null
+    for (;;) {
+      skipWs()
+      const c = s[i]
+      if (c === '*' || c === '\u00d7' || c === '/') {
+        i++
+        const q = factor()
+        p = q && (c === '/' ? divPair(p, q) : mulPair(p, q))
+      } else if (c && /[0-9a-z.(]/i.test(c)) {
+        // implicit products: "3x", "3(x+1)", ")(x+1)"
+        const q = factor()
+        p = q && mulPair(p, q)
+      } else return p
+      if (!p) return null
+    }
+  }
+  function expr () {
+    let p = term()
+    if (!p) return null
+    for (;;) {
+      skipWs()
+      const c = s[i]
+      if (c !== '+' && c !== '-') return p
+      i++
+      const q = term()
+      if (!q) return null
+      const sign = rat(c === '-' ? -1 : 1)
+      p = { a: ratAdd(p.a, ratMul(sign, q.a)), b: ratAdd(p.b, ratMul(sign, q.b)) }
+    }
+  }
+  const out = expr()
+  skipWs()
+  return (out && i >= s.length) ? out : null
+}
+
+// Lines that announce an equation round: prompt words ("Solve:", "Quick math",
+// "equation"), the round banner's "Reward:" tag, or a bare equation whose only
+// other characters are decoration ("✦ 3x+5=20?"). Player chatter ("I think
+// x = 5 lol") never qualifies, so the fleet stays quiet outside real rounds.
+const EQUATION_PROMPT = /solve|equation|math|find (?:x\b|[a-z]\b|the\b)|value of|calculate|reward|what(?:'s| is)|=\s*\?|\?\s*$/i
+const EQUATION_CHARS = /[0-9a-z+\-*/().\s]/i
+const MATH_OPERATOR = '+-*/()'
+
+// Pulls a solvable linear equation ("3x+5=20") out of a full chat line and
+// solves it for its single variable. Returns { equation, variable, answer,
+// answerText } or null. No unique solution (3x+5=3x+9), more than one
+// variable, or anything non-linear → null: when no answer can be COMPUTED,
+// nothing is sent.
+function parseChatGameEquation (text) {
+  const original = String(text ?? '')
+  // ×/÷/— arrive via Minecraft formatting, and a "(x=?)" / "x=?" tag is a
+  // "what is x" decoration — not a second equation to solve.
+  const s = original
+    .replace(/[\u2212\u2013\u2014]/g, '-')
+    .replace(/[\u00d7]/g, '*')
+    .replace(/[\u00f7]/g, '/')
+    .replace(/\(\s*[a-z]\s*=\s*\?{0,3}\s*\)/gi, ' ')
+    .replace(/\b[a-z]\s*=\s*\?{1,3}/gi, ' ')
+  if (!s.includes('=')) return null
+  for (let eq = s.indexOf('='); eq !== -1; eq = s.indexOf('=', eq + 1)) {
+    let l = eq
+    while (l > 0 && EQUATION_CHARS.test(s[l - 1])) l--
+    let r = eq + 1
+    while (r < s.length && EQUATION_CHARS.test(s[r])) r++
+    const lhsRaw = s.slice(l, eq), rhsRaw = s.slice(eq + 1, r)
+    // Prompt words wrap the equation ("Solve 3x+5=20"), so shed non-expression
+    // characters from the ends — but never from inside an expression: a
+    // candidate that starts or ends mid-word or mid-operator is a cut piece of
+    // a bigger formula ("Score" → "e", "x + y" → "y") and must not be solved.
+    for (let i = 0; i <= lhsRaw.length; i++) {
+      const rawL = lhsRaw.slice(i)
+      const left = rawL.trim()
+      if (!left || left[0] === '+') continue
+      const leftStart = l + i + (rawL.length - rawL.trimStart().length)
+      if (leftStart > 0 && /[a-z0-9.]/i.test(s[leftStart - 1])) continue
+      let back = leftStart - 1
+      while (back >= 0 && /\s/.test(s[back])) back--
+      if (back >= 0 && MATH_OPERATOR.includes(s[back])) continue
+      for (let j = rhsRaw.length; j >= 0; j--) {
+        const rawR = rhsRaw.slice(0, j)
+        const right = rawR.trim()
+        if (!right) continue
+        const rightEnd = eq + 1 + rawR.trimEnd().length
+        if (rightEnd < s.length && /[a-z0-9.]/i.test(s[rightEnd])) continue
+        let fwd = rightEnd
+        while (fwd < s.length && /\s/.test(s[fwd])) fwd++
+        if (fwd < s.length && MATH_OPERATOR.includes(s[fwd])) continue
+        const letters = new Set((left + right).toLowerCase().match(/[a-z]/g) || [])
+        if (letters.size !== 1) continue // one variable only
+        const variable = [...letters][0]
+        const L = parseLinearSide(left, variable), R = parseLinearSide(right, variable)
+        if (!L || !R) continue
+        // Both sides parse — THIS is the equation. Solvable: answer it. Not
+        // solvable (3x+5=3x+9, x=x): there is no answer to compute, so stay
+        // silent instead of guessing.
+        const a = ratSub(L.a, R.a), b = ratSub(L.b, R.b) // a·v + b = 0
+        if (a.n === 0) return null
+        const value = ratDiv(rat(-b.n, b.d), a)
+        if (!value) return null
+        const leftover = s.slice(0, leftStart) + s.slice(rightEnd)
+        const bare = !/[a-z0-9]/i.test(leftover)
+        if (!bare && !EQUATION_PROMPT.test(original)) return null // player chatter
+        return { equation: `${left}=${right}`, variable, answer: value.n / value.d, answerText: formatRat(value) }
+      }
+    }
+  }
+  return null
+}
+
+function createChatGameManager ({ setTimer = setTimeout, clearTimer = clearTimeout, random = Math.random, submit = () => true, onEvent = () => {}, now = Date.now } = {}) {
+  let game = null
+  let lastEquation = '', lastEquationAt = 0
+  const stop = (reason) => {
+    if (!game) return false
+    if (game.timer !== null) clearTimer(game.timer)
+    const done = { min: game.min, max: game.max, guessed: game.guessed.slice(), reason }
+    game = null
+    onEvent({ kind: 'stop', ...done })
+    return true
+  }
+  const tick = () => {
+    if (!game) return
+    game.timer = null
+    const value = game.numbers.pop()
+    const botId = game.pool[game.cursor++ % game.pool.length]
+    game.guessed.push(value)
+    let ok = false
+    try { ok = submit(botId, value) !== false } catch (_) { ok = false }
+    if (!ok) {
+      // The chosen bot is gone — the number goes back for another bot to say,
+      // and a pool that can no longer speak ends the round instead of spinning.
+      game.numbers.unshift(value)
+      game.guessed.pop()
+      if (++game.misses > game.pool.length * 2) return stop('no-senders')
+    } else {
+      game.misses = 0
+    }
+    if (!game.numbers.length) return stop('covered')
+    game.timer = setTimer(tick, game.intervalMs)
+  }
+  return {
+    get running () { return game !== null },
+    get state () {
+      if (!game) return null
+      return { min: game.min, max: game.max, remaining: game.numbers.length, guessed: game.guessed.slice(), bots: game.pool.slice() }
+    },
+    // Every number in range is guessed exactly once, by a random pool bot each
+    // time. Replaces a running round — a new prompt means a new number.
+    begin ({ min, max, bots = [], intervalMs = 100, maxBots = 30 } = {}) {
+      if (!Number.isFinite(min) || !Number.isFinite(max) || min > max) return false
+      stop('replaced')
+      const numbers = shuffledCopy(Array.from({ length: max - min + 1 }, (_, i) => min + i), random)
+      const pool = shuffledCopy(bots.filter(Boolean).slice(0, Math.max(1, maxBots)), random)
+      if (!numbers.length || !pool.length) return false
+      game = { min, max, numbers, pool, cursor: 0, guessed: [], misses: 0, timer: null, intervalMs: Math.max(10, Math.floor(intervalMs) || 100) }
+      onEvent({ kind: 'start', min, max, guesses: numbers.length, bots: pool.length, intervalMs: game.intervalMs })
+      tick() // first guess immediately — the round clock is already ticking
+      return true
+    },
+    // Equation rounds ("Solve: 3x+5=20"): exactly one COMPUTED answer, from
+    // exactly one randomly chosen pool bot. Walks on to the next bot when the
+    // chosen one is gone — but only ever one message goes out.
+    solveEquation (text, { bots = [], maxBots = 30 } = {}) {
+      const eq = parseChatGameEquation(text)
+      if (!eq) return false
+      // The same prompt re-rendered on the banner is not a second round.
+      if (eq.equation === lastEquation && now() - lastEquationAt < 15000) return true
+      lastEquation = eq.equation
+      lastEquationAt = now()
+      stop('equation-round') // a new chat event is running; a number round is stale
+      const pool = shuffledCopy(bots.filter(Boolean).slice(0, Math.max(1, maxBots)), random)
+      for (const botId of pool) {
+        let ok = false
+        try { ok = submit(botId, eq.answerText) !== false } catch (_) { ok = false }
+        if (ok) {
+          onEvent({ kind: 'equation', equation: eq.equation, variable: eq.variable, answer: eq.answerText, bot: botId })
+          return true
+        }
+      }
+      onEvent({ kind: 'equation', equation: eq.equation, variable: eq.variable, answer: eq.answerText, bot: null, failed: true })
+      return true // a recognized round even when nobody could speak
+    },
+    // One funnel for every chat line: a reveal stops the round, a prompt starts one.
+    feed (text, { bots = [], intervalMs = 100, maxBots = 30 } = {}) {
+      if (isChatGameEnd(text)) return stop('announced')
+      if (this.solveEquation(text, { bots, maxBots })) return true
+      const range = parseChatGameRange(text)
+      if (!range) return false
+      return this.begin({ ...range, bots, intervalMs, maxBots })
+    },
+    stop
+  }
+}
+
+
+// ── Item allowlists (globs) ────────────────────────────────────────────────
+// The /ege dispose list names items as comma-separated globs: "golden_apple"
+// is an exact match (so enchanted_golden_apple is never touched) and
+// "*shulker_box" matches every coloured shulker. Matching is case-insensitive
+// and folds _/-/spaces into one separator, so a registry name (golden_apple)
+// and a display name ("Golden Apple") both hit the same glob.
+function normalizeItemTerm (value) {
+  return String(value ?? '').toLowerCase().replace(/[_\s-]+/g, ' ').trim()
+}
+
+function parseItemGlobs (value) {
+  return String(value ?? '').split(',').map(normalizeItemTerm).filter(Boolean)
+}
+
+function itemMatchesGlobs (item, globs) {
+  if (!item || !Array.isArray(globs) || !globs.length) return false
+  const names = [item.name, item.displayName].map(normalizeItemTerm).filter(Boolean)
+  return globs.some(glob => {
+    const re = new RegExp('^' + glob.split('*').map(part => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$')
+    return names.some(name => re.test(name))
+  })
+}
+
+// "21,15,13,11" → [21, 15, 13, 11]. Junk entries are dropped, order survives.
+function parseRewardSlots (value) {
+  return String(value ?? '').split(',').map(s => s.trim()).filter(Boolean).map(Number).filter(n => Number.isInteger(n) && n >= 0)
+}
+
+// ── bot-scripts ────────────────────────────────────────────────────────────
+// Plain-text command lists: one command per line, blank lines and # comments
+// skipped. A line may open with a target selector — "*<fragment> <cmd>" runs on
+// every bot whose name contains the fragment (case-insensitive), "* <cmd>" runs
+// on every bot, and a bare line runs on the invoking bot. The rest of the line
+// is an ordinary command, so the chain syntax (&&, ;, sleep) works inside a
+// script line exactly as typed.
+function parseScriptLine (line) {
+  const trimmed = String(line ?? '').replace(/\r$/, '').trim()
+  if (!trimmed || trimmed.startsWith('#')) return null
+  const m = trimmed.match(/^(\*[^ \t]*)[ \t]+([\s\S]*)$/)
+  // A lone selector ("*123") names bots but sends nothing — ignore it.
+  if (!m) return trimmed.startsWith('*') ? null : { target: { kind: 'self', pattern: '' }, command: trimmed }
+  const star = m[1]
+  const command = m[2].trim()
+  if (!command) return null
+  if (star === '*') return { target: { kind: 'all', pattern: '' }, command }
+  return { target: { kind: 'match', pattern: star.slice(1) }, command }
+}
+
+function parseScript (text) {
+  return String(text ?? '').split('\n').map(parseScriptLine).filter(Boolean)
+}
+
+function selectScriptBots (pattern, names) {
+  const needle = String(pattern ?? '').toLowerCase()
+  return (names || []).filter(name => String(name).toLowerCase().includes(needle))
+}
+
+function listBotScripts (dir) {
+  try {
+    return fs.readdirSync(dir).filter(f => /\.txt$/i.test(f)).map(f => f.replace(/\.txt$/i, ''))
+  } catch (_) { return [] }
+}
+
+// Loads bot-scripts/<name>.txt. The name is strictly [\w-] — no path separators,
+// no "..", no extension games — so a script can never escape its folder.
+function loadBotScript (dir, name) {
+  const n = String(name ?? '').trim()
+  if (!/^[\w-]+$/.test(n)) return { ok: false, error: `invalid script name "${String(name ?? '')}" — names are letters, digits, "-" and "_" only` }
+  try {
+    const text = fs.readFileSync(path.join(dir, `${n}.txt`), 'utf8')
+    return { ok: true, name: n, steps: parseScript(text) }
+  } catch (err) {
+    return { ok: false, error: `no script "${n}.txt" in ${dir} (${err.code || err.message})` }
+  }
+}
+
+// The web GUI's suggestion rule, shared with the terminal TUI: a command matches
+// when it starts with the typed text, or its first word does ("/all <cmd>" is
+// offered while you type "/all").
+// ── Tor control (fresh circuits) ───────────────────────────────────────────
+// scripts/restart-tor.sh generates one Tor instance per SOCKS port with a
+// control port at SOCKS + CONTROL_OFFSET (1) and CookieAuthentication 0, so a
+// bare AUTHENTICATE is all it takes. SIGNAL NEWNYM makes Tor build fresh
+// circuits for NEW connections — a live connection keeps the circuit it is on
+// until its next reconnect.
+
+function parseTorControlPorts (value) {
+  const out = []
+  for (const tok of String(value || '').split(/[\s,;]+/)) {
+    if (!tok) continue
+    const n = Number(tok)
+    if (Number.isInteger(n) && n > 0 && n <= 65535 && !out.includes(n)) out.push(n)
+  }
+  return out
+}
+
+// Only a Tor instance ON THIS BOX can be controlled, so remote proxy hosts are
+// skipped: their SOCKS port is somebody else's server, +1 is not a control port.
+const LOCAL_TOR_HOSTS = ['127.0.0.1', 'localhost', '::1']
+function deriveTorControlPorts (groups, defaultProxy, offset = 1) {
+  const out = []
+  const add = (host, port) => {
+    const h = String(host || '').trim().toLowerCase()
+    if (!LOCAL_TOR_HOSTS.includes(h)) return
+    const socks = Number(port)
+    if (!Number.isInteger(socks) || socks <= 0 || socks > 65535) return
+    const ctrl = socks + offset
+    if (ctrl > 65535 || out.includes(ctrl)) return
+    out.push(ctrl)
+  }
+  for (const g of groups || []) add(g.host, g.port)
+  if (defaultProxy) add(defaultProxy.host, defaultProxy.port)
+  return out
+}
+
+// One control-port conversation: AUTHENTICATE → SIGNAL <name> → QUIT. Never
+// rejects — a dead port is a result ({ ok: false, error }), because the caller
+// reports per-port outcomes rather than aborting the whole request.
+function sendTorSignal (port, { connect, signal = 'NEWNYM', timeoutMs = 5000, setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
+  const net = require('net')
+  const target = Number(port)
+  return new Promise(resolve => {
+    let settled = false
+    let buf = ''
+    let timer = null
+    let sock = null
+    const finish = result => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimer(timer)
+      try { if (sock) sock.destroy() } catch (_) {}
+      resolve(result)
+    }
+    try {
+      sock = (connect || ((opts, cb) => net.connect(opts, cb)))({ host: '127.0.0.1', port: target }, () => {
+        sock.write(`AUTHENTICATE\r\nSIGNAL ${signal}\r\nQUIT\r\n`)
+      })
+    } catch (err) {
+      finish({ ok: false, port: target, error: err.message })
+      return
+    }
+    timer = setTimer(() => finish({ ok: false, port: target, error: `no reply from control port ${target} after ${timeoutMs}ms` }), timeoutMs)
+    sock.on('data', chunk => {
+      buf += String(chunk)
+      const lines = buf.split(/\r?\n/).filter(Boolean)
+      // Every command answers "250 …" on success; 515 is a failed
+      // AUTHENTICATE, other 4xx/5xx lines are equally fatal.
+      const bad = lines.find(l => /^[45]\d\d/.test(l))
+      if (bad) return finish({ ok: false, port: target, error: bad.trim() })
+      if (lines.filter(l => /^250/.test(l)).length >= 2) finish({ ok: true, port: target, reply: lines.join(' | ') })
+    })
+    sock.on('error', err => finish({ ok: false, port: target, error: err.message }))
+    sock.on('close', () => finish({ ok: false, port: target, error: 'control connection closed before it answered' }))
+  })
+}
+
+function commandSuggestions (value, commands, limit = 8) {
+  const v = String(value ?? '').trimEnd()
+  if (!v.startsWith('/')) return []
+  const table = commands || {}
+  return Object.keys(table)
+    .filter(k => k.indexOf(v) === 0 || (k.split(' ')[0] || '').indexOf(v) === 0)
+    .slice(0, limit)
+    .map(k => ({ key: k, desc: String(table[k] ?? '') }))
+}
+
 module.exports = {
   readDelayMs,
   readInt,
@@ -676,6 +1247,10 @@ module.exports = {
   buildHiddenDumpPlan,
   createSlowBroadcast,
   createSlowBroadcastManager,
+  parseChatGameRange,
+  parseChatGameEquation,
+  isChatGameEnd,
+  createChatGameManager,
   parseProxyGroups,
   findIgnoredProxyGroupVars,
   resolveBotProxy,
@@ -684,6 +1259,7 @@ module.exports = {
   buildHttpConnectRequest,
   describeProxy,
   resolveLoginPassword,
+  resolveFallbackPassword,
   parseBotPasswords,
   classifyAuthReply,
   nextAuthFailure,
@@ -691,5 +1267,19 @@ module.exports = {
   parseSleepDuration,
   fmtDuration,
   parseCommandChain,
-  executeCommandChain
+  executeCommandChain,
+  destructiveCommandEffect,
+  createCommandConfirmation,
+  parseItemGlobs,
+  itemMatchesGlobs,
+  parseRewardSlots,
+  parseScript,
+  parseScriptLine,
+  selectScriptBots,
+  listBotScripts,
+  loadBotScript,
+  parseTorControlPorts,
+  deriveTorControlPorts,
+  sendTorSignal,
+  commandSuggestions
 }

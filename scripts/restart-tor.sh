@@ -1,57 +1,263 @@
-#!/bin/sh
-# Restart Tor before launching the bot, so a fresh circuit/exit IP is in
-# place when the app starts. Works both on a systemd host and inside the
-# container, where Tor is a bare process rather than a service.
+#!/usr/bin/env bash
+# restart-tor.sh — FORCEFUL multi-instance Tor restart + app launch.
 #
-#   npm run start   →   restart-tor.sh   →   node bot.js
+#   npm run start   →   restart Tor, then exec node bot.js
+#   --tor-only      →   just restart Tor and exit
 #
-# Only touches Tor when the app actually routes through a local SOCKS
-# proxy (PROXY_HOST=localhost/127.0.0.1/::1, or unset = the docker default).
-# A remote proxy or direct mode skips the restart, matching the app's own
-# PROXY_IS_LOCAL guard.
+# ROOT ONLY. Guarantees a NEW CIRCUIT (new full path incl. guard) per instance:
+#   1. EVERY tor process on the box is SIGKILLED (the old script's blunt
+#      pkill -x tor, restored) + whatever squats on our ports dies too.
+#   2. The per-instance `state` file (entry guards / identity) is WIPED.
+#      This is the actual source of "same circuit over and over": guards are
+#      persisted in DataDirectory/state and survive kill+relaunch otherwise.
+#   3. The exit IP is PROVEN different afterwards through the SOCKS port; on
+#      a repeat it forces NEWNYM and retries, then FAILS LOUDLY rather than
+#      pretend. (REQUIRE_NEW_EXIT=0 → warn only, SKIP_IP_CHECK=1 → skip.)
+#   4. A taken port is a stale instance: its holder is kill -9'd, never skipped.
+#
+# FAST: parallel restart, 200ms polls via bash /dev/tcp (no node spawn),
+# warm descriptor cache kept (only `state` is wiped) → bootstrap ~3-5s,
+# 25s hard cap. TOR_PORTS must list EVERY instance port your bots use.
 
-set -e
+set -euo pipefail
 
-PROXY_HOST="${PROXY_HOST:-127.0.0.1}"
-PORT="${PROXY_PORT:-9050}"
-
-case "$PROXY_HOST" in
-  127.0.0.1|localhost|::1) ;;
-  *)
-    echo "[restart-tor] PROXY_HOST='${PROXY_HOST}' is not local — skipping Tor restart, starting the app."
-    exec node bot.js
-    ;;
-esac
-
-restart_tor() {
-  if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -q '^tor\.service'; then
-    systemctl restart tor
-  elif [ -x /usr/local/bin/restart-tor ]; then
-    # Container helper: pkill + relaunch against /etc/tor/torrc
-    /usr/local/bin/restart-tor
-  elif command -v tor >/dev/null 2>&1; then
-    pkill -x tor 2>/dev/null || true
-    sleep 1
-    tor -f /etc/tor/torrc >/dev/null 2>&1 &
-  else
-    echo "[restart-tor] WARNING: no Tor restart path found (systemctl/tor binary absent) — starting the app anyway."
-    return
-  fi
+log() { printf '[restart-tor] %s\n' "$*"; }
+die() {
+  printf '[restart-tor] ERROR: %s\n' "$*" >&2
+  exit 1
 }
 
-restart_tor
+# ---------------- config ----------------
+TOR_PORTS="${TOR_PORTS:-9050 9150 9250}"        # space-separated SOCKS ports — ALL of them!
+TOR_HOME="${TOR_HOME:-/etc/tor-instances}" # torrc-<port> + data-<port> live here
+CONTROL_OFFSET="${CONTROL_OFFSET:-1}"      # control port = socks port + this
+BOOT_TIMEOUT="${BOOT_TIMEOUT:-25}"         # seconds for the whole fleet to answer
+KILL_TIMEOUT="${KILL_TIMEOUT:-5}"          # seconds to wait for ports to go free
+TOR_BIN="${TOR_BIN:-tor}"
+IP_CHECK_URL="${IP_CHECK_URL:-https://api.ipify.org}"
+IP_CHECK_TIMEOUT="${IP_CHECK_TIMEOUT:-8}"
+MAX_IP_TRIES="${MAX_IP_TRIES:-3}"
+KEEP_STATE="${KEEP_STATE:-0}" # 1 = keep guards (old behavior)
+SKIP_IP_CHECK="${SKIP_IP_CHECK:-0}"
+REQUIRE_NEW_EXIT="${REQUIRE_NEW_EXIT:-1}" # 1 = abort if exit IP cannot change
 
-# Wait for the SOCKS port to accept connections so the first bot connection
-# doesn't race the proxy bootstrap (mirrors docker-entrypoint.sh).
-i=0
-until node -e "const net=require('net'),s=net.connect(process.env.PORT,'127.0.0.1',()=>{s.destroy();process.exit(0)});s.on('error',()=>process.exit(1))" 2>/dev/null; do
-  i=$((i + 1))
-  if [ "$i" -ge 60 ]; then
-    echo "[restart-tor] WARNING: Tor not accepting connections after 60s — starting the app anyway."
-    break
-  fi
-  sleep 1
+TOR_ONLY=0
+for arg in "$@"; do
+  case "$arg" in
+  --tor-only) TOR_ONLY=1 ;;
+  *) die "unknown flag: $arg (supported: --tor-only)" ;;
+  esac
 done
-[ "$i" -lt 60 ] && echo "[restart-tor] Tor is up on 127.0.0.1:${PORT}."
 
+# ---------------- root only ----------------
+[ "$(id -u)" -eq 0 ] || die "must run as root (box-wide kill + port takeover). Try: sudo npm run start"
+
+# ---------------- remote proxy → nothing to do ----------------
+PROXY_HOST="${PROXY_HOST:-127.0.0.1}"
+case "$PROXY_HOST" in
+127.0.0.1 | localhost | ::1) ;;
+*)
+  log "PROXY_HOST='${PROXY_HOST}' is not local — skipping Tor, starting the app."
+  [ "$TOR_ONLY" -eq 1 ] && exit 0
+  exec node bot.js
+  ;;
+esac
+
+command -v "$TOR_BIN" >/dev/null 2>&1 || die "tor binary not found (TOR_BIN=${TOR_BIN})"
+
+if [ -n "${PROXY_PORT:-}" ]; then
+  case " $TOR_PORTS " in
+  *" ${PROXY_PORT} "*) ;;
+  *) TOR_PORTS="${PROXY_PORT} ${TOR_PORTS}" ;;
+  esac
+fi
+
+mkdir -p "$TOR_HOME"
+
+ALL_PORTS=""
+for port in $TOR_PORTS; do
+  ALL_PORTS="$ALL_PORTS $port $((port + CONTROL_OFFSET))"
+done
+
+# ---------------- primitives ----------------
+
+port_busy() {
+  if (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
+get_exit_ip() {
+  curl -s --max-time "$IP_CHECK_TIMEOUT" --socks5-hostname "127.0.0.1:$1" "$IP_CHECK_URL" 2>/dev/null || true
+}
+
+kill_port_holders() {
+  local port="$1" pids="" p
+  command -v fuser >/dev/null 2>&1 && fuser -k -9 "${port}/tcp" >/dev/null 2>&1 || true
+  if command -v lsof >/dev/null 2>&1; then
+    pids="$(lsof -ti "tcp:${port}" -sTCP:LISTEN 2>/dev/null || true)"
+  fi
+  if [ -z "$pids" ] && command -v ss >/dev/null 2>&1; then
+    pids="$(ss -lptnH "sport = :${port}" 2>/dev/null | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u || true)"
+  fi
+  for p in $pids; do
+    [ "$p" = "$$" ] && continue
+    kill -9 "$p" 2>/dev/null || true
+  done
+}
+
+send_newnym() {
+  local ctrl="$1"
+  (
+    exec 3<>"/dev/tcp/127.0.0.1/${ctrl}" || exit 1
+    printf 'AUTHENTICATE\r\nSIGNAL NEWNYM\r\nQUIT\r\n' >&3
+  ) 2>/dev/null || return 1
+  return 0
+}
+
+write_torrc() {
+  local port="$1" conf="$2" data="$3"
+  cat >"$conf" <<EOF
+# Auto-generated by restart-tor.sh — one instance per SOCKS port.
+SocksPort 127.0.0.1:${port}
+SocksPolicy accept 127.0.0.1
+SocksPolicy reject *
+ControlPort 127.0.0.1:$((port + CONTROL_OFFSET))
+CookieAuthentication 0
+DataDirectory ${data}
+ClientOnly 1
+# Churn circuits instead of reusing one for up to 10 minutes.
+MaxCircuitDirtiness 10
+NewCircuitPeriod 15
+Log notice file ${TOR_HOME}/tor-${port}.log
+EOF
+}
+
+# ---------------- phase 1: record current exit IPs (proof baseline) ----------------
+if [ "$SKIP_IP_CHECK" != "1" ]; then
+  for port in $TOR_PORTS; do
+    if port_busy "$port"; then
+      ip="$(get_exit_ip "$port")"
+      [ -n "$ip" ] && echo "$ip" >"$TOR_HOME/last-exit-${port}"
+    fi
+  done
+fi
+
+# ---------------- phase 2: BLUNT FORCE KILL — nothing tor-shaped survives ----------------
+log "force-restarting Tor instances on:${TOR_PORTS}"
+command -v systemctl >/dev/null 2>&1 && systemctl stop tor tor@default 2>/dev/null || true
+command -v brew >/dev/null 2>&1 && brew services stop tor >/dev/null 2>&1 || true
+pkill -9 -x tor 2>/dev/null || true # ← the old script's guarantee, restored
+pkill -9 -x tor.real 2>/dev/null || true
+for port in $TOR_PORTS; do
+  pkill -9 -f "/torrc-${port}( |$)" 2>/dev/null || true
+  kill_port_holders "$port"
+  kill_port_holders $((port + CONTROL_OFFSET))
+done
+
+deadline=$((SECONDS + KILL_TIMEOUT))
+while :; do
+  busy=""
+  for port in $ALL_PORTS; do
+    port_busy "$port" && busy="$busy $port"
+  done
+  [ -z "$busy" ] && break
+  [ "$SECONDS" -ge "$deadline" ] && die "ports still held after SIGKILL:${busy} — something is respawning them; refusing to continue"
+  for port in $busy; do kill_port_holders "$port"; done
+  sleep 0.2
+done
+log "all ports confirmed free — every old circuit (and its guard) is dead."
+
+# ---------------- phase 3: wipe identity + relaunch ----------------
+for port in $TOR_PORTS; do
+  conf="$TOR_HOME/torrc-${port}"
+  data="$TOR_HOME/data-${port}"
+  mkdir -p "$data"
+  chmod 700 "$data"
+  if [ "$KEEP_STATE" != "1" ]; then
+    # `state` holds the sticky entry guards — killing it is what makes the
+    # PATH new, not just the process. Descriptor cache stays, so it's fast.
+    rm -f "$data/state" "$data/state.old"
+  fi
+  [ -f "$conf" ] || write_torrc "$port" "$conf" "$data"
+  nohup "$TOR_BIN" -f "$conf" >>"$TOR_HOME/tor-${port}.out" 2>&1 &
+  log "port ${port}: new tor launched (pid $!)"
+done
+
+# ---------------- phase 4: wait for the fleet (parallel, 200ms polls) ----------------
+remaining="$TOR_PORTS"
+deadline=$((SECONDS + BOOT_TIMEOUT))
+while [ -n "$remaining" ] && [ "$SECONDS" -lt "$deadline" ]; do
+  next=""
+  for port in $remaining; do
+    if port_busy "$port"; then
+      log "port ${port}: up"
+    else
+      next="$next $port"
+    fi
+  done
+  remaining="$next"
+  [ -n "$remaining" ] && sleep 0.2
+done
+if [ -n "$remaining" ]; then
+  for port in $remaining; do
+    log "last 20 lines of ${TOR_HOME}/tor-${port}.log:"
+    tail -n 20 "${TOR_HOME}/tor-${port}.log" 2>/dev/null || true
+  done
+  die "Tor did not answer on:${remaining} within ${BOOT_TIMEOUT}s — NOT starting the bot on a dead proxy"
+fi
+
+# ---------------- phase 5: NEWNYM + PROOF that the exit IP changed ----------------
+for port in $TOR_PORTS; do
+  send_newnym $((port + CONTROL_OFFSET)) || true
+done
+
+if [ "$SKIP_IP_CHECK" != "1" ]; then
+  if command -v curl >/dev/null 2>&1; then
+    for port in $TOR_PORTS; do
+      prev="$(cat "$TOR_HOME/last-exit-${port}" 2>/dev/null || true)"
+      new=""
+      tries=0
+      while [ "$tries" -lt "$MAX_IP_TRIES" ]; do
+        tries=$((tries + 1))
+        new="$(get_exit_ip "$port")"
+        if [ -z "$new" ]; then
+          log "port ${port}: exit-IP check unreachable (attempt ${tries}/${MAX_IP_TRIES})"
+          sleep 2
+          continue
+        fi
+        log "port ${port}: exit IP ${prev:-<unknown>} → ${new} (attempt ${tries})"
+        if [ -z "$prev" ] || [ "$new" != "$prev" ]; then
+          break
+        fi
+        log "port ${port}: SAME exit IP as before — forcing NEWNYM and retrying"
+        send_newnym $((port + CONTROL_OFFSET)) || true
+        sleep 2
+      done
+      if [ -n "$new" ]; then
+        echo "$new" >"$TOR_HOME/last-exit-${port}"
+        if [ -n "$prev" ] && [ "$new" = "$prev" ]; then
+          if [ "$REQUIRE_NEW_EXIT" = "1" ]; then
+            die "port ${port}: exit IP is STILL ${new} after ${MAX_IP_TRIES} attempts — refusing to claim a new circuit. (REQUIRE_NEW_EXIT=0 to continue anyway)"
+          fi
+          log "WARNING: port ${port}: exit IP unchanged (${new}) — proceeding because REQUIRE_NEW_EXIT=0"
+        fi
+      else
+        if [ "$REQUIRE_NEW_EXIT" = "1" ]; then
+          die "port ${port}: could not verify exit IP at all — refusing to claim a new circuit. (SKIP_IP_CHECK=1 to disable)"
+        fi
+        log "WARNING: port ${port}: could not verify exit IP — proceeding because REQUIRE_NEW_EXIT=0"
+      fi
+    done
+  else
+    log "WARNING: curl not found — exit-IP proof skipped (install curl for the guarantee)"
+  fi
+fi
+
+log "done — new guard + new circuit + verified exit IP per instance."
+
+if [ "$TOR_ONLY" -eq 1 ]; then
+  exit 0
+fi
 exec node bot.js

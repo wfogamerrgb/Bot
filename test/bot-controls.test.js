@@ -1,7 +1,10 @@
 'use strict'
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const { readDelayMs, readInt, readNumber, parseDumpMode, parseDataArgs, parseCratesAllDump, parseCratesAllAfk, parseCratesAllFlags, shuffledCopy, createSlowBroadcast, createSlowBroadcastManager, parseProxyGroups, resolveBotProxy, hasProxyAuth, proxyAuthHeader, buildHttpConnectRequest, describeProxy, resolveLoginPassword, parseBotPasswords, classifyAuthReply, nextAuthFailure, isAuthBlocked, findIgnoredProxyGroupVars } = require('../bot-controls')
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
+const { readDelayMs, readInt, readNumber, parseDumpMode, parseDataArgs, parseCratesAllDump, parseCratesAllAfk, parseCratesAllFlags, shuffledCopy, createSlowBroadcast, createSlowBroadcastManager, parseChatGameRange, parseChatGameEquation, isChatGameEnd, createChatGameManager, parseProxyGroups, resolveBotProxy, hasProxyAuth, proxyAuthHeader, buildHttpConnectRequest, describeProxy, resolveLoginPassword, resolveFallbackPassword, parseBotPasswords, classifyAuthReply, nextAuthFailure, isAuthBlocked, findIgnoredProxyGroupVars, destructiveCommandEffect, createCommandConfirmation, parseItemGlobs, itemMatchesGlobs, parseRewardSlots, parseScript, parseScriptLine, selectScriptBots, listBotScripts, loadBotScript, parseTorControlPorts, deriveTorControlPorts, sendTorSignal, commandSuggestions } = require('../bot-controls')
 
 function clock() {
   let time = 0, sequence = 0
@@ -44,6 +47,27 @@ test('parseDumpMode flags a typo instead of silently starting a TPA dump', () =>
   assert.deepEqual(parseDumpMode('hidden'), { mode: 'hidden', unknown: null })
   assert.deepEqual(parseDumpMode('cancel'), { mode: 'cancel', unknown: null })
   assert.deepEqual(parseDumpMode('hiden'), { mode: 'tpa', unknown: 'hiden' })
+})
+
+test('destructiveCommandEffect names the fleet-killers and nothing else', () => {
+  assert.equal(destructiveCommandEffect('/exit'), 'kills the bot process and disconnects every bot')
+  for (const cmd of ['/all /dc', '/all-slow /dc', '/all-slow 30 /dc', '/all-slow 500ms /disconnect', '/all /dc now']) {
+    assert.equal(destructiveCommandEffect(cmd), 'disconnects every bot at once', cmd)
+  }
+  for (const cmd of ['/dc', '/status', '/all /status', '/all !hello', '/exitish', '/alliance', '', undefined]) {
+    assert.equal(destructiveCommandEffect(cmd), null, String(cmd))
+  }
+})
+
+test('createCommandConfirmation runs only on an exact repeat inside the window', () => {
+  let now = 0
+  const confirm = createCommandConfirmation(60000, () => now)
+  assert.equal(confirm.confirm('/exit'), false, 'first run warns')
+  assert.equal(confirm.confirm('/all /dc'), false, 'a different command warns too')
+  assert.equal(confirm.confirm('/exit'), true, 'the exact repeat confirms')
+  assert.equal(confirm.confirm('/exit'), false, 'a confirmation is one-shot')
+  now = 120000
+  assert.equal(confirm.confirm('/exit'), false, 'an expired window warns again')
 })
 
 test('crates-all dump= picks the dump step, and a bare value is a TPA target', () => {
@@ -150,6 +174,265 @@ test('empty broadcast finishes without a timer', () => {
   assert.equal(c.timers.size, 0)
 })
 
+// ── Tor control (fresh circuits) ───────────────────────────────────────────
+
+test('parseTorControlPorts reads a messy list and deriveTorControlPorts keeps local instances only', () => {
+  assert.deepEqual(parseTorControlPorts('9051,9151 9251;9051'), [9051, 9151, 9251])
+  assert.deepEqual(parseTorControlPorts(''), [])
+  assert.deepEqual(parseTorControlPorts('0,70000,abc,-1, 9051'), [9051], 'junk and out-of-range entries are dropped')
+  assert.deepEqual(parseTorControlPorts(null), [])
+  // The convention is scripts/restart-tor.sh's: control port = SOCKS + 1.
+  assert.deepEqual(deriveTorControlPorts(
+    [{ host: '127.0.0.1', port: 9150 }, { host: 'localhost', port: 9250 }, { host: 'proxy.example.com', port: 1080 }],
+    { host: '127.0.0.1', port: 9050 }
+  ), [9151, 9251, 9051])
+  assert.deepEqual(deriveTorControlPorts([{ host: '10.0.0.5', port: 9050 }], null), [], 'a remote proxy is nobody we can signal')
+  assert.deepEqual(deriveTorControlPorts([{ host: '127.0.0.1', port: 9050 }, { host: 'localhost', port: 9050 }], null, 2), [9052], 'the same instance is listed once')
+  assert.deepEqual(deriveTorControlPorts([], { host: 'localhost', port: 65535 }), [], 'offsetting past 65535 is not a port')
+})
+
+test('sendTorSignal authenticates and signals, and a dead or rude port is a result not a throw', async () => {
+  const net = require('node:net')
+  const listen = handler => new Promise(resolve => {
+    const server = net.createServer(handler)
+    server.listen(0, '127.0.0.1', () => resolve(server))
+  })
+  const close = server => new Promise(resolve => server.close(resolve))
+  const withServer = async (handler, fn) => {
+    const server = await listen(handler)
+    try { return await fn(server.address().port) } finally { await close(server) }
+  }
+
+  // The real conversation: AUTHENTICATE + SIGNAL + QUIT go out together, and
+  // both 250 answers come back before the connection closes.
+  await withServer(sock => sock.on('data', () => { sock.write('250 OK\r\n250 OK\r\n'); sock.end() }), async port => {
+    const result = await sendTorSignal(port)
+    assert.equal(result.ok, true, JSON.stringify(result))
+    assert.equal(result.port, port)
+    assert.match(result.reply, /250/)
+  })
+
+  await withServer(sock => sock.on('data', () => { sock.write('515 Authentication failed\r\n'); sock.end() }), async port => {
+    const result = await sendTorSignal(port)
+    assert.equal(result.ok, false, 'a refused AUTHENTICATE is a failure')
+    assert.match(result.error, /515/)
+  })
+
+  // The fake control port reads but never answers. It must consume the socket
+  // data — an ignored (paused) socket never sees the client's FIN, and the
+  // server would linger forever.
+  await withServer(sock => sock.on('data', () => {}), async port => {
+    const result = await sendTorSignal(port, { timeoutMs: 50 })
+    assert.equal(result.ok, false, 'a silent port times out instead of hanging')
+    assert.match(result.error, /no reply/)
+  })
+
+  // Nothing is listening: ECONNREFUSED comes back as a result too.
+  const spare = await listen(_sock => {})
+  const deadPort = spare.address().port
+  await close(spare)
+  const refused = await sendTorSignal(deadPort)
+  assert.equal(refused.ok, false)
+  assert.ok(refused.error, 'the failure says why')
+})
+
+// ── Chat games (guess the number) ──────────────────────────────────────────
+
+test('parseChatGameRange reads hint lines and never reads a countdown as a range', () => {
+  assert.deepEqual(parseChatGameRange('Hint: 1-15 | Reward: $2,500'), { min: 1, max: 15 })
+  assert.deepEqual(parseChatGameRange('\u2726 Hint: 1 \u2013 15 | Reward: $2,500'), { min: 1, max: 15 })
+  assert.deepEqual(parseChatGameRange('Guess a number between 3 and 9'), { min: 3, max: 9 })
+  assert.deepEqual(parseChatGameRange('Guess the number: 1-15'), { min: 1, max: 15 })
+  assert.deepEqual(parseChatGameRange('Hint: 15-1'), { min: 1, max: 15 }, 'a reversed range is normalized')
+  assert.equal(parseChatGameRange('A chat event has started! You have 20 seconds to guess the number'), null, 'a countdown is not a range')
+  assert.equal(parseChatGameRange('Reward: $2,500'), null, 'a price is not a range')
+  assert.equal(parseChatGameRange(''), null)
+  assert.equal(parseChatGameRange(null), null)
+})
+
+test('isChatGameEnd ends a round on a reveal or wrap-up but never on the prompt', () => {
+  for (const line of ['The correct number was 7!', 'Steve guessed the number!', 'The chat event has ended', 'Nobody guessed the number in time']) {
+    assert.equal(isChatGameEnd(line), true, line)
+  }
+  for (const line of ['A chat event has started! You have 20 seconds to guess the number', 'Hint: 1-15 | Reward: $2,500', 'Hypr7_C0re won a coinflip for $50,000']) {
+    assert.equal(isChatGameEnd(line), false, line)
+  }
+})
+
+test('the chat game manager covers the range once, in random order, from random pool bots', () => {
+  const c = clock()
+  const guesses = []
+  // Fixed-seed LCG: deterministic enough to assert on, random enough that the
+  // order is not the sorted one.
+  let seed = 12345
+  const random = () => (seed = (seed * 16807) % 2147483647) / 2147483647
+  const job = createChatGameManager({ ...c, random, submit: (id, n) => { guesses.push([id, n]); return true } })
+  job.feed('A chat event has started! You have 20 seconds to guess the number', { bots: ['A', 'B', 'C', 'D', 'E'], intervalMs: 100, maxBots: 3 })
+  assert.equal(job.running, false, 'a countdown alone starts nothing')
+  assert.equal(guesses.length, 0)
+  job.feed('Hint: 1-5 | Reward: $2,500', { bots: ['A', 'B', 'C', 'D', 'E'], intervalMs: 100, maxBots: 3 })
+  assert.equal(job.running, true)
+  assert.equal(guesses.length, 1, 'the first guess fires immediately — the round clock is ticking')
+  c.tick(1000)
+  const values = guesses.map(([, n]) => n)
+  assert.deepEqual([...values].sort((a, b) => a - b), [1, 2, 3, 4, 5], 'every number in range exactly once')
+  assert.notDeepEqual(values, [1, 2, 3, 4, 5], 'in random order, not 1, 2, 3, 4, 5')
+  const senders = new Set(guesses.map(([id]) => id))
+  assert.equal(senders.size > 1, true, 'more than one bot sends guesses')
+  assert.deepEqual([...senders].sort(), [...senders].filter(id => ['A', 'B', 'C'].includes(id)).sort(), 'only the first maxBots connected bots are used')
+  assert.equal(job.running, false, 'the round ends when the range is covered')
+  assert.equal(c.timers.size, 0, 'and no timer is left behind')
+})
+
+test('a reveal stops the chat game cold, and a new prompt starts a fresh round', () => {
+  const c = clock(), guesses = []
+  const job = createChatGameManager({ ...c, submit: (id, n) => { guesses.push(n); return true } })
+  job.feed('Hint: 1-100', { bots: ['A'], intervalMs: 100 })
+  assert.equal(job.running, true)
+  job.feed('The correct number was 37!')
+  assert.equal(job.running, false, 'the reveal ends the round')
+  const sent = guesses.length
+  c.tick(10000)
+  assert.equal(guesses.length, sent, 'nothing is sent after the reveal')
+  job.feed('Hint: 3-4', { bots: ['A'], intervalMs: 100 })
+  assert.equal(job.running, true, 'a new prompt starts a new round')
+  c.tick(1000)
+  assert.deepEqual([...guesses.slice(sent)].sort((a, b) => a - b), [3, 4], 'with its own range')
+  assert.equal(job.running, false)
+})
+
+test('a chat game pool that cannot speak ends the round instead of spinning', () => {
+  const c = clock()
+  const job = createChatGameManager({ ...c, submit: () => false })
+  job.feed('Hint: 1-5', { bots: ['A', 'B'], intervalMs: 100 })
+  c.tick(10000)
+  assert.equal(job.running, false, 'every sender dead → the round gives up')
+  assert.equal(c.timers.size, 0)
+})
+
+// ── Chat games (equation rounds) ────────────────────────────────────────────
+
+test('parseChatGameEquation computes the exact value of the variable, never guesses', () => {
+  assert.deepEqual(parseChatGameEquation('Solve: 3x+5=20'), { equation: '3x+5=20', variable: 'x', answer: 5, answerText: '5' })
+  assert.equal(parseChatGameEquation('\u2726 Solve: 3x+5=20 | Reward: $2,500').answerText, '5', 'the round banner is a prompt')
+  assert.equal(parseChatGameEquation('Solve for x: 2x-4=10').answerText, '7')
+  assert.equal(parseChatGameEquation('Quick math! 3(x+2)=15 | Reward: $1,000').answerText, '3', 'a factored side is distributed exactly')
+  assert.equal(parseChatGameEquation('What is x? 5x=25').answerText, '5')
+  assert.equal(parseChatGameEquation('Solve: x/2=4').answerText, '8')
+  assert.equal(parseChatGameEquation('Solve: 0.5x=3').answerText, '6', 'decimals are rationals, not guesses')
+  assert.equal(parseChatGameEquation('Solve: 2x+1=x+4').answerText, '3', 'variables on both sides')
+  assert.equal(parseChatGameEquation('Solve: 2x=7').answerText, '3.5', 'a non-integer answer is exact')
+  assert.equal(parseChatGameEquation('Solve: 2x+10=4').answerText, '-3', 'negative answers carry their sign')
+  assert.equal(parseChatGameEquation('Solve: 3x+5=20 (x=?)').answerText, '5', 'a "what is x" tag is not a second equation')
+  assert.equal(parseChatGameEquation('Solve: 3x+5=3x+9'), null, 'no unique solution — nothing is sent')
+  assert.equal(parseChatGameEquation('Solve: x=x'), null, 'an identity has no answer to compute')
+  assert.equal(parseChatGameEquation('Solve: x+y=5'), null, 'two variables — nothing is sent')
+  assert.equal(parseChatGameEquation('Solve: x^2=9'), null, 'non-linear is never guessed at')
+  assert.equal(parseChatGameEquation('Solve: 3x+5=?'), null, 'a blank is not an equation')
+  assert.equal(parseChatGameEquation('I think x = 5 lol'), null, 'player chatter is not a prompt')
+  assert.equal(parseChatGameEquation('Score = 5 | Reward: $100'), null, 'a scoreboard line is not an equation')
+  assert.equal(parseChatGameEquation('1+1=2'), null, 'nothing to solve')
+  assert.equal(parseChatGameEquation(''), null)
+  assert.equal(parseChatGameEquation(null), null)
+})
+
+test('isChatGameEnd also wraps up equation rounds before a reveal can be answered', () => {
+  for (const line of ['Nobody solved the equation in time', 'The correct answer was 5!', 'Steve solved the equation!', 'The answer was 5']) {
+    assert.equal(isChatGameEnd(line), true, line)
+  }
+})
+
+test('an equation round is answered exactly once, by one bot, with the computed answer', () => {
+  const c = clock(), sent = []
+  const job = createChatGameManager({ ...c, now: () => c.time, submit: (id, v) => { sent.push([id, v]); return true } })
+  job.feed('Solve: 3x+5=20 | Reward: $2,500', { bots: ['A', 'B', 'C', 'D'], maxBots: 3 })
+  assert.equal(sent.length, 1, 'exactly one message goes out')
+  assert.equal(sent[0][1], '5', 'the computed answer — just the number')
+  assert.equal(['A', 'B', 'C'].includes(sent[0][0]), true, 'from the first maxBots pool bots')
+  assert.equal(job.running, false, 'no number round is started')
+  job.feed('Solve: 3x+5=20 | Reward: $2,500', { bots: ['A', 'B', 'C', 'D'], maxBots: 3 })
+  assert.equal(sent.length, 1, 'a repeated banner line is not answered twice')
+  job.feed('Solve: 2x=10', { bots: ['A', 'B'], maxBots: 5 })
+  assert.equal(sent.length, 2, 'a new equation is a new round')
+  assert.equal(sent[1][1], '5')
+  assert.equal(c.timers.size, 0, 'an equation needs no timer')
+})
+
+test('an equation steals the round from a stale number game and skips dead bots', () => {
+  const c = clock(), sent = []
+  // Only B is connected: the manager walks the pool until a bot can speak,
+  // and only the message that actually goes out is recorded.
+  const job = createChatGameManager({ ...c, now: () => c.time, submit: (id, v) => {
+    if (id !== 'B') return false
+    sent.push([id, v])
+    return true
+  } })
+  job.feed('Hint: 1-100', { bots: ['A', 'B'], intervalMs: 100 })
+  assert.equal(job.running, true)
+  job.feed('Solve: 2x=10', { bots: ['A', 'B'], maxBots: 5 })
+  assert.equal(job.running, false, 'the stale number round is over')
+  assert.equal(sent.filter(([, v]) => v === '5').length, 1, 'still exactly one answer')
+  assert.equal(sent.find(([, v]) => v === '5')[0], 'B', 'it comes from the one bot that can speak')
+})
+
+// ── /ege allowlists & bot-scripts ─────────────────────────────────────────
+
+test('item globs keep enchanted golden apples out of the dispose list', () => {
+  const globs = parseItemGlobs('experience_bottle,golden_apple,shield,totem_of_undying,*shulker_box')
+  const match = (name, displayName) => itemMatchesGlobs({ name, displayName: displayName || name }, globs)
+  assert.equal(match('golden_apple', 'Golden Apple'), true)
+  assert.equal(match('enchanted_golden_apple', 'Enchanted Golden Apple'), false, 'an exact glob must never eat the enchanted ones')
+  assert.equal(match('experience_bottle', 'Bottle o Enchanting'), true, 'the registry name is what matches')
+  assert.equal(match('shield'), true)
+  assert.equal(match('totem_of_undying', 'Totem of Undying'), true)
+  assert.equal(match('red_shulker_box', 'Red Shulker Box'), true, '*shulker_box catches every colour')
+  assert.equal(match('blue_shulker_box'), true)
+  assert.equal(match('diamond_sword', 'Diamond Sword'), false, 'only the allowed junk moves')
+  assert.equal(itemMatchesGlobs({ name: 'shield' }, []), false, 'an empty allowlist moves nothing')
+  assert.equal(itemMatchesGlobs(null, globs), false)
+})
+
+test('parseRewardSlots keeps order and drops junk', () => {
+  assert.deepEqual(parseRewardSlots('21,15,13,11'), [21, 15, 13, 11])
+  assert.deepEqual(parseRewardSlots(' 21 , nope , 15 '), [21, 15])
+  assert.deepEqual(parseRewardSlots(''), [])
+  assert.deepEqual(parseRewardSlots(undefined), [])
+})
+
+test('script lines carry target selectors and skip comments', () => {
+  assert.equal(parseScriptLine('# a comment'), null)
+  assert.equal(parseScriptLine('   '), null)
+  assert.equal(parseScriptLine('*123'), null, 'a selector with no command is ignored')
+  assert.deepEqual(parseScriptLine('hello'), { target: { kind: 'self', pattern: '' }, command: 'hello' })
+  assert.deepEqual(parseScriptLine('*123 /kits'), { target: { kind: 'match', pattern: '123' }, command: '/kits' })
+  assert.deepEqual(parseScriptLine('* say hi && sleep 1s && say bye'), { target: { kind: 'all', pattern: '' }, command: 'say hi && sleep 1s && say bye' })
+  assert.deepEqual(selectScriptBots('123', ['ab123cd', 'AB123', 'nope']), ['ab123cd', 'AB123'])
+  assert.deepEqual(selectScriptBots('', ['a', 'b']), ['a', 'b'], 'an empty pattern matches every name')
+  assert.equal(parseScript('# c\nhello\n\n*B one').length, 2)
+})
+
+test('loadBotScript reads a script and refuses to escape its folder', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bot-scripts-unit-'))
+  fs.writeFileSync(path.join(dir, 'demo.txt'), '# demo\nhello\n*B one\n')
+  const ok = loadBotScript(dir, 'demo')
+  assert.equal(ok.ok, true)
+  assert.equal(ok.steps.length, 2)
+  assert.deepEqual(listBotScripts(dir), ['demo'])
+  assert.equal(loadBotScript(dir, '../demo').ok, false, 'path tricks are rejected')
+  assert.equal(loadBotScript(dir, 'missing').ok, false)
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('command suggestions follow the web GUI match rule', () => {
+  const commands = { '/all <cmd>': 'broadcast', '/all-slow [d] <cmd>': 'slow', '/kits': 'claim', '/list': 'status' }
+  assert.deepEqual(commandSuggestions('/al', commands).map(m => m.key), ['/all <cmd>', '/all-slow [d] <cmd>'])
+  assert.deepEqual(commandSuggestions('/kits', commands).map(m => m.key), ['/kits'])
+  assert.deepEqual(commandSuggestions('/kits ', commands).map(m => m.key), ['/kits'], 'a trailing space never hides the match')
+  assert.deepEqual(commandSuggestions('hello', commands), [])
+  assert.deepEqual(commandSuggestions('/zzz', commands), [])
+})
+
+
 test('parseProxyGroups reads indexed PROXY_GROUP_N_* vars and stops at the first gap', () => {
   const env = {
     PROXY_GROUP_1_BOTS: 'Alice, Bob',
@@ -164,8 +447,8 @@ test('parseProxyGroups reads indexed PROXY_GROUP_N_* vars and stops at the first
   }
   const groups = parseProxyGroups(env)
   assert.deepEqual(groups, [
-    { index: 1, bots: ['Alice', 'Bob'], host: '1.2.3.4', port: 1081, type: 'http', user: '', pass: '', loginPassword: '' },
-    { index: 2, bots: ['Carol'], host: '5.6.7.8', port: 1080, type: 'socks5', user: '', pass: '', loginPassword: '' }
+    { index: 1, bots: ['Alice', 'Bob'], host: '1.2.3.4', port: 1081, type: 'http', user: '', pass: '', loginPassword: '', fallbackPassword: '' },
+    { index: 2, bots: ['Carol'], host: '5.6.7.8', port: 1080, type: 'socks5', user: '', pass: '', loginPassword: '', fallbackPassword: '' }
   ])
 })
 
@@ -239,9 +522,9 @@ test('parseProxyGroups gives each group its own credentials', () => {
     PROXY_GROUP_1_BOTS: 'Alice', PROXY_GROUP_1_HOST: '1.2.3.4', PROXY_GROUP_1_USER: 'alice', PROXY_GROUP_1_PASS: 'group-one-secret',
     PROXY_GROUP_2_BOTS: 'Bob', PROXY_GROUP_2_HOST: '5.6.7.8', PROXY_GROUP_2_PASS: 'password-only'
   })
-  assert.deepEqual(groups[0], { index: 1, bots: ['Alice'], host: '1.2.3.4', port: 1080, type: 'socks5', user: 'alice', pass: 'group-one-secret', loginPassword: '' })
+  assert.deepEqual(groups[0], { index: 1, bots: ['Alice'], host: '1.2.3.4', port: 1080, type: 'socks5', user: 'alice', pass: 'group-one-secret', loginPassword: '', fallbackPassword: '' })
   // A username-less group is legal — some SOCKS5 setups authenticate on the password alone.
-  assert.deepEqual(groups[1], { index: 2, bots: ['Bob'], host: '5.6.7.8', port: 1080, type: 'socks5', user: '', pass: 'password-only', loginPassword: '' })
+  assert.deepEqual(groups[1], { index: 2, bots: ['Bob'], host: '5.6.7.8', port: 1080, type: 'socks5', user: '', pass: 'password-only', loginPassword: '', fallbackPassword: '' })
 })
 
 test('parseProxyGroups accepts _PASSWORD as a spelling of _PASS, and _PASS wins when both are set', () => {
@@ -402,6 +685,25 @@ test('resolveLoginPassword puts a per-bot password above the group and the globa
   assert.deepEqual(resolveLoginPassword('BotThree', groups, env), { password: 'group-pw', source: 'PROXY_GROUP_1_LOGIN_PASSWORD' })
   assert.deepEqual(resolveLoginPassword('BotFour', groups, env), { password: 'also-own', source: 'BOT_PASSWORDS' })
   assert.deepEqual(resolveLoginPassword('Stranger', groups, env), { password: 'global-pw', source: 'LOGIN_PASSWORD' })
+})
+
+test('resolveFallbackPassword finds the group fallback, then the global one, else null', () => {
+  const groups = parseProxyGroups({
+    PROXY_GROUP_1_BOTS: 'Alice,Bob', PROXY_GROUP_1_HOST: '1.2.3.4',
+    PROXY_GROUP_1_LOGIN_PASSWORD: 'group-pw', PROXY_GROUP_1_FALLBACK_LOGIN_PASSWORD: 'group-fallback',
+    PROXY_GROUP_2_BOTS: 'Carol', PROXY_GROUP_2_HOST: '5.6.7.8', PROXY_GROUP_2_LOGIN_PASSWORD: 'pw'
+  })
+  assert.equal(groups[0].fallbackPassword, 'group-fallback', 'parsed next to the primary password')
+  const env = { LOGIN_PASSWORD_FALLBACK: 'global-fallback' }
+  // The group's fallback beats the global one…
+  assert.deepEqual(resolveFallbackPassword('Alice', groups, env), { password: 'group-fallback', source: 'PROXY_GROUP_1_FALLBACK_LOGIN_PASSWORD' })
+  // …a group without one falls through to the global fallback…
+  assert.deepEqual(resolveFallbackPassword('Carol', groups, env), { password: 'global-fallback', source: 'LOGIN_PASSWORD_FALLBACK' })
+  assert.deepEqual(resolveFallbackPassword('Zed', groups, env), { password: 'global-fallback', source: 'LOGIN_PASSWORD_FALLBACK' })
+  // …and with nothing configured there is nothing to fall back to, so the
+  // failure guard behaves exactly as it did before this existed.
+  assert.equal(resolveFallbackPassword('Zed', groups, {}), null)
+  assert.equal(resolveFallbackPassword('Zed', [], { LOGIN_PASSWORD_FALLBACK: '' }), null)
 })
 
 test('classifyAuthReply recognises the real failure wordings and nothing else', () => {

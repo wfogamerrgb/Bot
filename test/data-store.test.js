@@ -96,9 +96,10 @@ test('roundPublished keeps two decimals and ignores non-numbers', () => {
 
 // A location object used to land in one cell as {"x":1,"y":64,"z":-3}, which
 // cannot be filtered, sorted, plotted, or diffed.
-// ── Ban hold ────────────────────────────────────────────────────────────────
+// ── Ban flag lifecycle ─────────────────────────────────────────────────────
 
-// The gate that stops a banned account from reconnect-storming the server.
+// Reporting only (the removed list is what gates connecting): a ban flag stays
+// until its expiry passes, and the sweep is what clears it.
 test('a ban is held until it expires, and a permanent ban is held forever', () => {
   const now = 1_000_000
   const live = store.isBanActive({ banned: true, banExpiresAt: now + 60_000 }, now)
@@ -108,7 +109,7 @@ test('a ban is held until it expires, and a permanent ban is held forever', () =
 
   const lapsed = store.isBanActive({ banned: true, banExpiresAt: now - 1 }, now)
   assert.equal(lapsed.held, false)
-  assert.equal(lapsed.expired, true, 'the sweep reconnects once this is true')
+  assert.equal(lapsed.expired, true, 'the sweep clears the flag once this is true')
 
   for (const row of [{ banned: true, banExpiresAt: 0 }, { banned: true }]) {
     const held = store.isBanActive(row, now)
@@ -151,9 +152,9 @@ test('recordBan keeps one row per bot and counts repeats', () => {
   assert.equal(state.bans.length, 2)
 })
 
-// The hold is file-backed: the bot row carries `banned` + `banExpiresAt`, and it
-// has to still be there after a restart or the bot would reconnect into a live ban.
-test('a ban hold survives a save/load round trip', () => {
+// The record is file-backed: the bot row carries `banned` + `banExpiresAt`, and
+// it has to still be there after a restart or the report silently resets.
+test('a ban record survives a save/load round trip', () => {
   const file = path.join(os.tmpdir(), `data-store-bans-${process.pid}-${Date.now()}.json`)
   const state = store.emptyState()
   store.upsertBot(state, { bot: 'A', banned: true, bannedAt: 1000, banKind: 'temporary', banReason: 'alt farming', banExpiresAt: 9_999_999_999_999 })
@@ -163,15 +164,15 @@ test('a ban hold survives a save/load round trip', () => {
   fs.unlinkSync(file)
 
   assert.equal(reloaded.bans.length, 1, 'the Bans-tab roster is saved too')
-  const hold = store.isBanActive(reloaded.bots.A)
-  assert.equal(hold.held, true, 'a restart must not walk back into the ban')
-  assert.equal(hold.expiresAt, 9_999_999_999_999)
+  const record = store.isBanActive(reloaded.bots.A)
+  assert.equal(record.held, true, 'a restart must keep reporting the ban')
+  assert.equal(record.expiresAt, 9_999_999_999_999)
 })
 
-test('a bans roster row is distinguishable from a bot hold row', () => {
+test('a bans roster row is distinguishable from a bot report row', () => {
   const state = store.emptyState()
   store.recordBan(state, { bot: 'A', kind: 'permanent', reason: 'cheating', permanent: true })
-  // bans[] rows describe history; only the bot row gates reconnecting.
+  // bans[] rows describe history; only the bot row carries the live report flag.
   assert.equal(store.isBanActive(state.bans[0]).held, false)
   assert.equal(store.isBanActive({ banned: true, banExpiresAt: 0 }).held, true)
 })

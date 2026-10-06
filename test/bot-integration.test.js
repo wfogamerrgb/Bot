@@ -29,12 +29,24 @@ function runtime(env = {}) {
   // Its own cron state file per runtime: `/cron add` now persists jobs, and a
   // shared path would leak jobs between tests (and write into the repo).
   const cronStateFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'bot-cron-')), 'cron-jobs.json')
+  // Same isolation for the persistent state files: tests mutate dataState and
+  // trigger real saves (saveState writes DATA_FILE via a tmp file), and those
+  // must land in a temp dir — never in the repo, and never in a live install's
+  // data/ directory (root-owned on the server: "EACCES ... data/spawner-data
+  // .json.tmp", which failed 'the removed list gates reconnecting…').
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bot-data-'))
+  const stateEnv = {
+    DATA_FILE: path.join(stateDir, 'spawner-data.json'),
+    REMOVED_BOTS_FILE: path.join(stateDir, 'removed-bots.json'),
+    TIMESERIES_FILE: path.join(stateDir, 'timeseries.jsonl'),
+    TIMESERIES_SUMMARY_FILE: path.join(stateDir, 'timeseries-summary.json')
+  }
   const processMock = {
     // MC_WEB_AUTO_BUILD is forced off here (the app default is ON): with it on,
 // a /play request for an unbuilt client would clone and build the real
 // multi-GB upstream client from the test suite. Tests that need a build point
 // MC_WEB_CLIENT_DIR at a temp dir instead.
-  env: { BOT_NAMES: 'A,B,C', WEB_GUI: 'true', TUI_GUI: 'false', WEB_PASSWORD: 'test-only', WEB_TERMINAL_LOG: 'false', MC_WEB_AUTO_BUILD: 'false', CRON_STATE_FILE: cronStateFile, ...env },
+  env: { BOT_NAMES: 'A,B,C', WEB_GUI: 'true', TUI_GUI: 'false', WEB_PASSWORD: 'test-only', WEB_TERMINAL_LOG: 'false', MC_WEB_AUTO_BUILD: 'false', CRON_STATE_FILE: cronStateFile, ...stateEnv, ...env },
     stdout: { isTTY: false, write() {} }, stderr: { write() {} },
     on() {}, exit() {}, memoryUsage: () => ({ rss: 0, heapUsed: 0 }), uptime: () => 1
   }
@@ -61,6 +73,9 @@ function runtime(env = {}) {
         ...controls,
         createSlowBroadcast: () => controls.createSlowBroadcast({ setTimer, clearTimer }),
         createSlowBroadcastManager: () => controls.createSlowBroadcastManager({ setTimer, clearTimer }),
+        // Same reason as the broadcasts: the chat-game round must tick on the
+        // harness clock, not on real setTimeout.
+        createChatGameManager: (opts = {}) => controls.createChatGameManager({ ...opts, setTimer, clearTimer }),
         // bot-controls reads the real process.env by default, but inside this
         // harness bot.js reads processMock.env — so the group vars have to be
         // parsed from the same object bot.js sees, exactly as they would be in
@@ -194,8 +209,33 @@ test('actual router handles slow chat, removed/offline bots, local arguments, an
   r.run(`bots.C.bot.entity = {}; runCrateRoutine = (id, color) => chats.push([id, color]); handleCommand('/all-slow /crates purple')`)
   assert.deepEqual(plain(r.context.chats.at(-1)), ['A', 'purple_shulker_box'])
   tick(); assert.deepEqual(plain(r.context.chats.at(-1)), ['C', 'purple_shulker_box'])
-  r.run(`handleCommand('/all-slow hello'); handleCommand('/exit')`)
+  r.run(`handleCommand('/all-slow hello'); handleCommand('/exit'); handleCommand('/exit')`)
   assert.equal(r.run('slowBroadcast.running'), false)
+})
+
+test('destructive commands warn first and run only on an exact repeat', () => {
+  const r = runtime({ ALL_SLOW_DELAY_MS: '25' })
+  const allLogs = () => r.run(`Object.values(bots).flatMap(b => b.logs.map(l => l.text)).join('|')`)
+  // First /exit only warns: no exit timer is scheduled and dispatches survive.
+  r.run(`handleCommand('/all-slow !hello'); handleCommand('/exit')`)
+  assert.match(allLogs(), /DO NOT RUN/)
+  assert.ok([...r.timers.values()].every(t => t.delay !== 300), 'first /exit must not schedule the exit')
+  assert.equal(r.run('slowBroadcast.running'), true, 'first /exit must not cancel pending dispatches')
+  // The identical command again is the explicit go-ahead.
+  r.run(`handleCommand('/exit')`)
+  assert.ok([...r.timers.values()].some(t => t.delay === 300), 'repeated /exit runs')
+  assert.equal(r.run('slowBroadcast.running'), false)
+})
+
+test('/all /dc disconnects nothing until the exact command is repeated', () => {
+  const r = runtime()
+  const allLogs = () => r.run(`Object.values(bots).flatMap(b => b.logs.map(l => l.text)).join('|')`)
+  r.run(`handleCommand('/all /dc')`)
+  assert.match(allLogs(), /DO NOT RUN/)
+  assert.ok(!allLogs().includes('Disconnecting'), 'first /all /dc must not disconnect anyone')
+  assert.deepEqual(plain(r.context.chats), [], 'a guarded command never leaks to chat')
+  r.run(`handleCommand('/all /dc')`)
+  assert.match(allLogs(), /Disconnecting/, 'repeated /all /dc runs on every bot')
 })
 
 test('bare broadcasts give usage; normal /all stays immediate', () => {
@@ -387,7 +427,7 @@ test('the removed list gates reconnecting and /unban puts a bot back', () => {
   assert.equal(r.run('dropFromRoster("A")'), false, 'dropping it twice is harmless')
 
   // The commands must survive being called, and /unban must clear both the list
-  // and the ban hold (otherwise the next reconnect is held again).
+  // and the ban flag (otherwise the data file keeps reporting a ban).
   r.run(`handleCommand('/removed')`)
   r.run(`handleCommand('/unban')`)
   r.run(`handleCommand('/unban ghost')`)
@@ -396,26 +436,175 @@ test('the removed list gates reconnecting and /unban puts a bot back', () => {
   r.run('dataState.bots.A = { banned: true, banKind: "permanent", banExpiresAt: 0 }')
   r.run(`handleCommand('/unban A')`)
   assert.equal(r.run('removedEntryFor("A")'), null, 'the bot is off the removed list')
-  assert.equal(r.run('dataState.bots.A.banned'), false, 'and its ban hold is cleared')
+  assert.equal(r.run('dataState.bots.A.banned'), false, 'and its ban flag is cleared')
 
   assert.equal(r.run('PERMANENT_BAN_ACTION'), 'remove', 'a permanent ban defaults to leaving the roster')
 })
 
-// activeBan is what both the startup loop and scheduleReconnect ask before
-// dialling, so it is worth pinning down through bot.js rather than only in isolation.
-test('activeBan holds a live ban and releases an expired one', () => {
+// The connect gate is removed-bots.json and nothing else. Ban flags in the data
+// file are reporting — a flagged bot must keep dialling, or one bad verdict (or
+// a stale flag left in data/ from an old session) strands the account forever.
+test('only the removed list blocks connecting; data-file ban flags do not', () => {
   const r = runtime()
   r.run(`
+    dataState.bots.A = { banned: true, banKind: 'temporary', banExpiresAt: Date.now() + 60000 }
     dataState.bots.B = { banned: true, banKind: 'permanent', banExpiresAt: 0 }
-    dataState.bots.C = { banned: true, banKind: 'temporary', banExpiresAt: Date.now() - 1000 }
-    dataState.bots.D = { banned: true, banKind: 'temporary', banExpiresAt: Date.now() + 60000 }
   `)
-  assert.equal(r.run('activeBan("B").permanent'), true, 'no expiry is a permanent hold')
-  assert.equal(r.run('activeBan("C")'), null, 'an elapsed ban is no longer held')
-  assert.equal(r.run('activeBan("D").permanent'), false)
-  assert.ok(r.run('activeBan("D").expiresAt') > Date.now())
-  assert.equal(r.run('activeBan("A")'), null, 'an unbanned bot is never held')
+  assert.equal(r.run('connectBlockReason("A")'), null, 'a live data-file ban flag is not a gate')
+  assert.equal(r.run('connectBlockReason("B")'), null, 'not even a permanent-looking one')
+
+  r.timers.clear()
+  r.run(`handleCommand('/reconnect')`)
+  assert.ok([...r.timers.values()].some(t => t.delay === 1000), 'a data-banned bot is still reconnected on demand')
+
+  r.run(`removedBots = removedBotsStore.addRemovedBot(removedBots, { bot: 'B', kind: 'permanent', reason: 'cheating' }, { addedBy: 'ban-detection' }).list`)
+  assert.match(String(r.run('connectBlockReason("B")')), /removed list/, 'the removed list is the gate')
+  r.run(`handleCommand('/switch 2')`)
+  r.timers.clear()
+  r.run(`handleCommand('/reconnect')`)
+  assert.equal(r.timers.size, 0, 'a removed bot is never reconnected')
+  assert.match(r.run(`bots.B.logs.map(l => l.text).join('|')`), /removed list/)
 })
+
+// /unban-all empties the removed list and walks the bots back one at a time —
+// every restored bot at once would trip the server's login rate limit.
+test('/unban-all restores everyone with a stagger between reconnects', () => {
+  const r = runtime({ UNBAN_ALL_STAGGER_MS: '100' })
+  r.timers.clear()
+  r.run(`removedBots = removedBotsStore.addRemovedBot(removedBots, { bot: 'A', kind: 'permanent', reason: 'cheating' }, { addedBy: 'ban-detection' }).list`)
+  r.run(`removedBots = removedBotsStore.addRemovedBot(removedBots, { bot: 'B', kind: 'temporary', reason: 'alt farming' }, { addedBy: 'ban-detection' }).list`)
+  r.run(`dataState.bots.A = { banned: true, banKind: 'permanent', banExpiresAt: 0 }`)
+  r.run(`createBotInstance = (id) => chats.push([id, 'connect'])`)
+
+  r.run(`handleCommand('/unban-all')`)
+  assert.equal(r.run('removedBots.bots.length'), 0, 'the list is emptied')
+  assert.equal(r.run('dataState.bots.A.banned'), false, 'and the data-file report flags are cleared too')
+  assert.deepEqual([...r.timers.values()].map(t => t.delay).sort((a, b) => a - b), [0, 100], 'one reconnect per bot, UNBAN_ALL_STAGGER_MS apart — never all at once')
+
+  while (r.timers.size) { const t = [...r.timers.keys()][0]; r.timers.delete(t); t.fn() }
+  assert.deepEqual(plain(r.context.chats), [['A', 'connect'], ['B', 'connect']], 'both bots come back, each on its own timer')
+
+  // An empty list must not schedule anything.
+  r.timers.clear()
+  r.run(`handleCommand('/unban-all')`)
+  assert.equal(r.timers.size, 0, 'nothing to restore means nothing to reconnect')
+})
+
+// The chat-game default pace is a gameplay decision: too fast looks scripted.
+test('chat game guesses default to one every 350ms', () => {
+  const r = runtime()
+  assert.equal(r.run("settings.get('CHAT_GAME_GUESS_MS')"), 350)
+  const tuned = runtime({ CHAT_GAME_GUESS_MS: '50' })
+  assert.equal(tuned.run("settings.get('CHAT_GAME_GUESS_MS')"), 50, 'and stays overridable')
+})
+
+// The dashboard's "⟳ tor" button: per-port results, failures never throw.
+test('/api/tor/newnym and /tor-newnym report every control port', async () => {
+  const r = runtime({ TOR_CONTROL_PORTS: '59997' })
+  const cookie = await r.login()
+  const res = await r.request('/api/tor/newnym', '', cookie, 'POST')
+  assert.equal(res.status, 200)
+  const body = JSON.parse(res.body)
+  assert.equal(body.ok, false, 'a dead control port is a reported failure, not a crash')
+  assert.equal(body.results[0].port, 59997)
+  assert.ok(body.results[0].error, 'and it says why')
+
+  const result = await r.run(`handleCommand('/tor-newnym')`)
+  assert.equal(result.ok, false)
+  assert.equal(result.results.length, 1, 'the console command runs the same sweep')
+
+  const empty = runtime()
+  const bare = await empty.run(`handleCommand('/tor-newnym')`)
+  assert.equal(bare.ok, false)
+  assert.equal(bare.results.length, 0, 'with no local Tor there is nothing to signal — reported, not guessed at')
+})
+
+// The sweep only tidies reporting flags — it must never yank a connection
+// around (it used to force-reconnect, which could double up a live bot).
+test('the ban sweep clears lapsed flags without touching connections', () => {
+  const r = runtime()
+  r.timers.clear()
+  r.run(`
+    dataState.bots.A = { banned: true, banKind: 'temporary', banExpiresAt: Date.now() - 1000 }
+    dataState.bots.B = { banned: true, banKind: 'temporary', banExpiresAt: Date.now() + 60000 }
+    dataState.bots.C = { banned: true, banKind: 'permanent', banExpiresAt: 0 }
+  `)
+  r.run('releaseExpiredBans()')
+  assert.equal(r.run('dataState.bots.A.banned'), false, 'an elapsed flag is cleared')
+  assert.equal(r.run('dataState.bots.B.banned'), true, 'a live one is kept')
+  assert.equal(r.run('dataState.bots.C.banned'), true, 'a permanent one is kept')
+  assert.equal(r.timers.size, 0, 'clearing report flags must never force a reconnect')
+})
+
+// A "guess the number" chat game is answered by the fleet: every number in the
+// range exactly once, from more than one bot, as fast as the timer allows.
+test('chat game prompts are covered by the fleet in random order', () => {
+  const r = runtime()
+  r.timers.clear()
+  r.run(`feedChatGameLine('A chat event has started! You have 20 seconds to guess the number')`)
+  assert.equal(r.run('chatGame.running'), false, 'a countdown alone starts nothing')
+  r.run(`feedChatGameLine('\u2726 Hint: 1-15 | Reward: $2,500')`)
+  assert.equal(r.run('chatGame.running'), true)
+  let guard = 1000
+  while (r.timers.size && guard--) { const t = [...r.timers.keys()][0]; r.timers.delete(t); t.fn() }
+  const chats = plain(r.context.chats)
+  const values = chats.map(([, msg]) => Number(msg)).filter(Number.isFinite)
+  assert.deepEqual([...values].sort((a, b) => a - b), Array.from({ length: 15 }, (_, i) => i + 1), 'every number 1-15, exactly once')
+  assert.equal(new Set(chats.map(([id]) => id)).size > 1, true, 'from more than one bot')
+  assert.equal(r.run('chatGame.running'), false, 'the round ends when the range is covered')
+
+  // A reveal mid-round stops it after the guess already in flight.
+  r.timers.clear()
+  r.context.chats.length = 0
+  r.run(`feedChatGameLine('Hint: 1-100')`)
+  r.run(`feedChatGameLine('Steve guessed the number!')`)
+  while (r.timers.size) { const t = [...r.timers.keys()][0]; r.timers.delete(t); t.fn() }
+  assert.equal(r.context.chats.length, 1, 'only the immediate first guess is sent')
+  assert.equal(r.run('chatGame.running'), false)
+})
+
+// An equation round has ONE exact answer, so exactly ONE randomly chosen bot
+// says it — computed, never guessed, and never twice.
+test('an equation chat game is answered exactly once by one bot', () => {
+  const r = runtime()
+  r.timers.clear()
+  r.run(`feedChatGameLine('Solve: 3x+5=20 | Reward: $2,500')`)
+  const chats = plain(r.context.chats)
+  assert.equal(chats.length, 1, 'exactly one bot answers')
+  assert.equal(chats[0][1], '5', 'the computed value of x, just the number')
+  r.run(`feedChatGameLine('Solve: 3x+5=20 | Reward: $2,500')`)
+  assert.equal(plain(r.context.chats).length, 1, 'a repeated banner is not answered twice')
+  r.run(`feedChatGameLine('I think x = 5 lol')`)
+  assert.equal(plain(r.context.chats).length, 1, 'player chatter never triggers an answer')
+})
+
+// bot-scripts: one command per line, "*<fragment>" targets bots by name.
+test('/run-script runs lines in order with * targeting', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bot-scripts-'))
+  fs.writeFileSync(path.join(dir, 'demo.txt'), '# demo\nhello\n*B one\n* two\n')
+  const r = runtime({ BOT_SCRIPTS_DIR: dir })
+  r.timers.clear()
+  await r.run(`handleCommand('/run-script demo')`)
+  assert.deepEqual(plain(r.context.chats), [
+    ['A', 'hello'], ['B', 'one'], ['A', 'two'], ['B', 'two'], ['C', 'two']
+  ], 'bare lines run on the invoker, *name on matching bots, * on everyone')
+  const before = plain(r.context.chats).length
+  await r.run(`handleCommand('/run-script ../demo')`)
+  await r.run(`handleCommand('/run-script missing')`)
+  assert.equal(plain(r.context.chats).length, before, 'bad or missing scripts send nothing')
+  r.run(`handleCommand('/scripts')`)
+  assert.match(channelLogs(r, 'A'), /Scripts in/)
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('/ege stops politely when the bot is not spawned', () => {
+  const r = runtime()
+  r.run(`bots.A.bot.entity = null`)
+  r.run(`handleCommand('/ege')`)
+  assert.match(channelLogs(r, 'A'), /not currently spawned/)
+  assert.ok(!r.run('bots.A.inAppleRoutine') && !r.run('bots.A.appleRoutineRunning'), 'and no routine flag is left set')
+})
+
 
 test('item name helpers prefer anvil custom names and expose the alternative name', () => {
   const r = runtime()
@@ -650,7 +839,11 @@ test('/play-stop fully stops the client server and /play restarts it on the same
 })
 
 test('/play shows the build-not-found page when the client build is missing', async () => {
-  const r = runtime()
+  // Point MC_WEB_CLIENT_DIR at an EMPTY dir instead of relying on the real
+  // web-client/dist being unbuilt: once a developer (or CI) has run the build,
+  // the default dir contains a client — this test would fail AND leave a real
+  // server bound on the default port, which keeps the runner alive forever.
+  const r = runtime({ MC_WEB_AUTO_BUILD: 'false', MC_WEB_CLIENT_DIR: emptyDistDir() })
   const cookie = await r.login()
   const res = await r.request('/play', '', cookie, 'GET')
   assert.equal(res.status, 200)
@@ -1077,6 +1270,43 @@ test('a rejected login stops the bot answering prompts and alerts once', () => {
   assert.equal(r.authAlerts.length, 0, 'the guard itself does not alert; the chat handler does')
 })
 
+test('a rejected login with a fallback password gets it once, after the configured wait', () => {
+  const r = runtime({
+    PROXY_GROUP_1_BOTS: 'A', PROXY_GROUP_1_HOST: 'h',
+    PROXY_GROUP_1_LOGIN_PASSWORD: 'guess-one', PROXY_GROUP_1_FALLBACK_LOGIN_PASSWORD: 'guess-two',
+    AUTH_FALLBACK_DELAY_MS: '6000'
+  })
+  assert.equal(plan(r, 'A', LOGIN_PROMPT, 1000).command, '/login guess-one')
+
+  // The rejection is not recorded as a failure yet: the fallback is the point.
+  const rejected = plan(r, 'A', 'Wrong password!', 1100)
+  assert.equal(rejected.record, undefined)
+  assert.equal(rejected.alert, undefined)
+  assert.deepEqual(rejected.fallback, {
+    command: '/login guess-two', source: 'PROXY_GROUP_1_FALLBACK_LOGIN_PASSWORD', kind: 'login', delayMs: 6000
+  })
+
+  // A prompt during the wait is still answered with the fallback — the handler
+  // delays the send rather than skipping, so a re-prompting server is fine.
+  assert.equal(plan(r, 'A', LOGIN_PROMPT, 3000).command, '/login guess-two')
+
+  // The fallback gets exactly one shot: a second rejection is sticky, as before.
+  const second = plan(r, 'A', 'Wrong password!', 9200)
+  assert.equal(second.record.kind, 'bad-password')
+  assert.equal(second.record.until, null)
+  assert.equal(second.alert, true)
+  assert.equal(plan(r, 'A', LOGIN_PROMPT, 9300).skip.kind, 'bad-password')
+})
+
+test('a rejected /register retries the fallback as a registration too', () => {
+  const r = runtime({ LOGIN_PASSWORD_FALLBACK: 'second', AUTH_FALLBACK_DELAY_MS: '6000' })
+  assert.equal(plan(r, 'A', REGISTER_PROMPT, 1000).command, '/register 123456 123456')
+  const rejected = plan(r, 'A', 'Register failed', 1100)
+  assert.equal(rejected.fallback.command, '/register second second')
+  assert.equal(rejected.fallback.kind, 'register')
+  assert.equal(rejected.fallback.source, 'LOGIN_PASSWORD_FALLBACK')
+})
+
 test('a player typing a failure phrase, or a late one, cannot disable a bot', () => {
   const r = runtime({ LOGIN_PASSWORD: 'pw' })
   plan(r, 'A', LOGIN_PROMPT, 1000)
@@ -1436,6 +1666,10 @@ function dataEnv (env = {}) {
 function payingBot (id, balance, extra = {}) {
   const shards = extra.shards == null ? 1234 : extra.shards
   const coins = extra.coins == null ? 567 : extra.coins
+  // The live /bal reply changed wording ("Balance: $0.40" → "Payments | Your
+  // balance is $1k."), so the default answer uses the current format; pass
+  // moneyReply to exercise another shape (legacy wording, abbreviations).
+  const moneyReply = extra.moneyReply || `Payments | Your balance is $${balance}`
   return `(() => {
     const listeners = bots.__payingListeners || (bots.__payingListeners = [])
     bots.${id}.bot = {
@@ -1444,7 +1678,7 @@ function payingBot (id, balance, extra = {}) {
         chats.push(['${id}', msg])
         const reply = msg === '/shards' ? 'Shards | Balance: ${shards}'
           : msg === '/coins' ? 'Coins | Balance: ${coins}'
-            : /^\\/bal\\b/.test(msg) ? 'Balance: $${balance}'
+            : /^\\/bal\\b/.test(msg) ? '${moneyReply}'
               : null
         if (reply == null) return
         listeners.slice().forEach(fn => fn({ toString: () => reply }))
@@ -1454,6 +1688,43 @@ function payingBot (id, balance, extra = {}) {
     }
   })()`
 }
+
+test('queryBalance parses the live Payments reply, abbreviated amounts, and the legacy wording', async () => {
+  const r = runtime()
+
+  // The live /bal wording, with the server's abbreviated amount.
+  r.run(payingBot('A', 1000, { moneyReply: 'Payments | Your balance is $1k.' }))
+  assert.equal(await r.run('queryBalance("A", "Balance", "/bal")'), 1000)
+
+  // Abbreviations scale ($1.5m = 1500000) and commas still strip ($1,250).
+  r.run(payingBot('A', 0, { moneyReply: 'Payments | Your balance is $1.5m.' }))
+  assert.equal(await r.run('queryBalance("A", "Balance", "/bal")'), 1500000)
+  r.run(payingBot('A', 0, { moneyReply: 'Payments | Your balance is $1,250.' }))
+  assert.equal(await r.run('queryBalance("A", "Balance", "/bal")'), 1250)
+
+  // The legacy wording must keep parsing — servers roll out wording changes
+  // gradually and a downgrade would otherwise blind every balance consumer.
+  r.run(payingBot('A', 0, { moneyReply: 'Balance: $0.40' }))
+  assert.equal(await r.run('queryBalance("A", "Balance", "/bal")'), 0.4)
+
+  // Shards/Coins stay on the labelled wording.
+  r.run(payingBot('A', 0, { shards: 2500, coins: 12 }))
+  assert.equal(await r.run('queryBalance("A", "Shards", "/shards")'), 2500)
+  assert.equal(await r.run('queryBalance("A", "Coins", "/coins")'), 12)
+
+  // A pending money query must ignore labelled replies: production fires all
+  // three commands at once and every reply reaches every listener, so without
+  // the guard the money query would latch onto "Shards | Balance: 2500".
+  r.run(`(() => {
+    const listeners = bots.__payingListeners || (bots.__payingListeners = [])
+    bots.A.bot = { entity: {}, chat() {}, once() {}, removeListener() {},
+      on(event, fn) { if (event === 'message') listeners.push(fn) } }
+  })()`)
+  const money = r.run('queryBalance("A", "Balance", "/bal")')
+  r.run("bots.__payingListeners.slice().forEach(fn => fn({ toString: () => 'Shards | Balance: 2500' }))")
+  r.run("bots.__payingListeners.slice().forEach(fn => fn({ toString: () => 'Payments | Your balance is $7.' }))")
+  assert.equal(await money, 7)
+})
 
 // The coinflip commands only; a balance query is also chat traffic.
 const coinflipChats = (r) => plain(r.run("chats.filter(c => c[1].startsWith('/coinflip'))"))

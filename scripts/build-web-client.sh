@@ -46,6 +46,15 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 PROJECT_ROOT="$(pwd)"
 
+# Node 25+ removed buffer.SlowBuffer, which old build-time dependencies still
+# read at require time (buffer-equal-constant-time@1.0.1 via jwa: "TypeError:
+# Cannot read properties of undefined (reading 'prototype')" — this aborted
+# the whole build on Node 26). Preload a shim that restores the alias for every
+# Node process the build spawns (pnpm, tsx, rsbuild workers). Harmless on
+# older Node. See scripts/node-compat-slowbuffer.cjs.
+NODE_OPTIONS="--require \"$PROJECT_ROOT/scripts/node-compat-slowbuffer.cjs\"${NODE_OPTIONS:+ $NODE_OPTIONS}"
+export NODE_OPTIONS
+
 PHASE="${1:-all}" # all | prepare | build
 
 BUILD_DIR="web-client"

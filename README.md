@@ -1,5 +1,11 @@
 # Minecraft Multi-Bot Console
 
+> ## ⛔ DO NOT KILL or RUN `/exit`
+> `/exit`, `/all /dc`, and killing the `node bot.js` process end the **entire
+> fleet** at once. Guarded commands print `DO NOT RUN!` and only run when the
+> exact same command is repeated within 60 seconds. Read
+> **[DO-NOT-KILL.md](DO-NOT-KILL.md)** before touching anything.
+
 Node.js tools for running and supervising multiple Mineflayer bots. The main
 entry point, `bot.js`, provides both a browser dashboard and an optional
 terminal UI. `bot-rtp.js` is the exploration-oriented variant with RTP,
@@ -297,7 +303,7 @@ in a formula:
 | `banKind` | kick text | `permanent`, `temporary`, `blacklist`, or `suspected` |
 | `banReason` | kick text | The reason phrase (`Alt Farming (3rd)`), never the raw component tree |
 | `banDuration` | kick text | The stated length (`29 days, 11 hours, 17 minutes`) |
-| `banExpiresAt` | kick text | Real date the hold ends — blank for a permanent ban. This is the number the ban hold compares against |
+| `banExpiresAt` | kick text | Real date the flag clears — blank for a permanent ban. This is the number the ban sweep compares against |
 | `banCaseId` | kick text | The server's case id (`1129`) when its ban screen carries one |
 
 `spawnerCount` and `trackedSpawners` are deliberately separate columns: they used
@@ -625,9 +631,13 @@ check logs before retrying to avoid accidentally executing a command twice.
 | `AUTH_RETRY_MS` | `300000` | How long a throttled login waits before trying again |
 | `AUTH_ALREADY_MS` | `60000` | Pause after "already logged in"/"already registered" |
 | `AUTH_MAX_THROTTLED_RETRIES` | `2` | Throttled replies tolerated before it is treated as a wrong password |
+| `LOGIN_PASSWORD_FALLBACK` | empty | Second password tried once after a rejection, for bots no group fallback covers |
+| `AUTH_FALLBACK_DELAY_MS` | `6000` | Wait after a rejected `/login`/`/register` before the fallback password is sent |
 | `BOT_NAMES` | required | Comma-separated bot usernames |
 | `CONNECT_DELAY_MS` | `39500` | Delay between initial bot connections |
 | `CONNECT_DELAY_RANDOM_MS` | `0` | Additional random delay range |
+| `UNBAN_ALL_STAGGER_MS` | `30000` | Gap between the reconnects `/unban-all` schedules, so restored bots never hit the login at once |
+| `TOR_CONTROL_PORTS` | derived | Tor control ports for `/tor-newnym` and the dashboard's ⟳ tor button — empty = every local proxy SOCKS port + 1 (scripts/restart-tor.sh's convention) |
 | `MAX_RECONNECT` | `17` | Maximum normal reconnect attempts |
 | `SERVER_COMMAND` | empty | Command sent after spawn instead of compass navigation |
 | `CLICK_COMPASS` | empty | Set to enable compass activation after spawn |
@@ -659,6 +669,95 @@ GUI_ITEM_SEARCH_TERMS=legendary;crate|box
 
 This matches an item containing `legendary` and either `crate` or `box`. If no
 item matches, the bot falls back to `GUI_SLOT`.
+
+### Chat games (guess the number & equations)
+
+When the server announces a timed chat round — `CHAT GAME … A chat event has
+started! You have 20 seconds to guess the number … Hint: 1-15 | Reward: $2,500`
+— the fleet covers the whole range automatically. Every tick (default 350 ms,
+about three numbers per second) one random bot from the first `CHAT_GAME_MAX_BOTS`
+connected bots says one number that has not been guessed yet. The order is
+shuffled (never `1, 2, 3, 4`, which is trivially obvious to a watching admin),
+and the round stops the moment the range is covered or the server reveals the
+answer (`the correct number was …`, `… guessed the number!`, `nobody guessed`).
+Guesses are sent as plain chat — just the number, exactly as a player would.
+
+**Equation rounds** (`Solve: 3x+5=20 …`) work differently: there is one exact
+answer, so exactly **one** randomly chosen bot sends it — never a chorus of
+identical answers. The value of the variable is *computed*, never guessed, with
+exact rational arithmetic (`0.5x = 3` → `6`, `2x = 7` → `3.5`), and the answer
+is sent as plain chat — just the number. Anything that cannot be computed
+exactly (no unique solution, more than one variable, non-linear) is left
+silently unanswered. Prompt lines are recognized by prompt words (`Solve`,
+`Quick math`, `equation`, …) or the round banner's `Reward:` tag, so ordinary
+player chatter like `I think x = 5 lol` never triggers an answer.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CHAT_GAME_AUTO` | `true` | Auto-play detected "guess the number" and equation rounds |
+| `CHAT_GAME_GUESS_MS` | `350` | Gap between guesses — 350 ms is about three numbers per second |
+| `CHAT_GAME_MAX_BOTS` | `30` | How many connected bots (roster order) are used as guessers |
+
+All three are live: flip them from the dashboard's `.ENV` tab mid-round. Each
+round is logged to the system channel — the range, how many bots are guessing,
+and the numbers that were sent.
+
+### /enchanted-golden-apple-extract (`/ege`)
+
+The kit-extract loop. One pass per `EAPPLE_REWARD_SLOTS` entry, and each pass is:
+
+1. `/kits`, then left-click `EAPPLE_KIT_SLOT` (default `14`),
+2. wait `EAPPLE_STEP_DELAY_MS`, then left-click that pass's reward slot (`21`, `15`, `13`, `11` by default),
+3. wait, `/dispose`, and shift-click **only** the `EAPPLE_DISPOSE_ITEMS` junk into the dispose GUI — nothing else is ever moved.
+
+The allowlist is glob-matched against registry and display names: `golden_apple`
+is an **exact** match, so enchanted golden apples are never touched, and
+`*shulker_box` catches every coloured shulker. Set `EAPPLE_REWARD_SLOTS=21` to
+run a single pass, or reorder/add slots freely.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `EAPPLE_KIT_SLOT` | `14` | Slot clicked in the `/kits` GUI |
+| `EAPPLE_REWARD_SLOTS` | `21,15,13,11` | One pass per slot — the second click of each pass |
+| `EAPPLE_DISPOSE_ITEMS` | `experience_bottle,golden_apple,shield,totem_of_undying,*shulker_box` | Comma-separated globs moved into `/dispose`; `*` wildcards allowed |
+| `EAPPLE_STEP_DELAY_MS` | `1200` | Pause between GUI clicks and window opens |
+
+All four are live: change them from the dashboard's `.ENV` tab between runs.
+
+### bot-scripts (`/run-script`)
+
+Plain-text command lists in `bot-scripts/*.txt` — one command per line, `#`
+comments and blank lines skipped. `/run-script <name>` runs them in order, each
+line finishing before the next (a line that starts `/crates` waits for the
+routine). `/scripts` lists what is available.
+
+A line may open with a target selector:
+
+```text
+# the invoking bot says this alone
+hello from the script
+
+# every bot whose name contains "123" (case-insensitive)
+*123 hello there
+
+# every bot
+* bye
+
+# chains work inside a line
+*123 /warp afk && sleep 3s && sneak
+```
+
+- `*<fragment> <cmd>` — every bot whose name contains the fragment
+- `* <cmd>` — every bot
+- bare line — the bot that ran `/run-script`
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `BOT_SCRIPTS_DIR` | `bot-scripts` | Folder the `.txt` scripts live in |
+
+The terminal TUI now offers the same command help as the web GUI: typing `/`
+shows a live suggestion panel (command + description) above the input, and Tab
+cycles through the matches.
 
 ### Proxy
 
@@ -780,6 +879,10 @@ dashboard, the log file, or Discord.
 > changes the password it logs in with. Give a bot that has its own password a
 > `BOT_PASSWORD_<BOT>` entry and the move is harmless.
 
+> A group can also carry a **second** password, `PROXY_GROUP_<N>_FALLBACK_LOGIN_PASSWORD`,
+> tried once when the primary is rejected — useful for alt rosters where the
+> registration password is not known up front (see the next section).
+
 #### Rejected logins stop the bot instead of hammering the server
 
 A wrong password used to be retried forever: the bot answers every `/login` prompt it
@@ -812,6 +915,26 @@ chat), so the guard is deliberately narrow: a reply only counts as a failure if 
 sent an auth command within `AUTH_REPLY_WINDOW_MS`, and anything shaped like player chat
 (`Name: message`) is ignored. A player typing "wrong password" in chat cannot disable a
 bot.
+
+#### A fallback password gets exactly one try before any of that
+
+When the right password is not known up front — an alt roster where accounts were
+registered with one of two passwords — configure the second one and the bot works
+it out:
+
+```
+PROXY_GROUP_3_FALLBACK_LOGIN_PASSWORD=second-pw   # for this group's bots
+LOGIN_PASSWORD_FALLBACK=second-pw                 # for bots no group covers
+```
+
+A rejected `/login` or `/register` then sends the fallback **once**, after
+`AUTH_FALLBACK_DELAY_MS` (default 6000 ms), instead of recording a failure on the
+spot. If the fallback is rejected too, the sticky `bad-password` guard above takes
+over exactly as before — two wrong guesses are a configuration problem, not
+something to keep trying. Once the fallback has been sent it becomes that bot's
+password for the rest of the session, so a reconnect does not re-run the rejected
+primary and re-wait the delay. `/status` names the variable the password came
+from, as always.
 
 ### Web dashboard
 
@@ -877,11 +1000,17 @@ image, so you can rebuild the client inside a running container and it takes
 effect immediately:
 
 ```bash
+npm run minecraft             # the easy one: build if missing, then serve on :8090
 npm run web-client:build      # checkout upstream v2.3.0 + pnpm build → web-client/dist
 npm run web-client:serve      # optional standalone: serve it on :8090 by itself
 # inside a container (script ships in the image):
 docker exec <container> npm run web-client:build
 ```
+
+(`scripts/build-web-client.sh` also preloads `scripts/node-compat-slowbuffer.cjs`
+for every Node process it spawns: Node 25+ removed `buffer.SlowBuffer`, which
+old build-time deps like `buffer-equal-constant-time` still read at require
+time — without the shim the build dies on modern Node.)
 
 **Docker disk usage is kept small.** The Dockerfile runs the build in two
 cacheable phases — `prepare` (clone upstream + `pnpm install`, cached as its
@@ -1103,6 +1232,7 @@ Any unrecognized input is sent as a Minecraft chat message or command.
 | `/players` | List players visible to the active bot |
 | `/uptime` | Show uptime for every bot |
 | `/proxy` | Show proxy and stall-watchdog configuration |
+| `/tor-newnym` | Ask every local Tor instance (control port = SOCKS + 1) for fresh circuits — reconnects leave through a new path; live connections keep theirs |
 | `/switch <id>` | Select a bot by name or list number |
 | `/new-bot <name> [host] [port] [version]` | Create a bot at runtime |
 | `/chat <message>` | Send a chat message without local command parsing |
@@ -1117,7 +1247,8 @@ Any unrecognized input is sent as a Minecraft chat message or command.
 | `/reconnect-all-slow` | Reconnect all bots with a configurable stagger |
 | `/removed` | List the removed / permanently-banned bots |
 | `/auth-retry <bot>` | Clear a recorded login/register failure and reconnect so it can authenticate again |
-| `/unban <bot>` | Take a bot off the removed list and reconnect it |
+| `/unban <bot>` | Take a bot off the removed list, clear its ban flag, and reconnect it |
+| `/unban-all` | Empty the removed list and bring every removed bot back, reconnecting them `UNBAN_ALL_STAGGER_MS` apart so they never stampede the login |
 | `/closeBot` | Disconnect and remove the active bot |
 | `/dump` | TPA and deposit inventory into nearby chests |
 | `/crates [color]` | Run one crate collection cycle |
@@ -1268,10 +1399,18 @@ FreeLLM API. Three rules make it safe to leave running:
 2. **Only the quoted message is sent.** The model must answer as a single
    double-quoted string; that string is extracted and verified — cleaned up,
    word-limited (`AI_CHAT_WORD_LIMIT`), never starting with `/` or `.` — and
-   only a message that passes ever reaches public chat.
+   only a message that passes ever reaches public chat. Verification also
+   rejects an echo of a recent chat line (a reasoning model quoting the room
+   back is how the bot used to repeat players verbatim) and a persona refusal
+   wrapped in quotes ("im not redstonepro"), which format checks alone pass. The log shows the
+   model's **full** response on every attempt (`AI said: …`), so you can read
+   everything it wrote — game chat only ever sees the verified quote.
 3. **No prerecorded fallback.** If the API is down or produces nothing
    verifiable, the turn is skipped and reported; a canned line dropped into a
-   live conversation is worse than silence.
+   live conversation is worse than silence. Every failed turn is reported as
+   a red error (`✗ AI chat error: …`) — a model that fails or errors is never
+   silently skipped, and a model that errors on every attempt is reported as
+   `AI chat model failed …`, distinct from `no verifiable message`.
 
 ```text
 /ai-chat                    # start for the current bot
@@ -1654,16 +1793,15 @@ Think there's been a mistake? discord.gg/fatalmc
 
 which yields `kind: temporary`, `duration: 29 days, 11 hours, 17 minutes`, `reason: Alt Farming (3rd)`, `caseId: 1129`. The `reason` is the phrase a human wrote — it is what reaches the spreadsheet cell and the Discord embed, never a 1.5 KB JSON blob.
 
-#### The ban hold (it will not reconnect)
+#### Ban flags are reporting only (removed-bots.json is the gate)
 
-Once a bot is known to be banned it is **held**: no reconnect attempts, no backoff loop, no login storm against a server that has already thrown the account out.
+Once a bot is known to be banned the verdict is recorded in the data file — but **the record never stops the bot from connecting**. `removed-bots.json` (below) is the only thing that does that. A bad verdict or a stale flag left in `data/` must not strand an account with no way back short of hand-editing the data file, so a flagged bot keeps dialling exactly like any other.
 
-- **A temporary ban is held until its expiry.** The ban is a wall-clock fact, so the absolute time is what is stored — a 29-day ban cannot live in a `setTimeout`, and the number has to outlive the process. It does: it is written to the data file, so a restart does not walk straight back into the ban. A periodic sweep (`BAN_SWEEP_MS`, default 60 s) is what ends the hold, reconnecting the bot when the expiry passes.
-- **A permanent ban is never released**, and the bot is moved onto the **removed list** (see below). Nothing reconnects it, and it is recorded as `permanent` so it is distinguishable forever.
-- **An unstated length is not a permanent ban.** A `temporary` ban with no duration, or a `suspected` one, is retried after `BAN_RETRY_MS` (default 30 min) rather than written off — the server saying "temporarily" is not the same as it saying "forever".
-- **The first detection sets the clock.** Later kicks from the same ban cannot push the release time further out.
-- **The bot stays visible while held** — as `⛔ banned` in the dashboard and `/list` — rather than being silently deleted like `/closeBot`. If you would rather it disappear from the roster entirely, say so.
-- **Startup checks the file first**: a bot still inside its ban window is not connected at all, and says why.
+- **A temporary ban is reported until its expiry.** The ban is a wall-clock fact, so the absolute time is what is stored — a 29-day ban cannot live in a `setTimeout`, and the number outlives the process. A periodic sweep (`BAN_SWEEP_MS`, default 60 s) clears the flag once the expiry passes, so the dashboard and `/data` stop claiming the bot is banned.
+- **A permanent ban is never released automatically**, and the bot is moved onto the **removed list** (see below) — which is what actually stops it connecting. Nothing reconnects it until `/unban` (or `/unban-all` for the whole list), and it is recorded as `permanent` so it is distinguishable forever.
+- **An unstated length is not a permanent ban.** A `temporary` ban with no duration, or a `suspected` one, keeps its flag for `BAN_RETRY_MS` (default 30 min) rather than forever — the server saying "temporarily" is not the same as it saying "forever".
+- **The first detection sets the clock.** Later kicks from the same ban cannot push the clear time further out.
+- **The bot stays visible while flagged** — as `⛔ banned` in the dashboard and `/list` — rather than being silently deleted like `/closeBot`. If you would rather it disappear from the roster entirely, say so.
 
 A ban is surfaced in five places, all from the same verdict:
 
@@ -1682,8 +1820,8 @@ Three settings, all optional:
 | `BAN_MESSAGE_REGEX` | *(unset)* | Extra case-insensitive pattern for your server's own wording, e.g. `you have been removed from`. An invalid pattern is ignored with a startup warning. |
 | `DISCORD_BAN_COOLDOWN_MS` | `900000` | How long one ban alert suppresses repeats for the same bot and type |
 | `DISCORD_AUTH_COOLDOWN_MS` | `1800000` | How long one login-rejected alert suppresses repeats for the same bot and kind |
-| `BAN_SWEEP_MS` | `60000` | How often a held ban is checked for expiry |
-| `BAN_RETRY_MS` | `1800000` | Retry window for a ban whose length the server never stated |
+| `BAN_SWEEP_MS` | `60000` | How often recorded ban flags are checked for expiry |
+| `BAN_RETRY_MS` | `1800000` | How long a flag stays when the server never stated the ban's length |
 | `PERMANENT_BAN_ACTION` | `remove` | What a permanent ban does to the live roster: `remove` (like `/closeBot`) or `hold` (stays visible with the badge) |
 | `REMOVED_BOTS_FILE` | `removed-bots.json` | The removed / permanently-banned list |
 
@@ -1697,12 +1835,13 @@ A permanent ban means the account is gone, so the bot leaves the roster instead 
     "addedAt": 1758067200000, "addedBy": "ban-detection", "count": 1 } ] }
 ```
 
-The list outranks everything: a bot on it is not connected at startup **and** not reconnected, even while it is still named in `BOT_NAMES` — you get a warning saying so rather than silence. It is saved atomically like the other state files and matched case-insensitively, because a name arrives from `.env`, from a kick message, and from whatever you type.
+The list is the **only** connect gate: a bot on it is not connected at startup **and** not reconnected, even while it is still named in `BOT_NAMES` — you get a warning saying so rather than silence. Nothing in `data/` can block a connection; edit this file (or run `/unban` / `/unban-all`) to decide who stays out. It is saved atomically like the other state files and matched case-insensitively, because a name arrives from `.env`, from a kick message, and from whatever you type.
 
 | Command | Effect |
 | --- | --- |
 | `/removed` | List the removed / permanently-banned bots with each reason, case id, and when it was added |
-| `/unban <bot>` | Take one off the list, clear its ban hold, and reconnect it |
+| `/unban <bot>` | Take one off the list, clear its ban flag, and reconnect it |
+| `/unban-all` | Empty the whole list at once and walk every restored bot back in, `UNBAN_ALL_STAGGER_MS` apart |
 
 With the default `PERMANENT_BAN_ACTION=remove` the bot is also disconnected and dropped from the dashboard exactly like `/closeBot`, leaving the record in the `Bans` tab and Discord. Set `PERMANENT_BAN_ACTION=hold` to keep it visible with the `⛔ banned` badge instead.
 

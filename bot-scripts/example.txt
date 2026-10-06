@@ -1,0 +1,14 @@
+# bot-scripts/example.txt - run with: /run-script example
+# One command per line, in order. Blank lines and # comments are skipped.
+# Line targets: "*<fragment> <cmd>" = every bot whose name contains the fragment,
+# "* <cmd>" = every bot, a bare line = the bot that ran /run-script.
+# The chain syntax (&&, ;, sleep) works inside a line.
+
+# The invoking bot greets on its own
+hello from the script
+
+# Every bot whose name contains "Cyn" (example) says hi
+*Cyn hi everyone
+
+# Everyone: warp to afk, wait, then crouch twice (example chain)
+* /warp afk && sleep 3s && sneak
