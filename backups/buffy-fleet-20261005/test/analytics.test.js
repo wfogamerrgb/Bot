@@ -59,30 +59,6 @@ test('a chart with fewer than two points says so instead of drawing a line', () 
   assert.match(svg, /class="grid"/)
 })
 
-test('a chart carries its exact points for the hover and draws the crosshair', () => {
-  const svg = analytics.lineChart([
-    { t: T0, last: 200, perLast: 100, bots: 2, min: 95, max: 210, count: 3 },
-    { t: T0 + HOUR, last: 105, perLast: 105, bots: 1, min: 105, max: 105, count: 1 }
-  ], { label: 'Shards (fleet)', valueKey: 'perLast', bucketMs: HOUR, note: 'per bot' })
-  assert.match(svg, /chart-data/, 'the points travel with the chart')
-  assert.match(svg, /hoverline/)
-  assert.match(svg, /hoverdot/)
-  const data = JSON.parse(svg.match(/<script type="application\/json" class="chart-data">([\s\S]*?)<\/script>/)[1])
-  assert.equal(data.valueKey, 'perLast')
-  assert.equal(data.bucketMs, HOUR)
-  assert.deepEqual(data.points[0], { t: T0, v: 100, last: 200, per: 100, bots: 2, min: 95, max: 210, n: 3 })
-  assert.equal(data.points[1].v, 105, 'the per-bot line rises even though the fleet total fell')
-})
-
-test('the page script answers the hover with exact numbers', () => {
-  const html = analytics.renderHtml(analytics.buildReport({ coinflip: { stats: cf.computeStats([]), fairness: cf.analyzeFairness([]), recent: [] }, timeseries: { totalSamples: 0, bots: [], series: {}, summary: {}, events: { bans: [], ranks: [] } } }))
-  assert.match(html, /chart-tip/)
-  assert.match(html, /mousemove/)
-  assert.match(html, /return String\(v\)/, 'tooltips retain the raw numeric precision instead of rounding it')
-  assert.match(html, /data-tab="coinflip" data-loaded="1"/, 'first paint is not replaced with timeseries content')
-  assert.match(html, /var url = '\/api\/analytics'/, 'lazy deep tabs fetch the rendered HTML field')
-})
-
 test('the report has a headline that answers the questions at a glance', () => {
   const built = report()
   assert.equal(built.headline.coinflips, 3)

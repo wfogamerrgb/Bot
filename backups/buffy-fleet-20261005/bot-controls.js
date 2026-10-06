@@ -893,38 +893,6 @@ function describeProxy(proxy) {
   return `${type} ${creds}${proxy.host}:${proxy.port}`
 }
 
-// A selector is one exact name, an inclusive 1-based roster range, or an
-// inclusive exact-name range. Explicit name:a..b also handles hyphenated names.
-// Fail closed: an invalid/ambiguous selector must never become public chat.
-function parseBroadcastTargets (text, roster) {
-  const body = String(text || '').trim()
-  const split = body.search(/\s/)
-  const token = split < 0 ? body : body.slice(0, split)
-  const rest = split < 0 ? '' : body.slice(split).trim()
-  const exact = name => roster.findIndex(id => id.toLowerCase() === name.toLowerCase())
-  const single = exact(token)
-  if (single >= 0) return { ids: [roster[single]], body: rest, selected: true }
-  let ends = null
-  if (/^\d+-\d+$/.test(token)) ends = token.split('-').map(n => Number(n) - 1)
-  else if (token.startsWith('name:')) {
-    ends = token.slice(5).split('..').map(exact)
-  } else if (!token.startsWith('/') && !token.startsWith('!')) {
-    const pairs = []
-    for (let i = 1; i < token.length - 1; i++) {
-      if (token[i] !== '-') continue
-      const a = exact(token.slice(0, i)), b = exact(token.slice(i + 1))
-      if (a >= 0 && b >= 0) pairs.push([a, b])
-    }
-    if (pairs.length > 1) return { error: 'Ambiguous name range; use name:first..last.' }
-    if (pairs.length) ends = pairs[0]
-  }
-  if (!ends) return { ids: roster.slice(), body, selected: false }
-  if (ends.length !== 2 || ends.some(n => !Number.isSafeInteger(n) || n < 0 || n >= roster.length) || ends[0] > ends[1]) {
-    return { error: `Invalid bot range "${token}"; use ordered endpoints within 1–${roster.length}.` }
-  }
-  return { ids: roster.slice(ends[0], ends[1] + 1), body: rest, selected: true }
-}
-
 // ── Destructive-command confirmation ────────────────────────────────────────
 // /exit kills the whole process and `/all /dc` disconnects every bot at once.
 // Neither may happen on one keystroke or one typo: these commands warn first
@@ -940,10 +908,9 @@ function destructiveCommandEffect(command) {
     // dispatcher, not to what the bots would run — strip it first, exactly the
     // way the /all-slow handler parses it.
     let body = (m[2] || '').trim()
-    // The target prefix may be numeric or named. Only slash-prefixed commands
-    // count here; deliberately forced chat (!...) is not a disconnect command.
-    const commandAt = body.search(/(?:^|\s)\/\S/)
-    if (commandAt >= 0) body = body.slice(commandAt).trim()
+    const splitAt = body.search(/\s/)
+    const first = splitAt === -1 ? body : body.slice(0, splitAt)
+    if (/^\d+(?:\.\d+)?(?:ms|s)?$/i.test(first)) body = splitAt === -1 ? '' : body.slice(splitAt + 1).trim()
     const dispatched = (body.split(/\s+/)[0] || '').toLowerCase()
     if (dispatched === '/dc' || dispatched === '/disconnect') return 'disconnects every bot at once'
   }
@@ -1510,7 +1477,6 @@ module.exports = {
   parseCommandChain,
   executeCommandChain,
   destructiveCommandEffect,
-  parseBroadcastTargets,
   createCommandConfirmation,
   parseItemGlobs,
   itemMatchesGlobs,

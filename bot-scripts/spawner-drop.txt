@@ -1,0 +1,6 @@
+# /run-script spawner-drop
+# Uses SPAWNER_DROP_* defaults: bones, duration 60s, cooldown 10s per stack,
+# scope=all (GUI + existing inventory), mode=duration. Stays at current position.
+# Custom run: /spawner-drop "bone" duration=2min cooldown=10s scope=all
+# Cancel: /spawner-drop stop
+/spawner-drop

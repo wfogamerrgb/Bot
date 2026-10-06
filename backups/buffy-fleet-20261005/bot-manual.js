@@ -14,8 +14,6 @@ const { Vec3 } = require('vec3')
 
 const MANUAL_CONTROLS = ['forward', 'back', 'left', 'right', 'jump', 'sneak', 'sprint']
 const DEG = Math.PI / 180
-const { parseSleepDuration } = require('./bot-controls')
-const STEP_MS = Math.min(10000, Math.max(1, envInt(process.env.MANUAL_STEP_MS, 500)))
 
 const VIEWER_PORT = envInt(process.env.MANUAL_VIEWER_PORT, 3000)
 const VIEWER_PORT_ATTEMPTS = envInt(process.env.MANUAL_VIEWER_PORT_MAX_ATTEMPTS, 10)
@@ -236,7 +234,7 @@ module.exports = function createManualControls (deps) {
     const entry = bots[id]
     const bot = entry?.bot
     if (!bot?.entity) { warn(chan(id), `Not spawned — cannot enter manual interact mode.`); return }
-    if (entry.spawnerDropRunning || entry.crateRoutineRunning || entry.crateLoopRunning || entry.shardshopLoopRunning || entry.inCrateRoutine) {
+    if (entry.crateRoutineRunning || entry.crateLoopRunning || entry.shardshopLoopRunning || entry.inCrateRoutine) {
       warn(id, 'A crates/shardshop routine is running on this bot — stop it before using manual interact.')
       return
     }
@@ -260,8 +258,6 @@ module.exports = function createManualControls (deps) {
     const entry = bots[id]
     if (!entry) return
     const wasManual = entry.manualMode
-    if (entry.manualStepTimer) clearTimeout(entry.manualStepTimer)
-    entry.manualStepTimer = null
     entry.suppressNextWindowClick = false
     if (entry.suppressWindowTimer) {
       clearTimeout(entry.suppressWindowTimer)
@@ -578,7 +574,7 @@ module.exports = function createManualControls (deps) {
     const needsBot = () => {
       if (!activeId) { warn(SYSTEM_ID, 'No active bot.'); return null }
       const entry = bots[activeId]
-      if (!entry?.bot?.entity || (entry.connectionState && entry.connectionState !== 'online')) { warn(chan(activeId), `${activeId} is not currently spawned.`); return null }
+      if (!entry?.bot?.entity) { warn(chan(activeId), `${activeId} is not currently spawned.`); return null }
       return entry
     }
     const nums = (text, count) => {
@@ -591,39 +587,6 @@ module.exports = function createManualControls (deps) {
       // ── mode ──
       case '/manual-interact':
       case '/manual': {
-        if (rest) {
-          const entry = needsBot()
-          if (!entry) return true
-          const words = rest.toLowerCase().split(/\s+/)
-          const action = words[0] === 'foward' ? 'forward' : words[0] === 'backward' ? 'back' : words[0]
-          if (action === 'stop' && words.length === 1) {
-            if (entry.manualStepTimer) clearTimeout(entry.manualStepTimer)
-            entry.manualStepTimer = null
-            entry.bot.pathfinder?.stop?.()
-            entry.bot.clearControlStates()
-            okMsg(activeId, 'Movement stopped.')
-            return true
-          }
-          if (!MANUAL_CONTROLS.includes(action)) {
-            const direct = ['walk', 'look', 'lookat', 'hotbar', 'dig', 'place', 'use', 'attack', 'drop', 'window-open', 'window-close']
-            if (direct.includes(action)) return routeCommand('/' + action + (words.length > 1 ? ' ' + words.slice(1).join(' ') : ''), activeId)
-            warn(activeId, 'Usage: /manual-interact <forward|back|left|right|jump|sneak|sprint> [duration ≤10s], stop, or a manual action with its arguments.')
-            return true
-          }
-          const duration = words[1] == null ? STEP_MS : /^\d+(?:\.\d+)?(?:ms|s)?$/.test(words[1]) ? parseSleepDuration(words[1]) : null
-          if (words.length > 2 || !(duration > 0 && duration <= 10000)) { warn(activeId, 'Movement duration must be 1ms–10s (default MANUAL_STEP_MS=500).'); return true }
-          if (entry.spawnerDropRunning || entry.inDumpRoutine || entry.inCrateRoutine || entry.inSpawnerRoutine || entry.inAppleRoutine) { warn(activeId, 'Stop the active inventory routine before moving.'); return true }
-          if (entry.manualStepTimer) clearTimeout(entry.manualStepTimer)
-          entry.bot.pathfinder?.stop?.()
-          entry.bot.clearControlStates()
-          entry.bot.setControlState(action, true)
-          entry.manualStepTimer = setTimeout(() => {
-            entry.manualStepTimer = null
-            entry.bot.setControlState(action, false)
-          }, duration)
-          okMsg(activeId, `${action} for ${duration}ms (no public chat or viewer startup).`)
-          return true
-        }
         if (!activeId) { warn(SYSTEM_ID, 'No active bot.'); return true }
         const entry = bots[activeId]
         if (!entry) { warn(SYSTEM_ID, 'No active bot.'); return true }
@@ -645,22 +608,13 @@ module.exports = function createManualControls (deps) {
         const bot = entry.bot
         if (!rest) { warn(activeId, 'Usage: /walk <x> <y> <z> [range] — or /walk stop'); return true }
         if (rest.toLowerCase() === 'stop') {
-          if (entry.manualStepTimer) clearTimeout(entry.manualStepTimer)
-          entry.manualStepTimer = null
           try { bot.pathfinder.stop() } catch (_) {}
           try { bot.clearControlStates() } catch (_) {}
           okMsg(activeId, 'Pathfinding stopped.')
           return true
         }
-        const parts = rest.split(/\s+/)
-        const origin = bot.entity.position
-        const target = parts.slice(0, 3).map((value, index) => {
-          const axis = ['x', 'y', 'z'][index]
-          if (/^~(?:-?\d+(?:\.\d+)?)?$/.test(value)) return origin[axis] + Number(value.slice(1) || 0)
-          return /^-?\d+(?:\.\d+)?$/.test(value) ? Number(value) : NaN
-        })
-        if (target.length !== 3 || !target.every(Number.isFinite) || parts.length > 4) { warn(activeId, 'Usage: /walk <x> <y> <z> [range]; ~ offsets use the current position, e.g. /walk ~2 ~ ~-3 0.'); return true }
-        if (entry.spawnerDropRunning || entry.inDumpRoutine || entry.inCrateRoutine || entry.inSpawnerRoutine) { warn(activeId, 'Stop the active inventory routine before walking.'); return true }
+        const target = nums(rest, 3)
+        if (!target) { warn(activeId, 'Usage: /walk <x> <y> <z> [range] — or /walk stop'); return true }
         let range = 1
         const extra = rest.split(/\s+/).filter(Boolean)[3]
         if (extra !== undefined) {
@@ -668,9 +622,6 @@ module.exports = function createManualControls (deps) {
           if (!Number.isFinite(range) || range < 0) { warn(activeId, 'Usage: /walk <x> <y> <z> [range] — range must be a number ≥ 0'); return true }
         }
         range = Math.min(range, 16)
-        if (entry.manualStepTimer) clearTimeout(entry.manualStepTimer)
-        entry.manualStepTimer = null
-        bot.clearControlStates?.()
         try {
           const { goals: { GoalNear } } = require('mineflayer-pathfinder')
           bot.pathfinder.setGoal(new GoalNear(target[0], target[1], target[2], range))
@@ -720,7 +671,6 @@ module.exports = function createManualControls (deps) {
         }
         return true
       }
-      case '/coordinates':
       case '/pos': {
         const entry = needsBot()
         if (!entry) return true
@@ -865,7 +815,7 @@ module.exports = function createManualControls (deps) {
         if (!entry) return true
         const all = rest.toLowerCase() === 'all'
         if (rest && !all) { warn(activeId, 'Usage: /pickup [all]'); return true }
-        pickupItems(activeId, entry, all ? Infinity : 1)
+        pickupItems(id, entry, all ? Infinity : 1)
         return true
       }
 

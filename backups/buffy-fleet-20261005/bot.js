@@ -45,7 +45,6 @@ const {
   loadBotScript,
   commandSuggestions,
   destructiveCommandEffect,
-  parseBroadcastTargets,
   createCommandConfirmation,
   parseTorControlPorts,
   deriveTorControlPorts,
@@ -223,17 +222,6 @@ const DATA_WEBHOOK_URL = (process.env.DATA_WEBHOOK_URL || '').trim()
 const DATA_WEBHOOK_SECRET = (process.env.DATA_WEBHOOK_SECRET || '').trim()
 const DATA_WEBHOOK_TIMEOUT_MS = readDelayMs(process.env.DATA_WEBHOOK_TIMEOUT_MS, 15000)
 const dataState = dataStore.loadState(DATA_FILE)
-const evidenceStore = require(path.join(__dirname, 'evidence')).createEvidenceStore({ file: process.env.EVIDENCE_FILE || path.join(__dirname, 'data', 'evidence.json') })
-function recordEvidence (id, kind, detail) {
-  try { return evidenceStore.record(id, kind, detail) } catch (err) { logFor(id, `{red-fg}✗ Evidence save failed: ${sanitize(err.message)}{/red-fg}`) }
-}
-function botOnline (entry) { return !!entry?.bot?.entity && (!entry.connectionState || entry.connectionState === 'online') }
-function connectionDetails (id, entry) {
-  const proxy = resolveBotProxy(id, PROXY_GROUPS, PROXY_DEFAULT)
-  const socket = entry?.bot?._client?.socket
-  const peer = socket?.remoteAddress || null
-  return { target: entry?.host || HOST, port: entry?.port || PORT, route: proxy ? 'proxied' : 'direct', proxy: proxy ? `${proxy.type || 'socks5'} ${proxy.host}:${proxy.port}` : 'direct', tcpPeer: peer, tcpPeerPort: socket?.remotePort || null, serverIp: !proxy && botOnline(entry) ? peer : (net.isIP(entry?.host || HOST) ? entry?.host || HOST : null), note: proxy ? 'TCP peer is the proxy; destination IP behind proxy is unknown unless the target is an IP literal. Public egress IP is not checked.' : 'TCP peer is the directly connected server; a hostname alone is not proof of its IP.' }
-}
 function persistData () {
   dataState.updatedAt = new Date().toISOString()
   dataStore.saveState(DATA_FILE, dataState)
@@ -864,7 +852,6 @@ cfDefine('ANALYTICS_ENABLED', { type: 'bool', def: true, group: 'Analytics', des
 cfDefine('ANALYTICS_PORT', { type: 'int', def: 8080, min: 1, max: 65535, group: 'Analytics', live: false, desc: 'Port for the analytics page — the listener starts at boot, so this one needs a restart' })
 cfDefine('ANALYTICS_OPEN', { type: 'bool', def: false, group: 'Analytics', desc: 'Serve analytics with no login at all (default: the dashboard session is required)' })
 cfDefine('ANALYTICS_BUCKET_MS', { type: 'ms', def: 3600000, min: 60000, group: 'Analytics', desc: 'Bucket size for the charts (also ?bucket=1h)' })
-cfDefine('ANALYTICS_WARMUP_MS', { type: 'ms', def: 3000000, min: 0, group: 'Analytics', desc: 'Skip the first 50 minutes after every bot-script (re)start in the charts and window deltas — that ramp is skewed (bots still logging in). 0 shows everything' })
 // Keys that are read once at startup. They are listed so the tab is a complete
 // picture of the configuration rather than only the new half of it.
 cfDefine('ALL_SLOW_DELAY_MS', { type: 'ms', def: 15000, min: 0, group: 'Timing', desc: 'Default gap between bots in /all-slow (live)' })
@@ -918,19 +905,7 @@ const coinflipStore = coinflip.createCoinflipStore({ file: COINFLIP_FILE, maxRec
 const timeseriesStore = timeseries.createTimeseriesStore({ file: TIMESERIES_FILE })
 
 
-cfDefine('SPAWNER_DROP_DURATION_MS', { type: 'ms', def: 60000, min: 1, max: 86400000, group: 'Spawner drop', desc: 'Default bounded drop duration; explicit duration= overrides it' })
-cfDefine('SPAWNER_DROP_COOLDOWN_MS', { type: 'ms', def: 10000, min: 100, max: 86400000, group: 'Spawner drop', desc: 'Gap after each confirmed whole-stack drop (live)' })
-cfDefine('SPAWNER_DROP_MODE', { type: 'string', def: 'duration', group: 'Spawner drop', desc: 'duration|once|until-stop; per-run mode= overrides it' })
-cfDefine('SPAWNER_DROP_SCOPE', { type: 'string', def: 'all', group: 'Spawner drop', desc: 'all|inventory|gui; all includes GUI and existing inventory stacks' })
-cfDefine('SPAWNER_DROP_MATCH', { type: 'string', def: 'bones', group: 'Spawner drop', desc: 'Default item name/NBT search term; per-run terms override it' })
-const spawnerDrop = require(path.join(__dirname, 'spawner-drop')).createSpawnerDrop({
-  bots, online: botOnline, reach: SPAWNER_REACH, blockName: SPAWNER_BLOCK,
-  log: (id, text, error) => logFor(id, error ? `{red-fg}✗ ${sanitize(text)}{/red-fg}` : `{cyan-fg}› ${sanitize(text)}{/cyan-fg}`),
-  matches: (item, terms) => terms.some(term => term.toLowerCase() === 'bones' && item.name === 'bone') || itemMatchesDumpTerms(itemSearchNames(item), itemNbtText(item), terms),
-  defaults: () => ({ durationMs: settings.get('SPAWNER_DROP_DURATION_MS'), cooldownMs: settings.get('SPAWNER_DROP_COOLDOWN_MS'), mode: settings.get('SPAWNER_DROP_MODE'), scope: settings.get('SPAWNER_DROP_SCOPE'), terms: [settings.get('SPAWNER_DROP_MATCH')] })
-})
-
-const LOCAL_COMMANDS = ['/evidence', '/connection', '/spawner-drop', '/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dump-spawners', '/dc', '/reconnect', '/crates', '/crates-loop', '/spawners', '/data', '/shardshop-loop', '/closeBot', '/bot-coinflip', '/bot-coinflip-all', '/ai-chat', '/repeat', '/use-book', '/enchanted-golden-apple-extract', '/ege', '/scripts', '/run-script']
+const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dump-spawners', '/dc', '/reconnect', '/crates', '/crates-loop', '/spawners', '/data', '/shardshop-loop', '/closeBot', '/bot-coinflip', '/bot-coinflip-all', '/ai-chat', '/repeat', '/use-book', '/enchanted-golden-apple-extract', '/ege', '/scripts', '/run-script']
 
 const logSubscribers = new Set()
 function subscribeLog(fn) { logSubscribers.add(fn); return () => logSubscribers.delete(fn) }
@@ -938,7 +913,6 @@ function subscribeLog(fn) { logSubscribers.add(fn); return () => logSubscribers.
 function logFor(id, msg) {
 if (id !== SYSTEM_ID && !bots[id]) return
 const line = `${timestamp()} ${msg}`
-evidenceStore.captureDumpLine(id, line)
 const store = id === SYSTEM_ID ? systemLogs : bots[id].logs
 store.push({ text: line, time: Date.now() })
 if (store.length > LOG_MAX_LINES) store.splice(0, store.length - LOG_MAX_LINES)
@@ -974,7 +948,7 @@ function dispatchCommandToBot (msg, id) {
     handleCommand(command, { selectedId: id })
     return true
   }
-  if (!botOnline(bots[id])) return false
+  if (!bots[id].bot?.entity) return false
   bots[id].bot.chat(command)
   return true
 }
@@ -1088,7 +1062,7 @@ return {
 rssMB: Math.round(m.rss / 1048576), heapMB: Math.round(m.heapUsed / 1048576),
 uptimeSec: Math.floor(process.uptime()), clients: webHandle ? webHandle.clients.size : 0,
 evlLagMs, logPerSec: Math.round(logRateWindow / 2),
-bots: Object.keys(bots).length, online: Object.values(bots).filter(botOnline).length,
+bots: Object.keys(bots).length, online: Object.values(bots).filter(b => b.bot && b.bot.entity).length,
 memory: monitoring ? monitoring.getMemorySnapshot() : null
 }
 }
@@ -1102,19 +1076,15 @@ monitoring = createMonitoring({
 function botSnapshot() {
 return Object.entries(bots).map(([id, e]) => {
 const b = e.bot
-const ping = botOnline(e) && b.player ? b.player.ping : null
+const ping = b && b.player ? b.player.ping : null
 const histArr = e.pingHist || (e.pingHist = [])
 if (typeof ping === 'number') { histArr.push(Math.max(0, ping)); if (histArr.length > 60) histArr.shift() }
-const online = botOnline(e)
+const online = !!(b && b.entity)
 return {
-id, online, number: Object.keys(bots).indexOf(id) + 1,
-state: online ? 'online' : dataState.bots[id]?.banned ? 'banned' : e.connectionState || 'disconnected',
-disconnectedAt: e.disconnectedAt || null,
-disconnectReason: sanitize(e.lastDisconnectReason || dataState.bots[id]?.banReason || ''),
-connection: connectionDetails(id, e),
+id, online,
 ping: typeof ping === 'number' ? Math.max(0, ping) : null,
-health: online ? (b.health ?? null) : null, food: online ? (b.food ?? null) : null,
-uptimeSec: online && e.spawnTime ? Math.floor((Date.now() - e.spawnTime) / 1000) : null,
+health: b ? (b.health ?? null) : null, food: b ? (b.food ?? null) : null,
+uptimeSec: e.spawnTime ? Math.floor((Date.now() - e.spawnTime) / 1000) : null,
 attempts: e.reconnectAttempts || 0,
 kick: e.lastKickReason ? escHtml(sanitize(e.lastKickReason).slice(0, 140)) : null,
 banned: Boolean(dataState.bots[id]?.banned),
@@ -1128,15 +1098,9 @@ coinflip: coinflipSessions.get(id) || coinflipLastRun.get(id) || null,
 pingHist: histArr,
 manual: manual.snapshotFor(e),
 // connecting: bot exists but hasn't spawned yet (useful for filtering in web UI)
-connecting: !online && !dataState.bots[id]?.banned && e.connectionState === 'connecting'
+connecting: !online && !!b
 }
-}).concat((removedBots.bots || []).filter(row => !Object.hasOwn(bots, row.bot)).map(row => ({
-  id: row.bot, number: null, online: false, connecting: false, state: 'banned', banned: true, removed: true,
-  banKind: row.kind || dataState.bots[row.bot]?.banKind || 'removed',
-  kick: escHtml(sanitize(row.reason || dataState.bots[row.bot]?.banReason || 'On removed list')),
-  disconnectReason: sanitize(row.reason || dataState.bots[row.bot]?.banReason || 'On removed list'),
-  disconnectedAt: dataState.bots[row.bot]?.bannedAt || null, pingHist: []
-})))
+})
 }
 function notifyBotsChanged() {
 if (tui) { try { tui.updateHeader() } catch (_) {} }
@@ -1534,7 +1498,7 @@ button.tb:hover{color:var(--txt);border-color:var(--acc)}
 </style><script src="/chart.js"></script><script src="/coinflip-dashboard.js"></script></head><body>
 <div id="app">
 <header><div class="logo">⛏ AFK<b>CONSOLE</b></div><div id="chips"></div><div id="wsstate" class="wsstate down">offline</div><button id="logout">sign out</button></header>
-<aside><div class="views"><div class="vchip on" data-view="all">ALL</div><div class="vchip" data-view="system">SYSTEM</div><button class="vchip" id="terminalbtn" type="button">TERMINAL</button><button class="vchip" id="envbtn" type="button" title="Temporary .env overrides — nothing is written to disk">.ENV</button><button class="vchip" id="coinflipbtn" type="button" title="Coinflip fleet analytics">COINFLIP</button><!--PLAYBTN--></div><label style="display:flex;align-items:center;gap:6px;padding:4px 0;font-size:11px;color:var(--dim);cursor:pointer"><input type="checkbox" id="show-all-bots" checked style="accent-color:var(--acc)">Show offline bots</label><div id="botlist"></div></aside>
+<aside><div class="views"><div class="vchip on" data-view="all">ALL</div><div class="vchip" data-view="system">SYSTEM</div><button class="vchip" id="terminalbtn" type="button">TERMINAL</button><button class="vchip" id="envbtn" type="button" title="Temporary .env overrides — nothing is written to disk">.ENV</button><button class="vchip" id="coinflipbtn" type="button" title="Coinflip fleet analytics">COINFLIP</button><!--PLAYBTN--></div><label style="display:flex;align-items:center;gap:6px;padding:4px 0;font-size:11px;color:var(--dim);cursor:pointer"><input type="checkbox" id="show-all-bots" style="accent-color:var(--acc)">Show offline bots</label><div id="botlist"></div></aside>
 <main>
 <div id="loghead"><span id="channame">ALL CHANNELS</span><span id="newchip"></span>
 <input id="search" placeholder="filter logs…"><button class="tb" id="topbtn" type="button" title="scroll to top">↑ top</button><button class="tb" id="bottombtn" type="button" title="scroll to newest">↓ bottom</button><button class="tb" id="followbtn" type="button">⏸ pause</button>
@@ -1810,17 +1774,16 @@ if(!control)return
 releaseManualKey(control,document.querySelector('.mkey[data-control="'+control+'"]'))
 })
 }
-var lastBotSnapshot=[]
-el('show-all-bots').onchange=function(){renderBots(lastBotSnapshot)}
-function renderBots(bs){lastBotSnapshot=bs;var box=el('botlist');box.innerHTML='';botStates={}
+function renderBots(bs){var box=el('botlist');box.innerHTML='';botStates={}
 var showAll = el('show-all-bots')?.checked || false
 for(var i=0;i<bs.length;i++){var b=bs[i]
+// Filter out offline non-connecting bots unless showAll is checked
+if(!showAll && !b.online && !b.connecting) continue
 botStates[b.id]=b
 var old=prevOnline[b.id]
 if(old===true&&!b.online)toast(b.id+(b.banned?' was banned':' went offline')+(b.kick?' — '+b.kick:''),'bad')
 if(old===false&&b.online)toast(b.id+' is online','good')
 prevOnline[b.id]=b.online
-if(!showAll && !b.online && !b.connecting && !b.banned && b.id!==view) continue
 var d=document.createElement('div')
 var cls = 'bot'
 if(b.online) cls += ' on'
@@ -1835,20 +1798,17 @@ var bannedHtml=b.banned?'<span class="manual-badge" style="color:var(--red);bord
 var authHtml=b.authFailed?'<span class="manual-badge" style="color:var(--red);border-color:rgba(248,113,113,.45)">🔑 '+b.authKind+'</span>':''
 var viewerHtml=b.manual&&b.manual.viewerPort?'<button class="manual-viewer" type="button" data-port="'+String(b.manual.viewerPort)+'">🌐 viewer</button>':''
 var cfHtml=b.coinflip?'<span class="manual-badge" style="color:var(--cyan);border-color:rgba(103,232,249,.4)">🎲 '+b.coinflip.flips+'/'+b.coinflip.planned+'</span>':''
-var offlineHtml = !b.online && !b.connecting ? '<span class="manual-badge" style="color:var(--red)">disconnected</span>' : ''
 var connectingHtml = b.connecting ? '<span class="manual-badge" style="color:var(--yellow);border-color:rgba(255,200,0,.4)">⏳ connecting</span>' : ''
-d.innerHTML='<div class="bhead"><div class="dot"></div><div class="bname"></div>'+bannedHtml+authHtml+cfHtml+manualHtml+guiHtml+viewerHtml+connectingHtml+offlineHtml+(b.attempts?'<div class="batt">↻'+b.attempts+'</div>':'')+'</div>'
+d.innerHTML='<div class="bhead"><div class="dot"></div><div class="bname"></div>'+bannedHtml+authHtml+cfHtml+manualHtml+guiHtml+viewerHtml+connectingHtml+(b.attempts?'<div class="batt">↻'+b.attempts+'</div>':'')+'</div>'
 +'<div class="bmeta"><span>'+(b.ping==null?'—':b.ping)+'ms</span><span>'+(b.health==null?'—':b.health)+'❤</span><span>'+(b.food==null?'—':b.food)+'🍗</span>'+(up?'<span>'+up+'</span>':'')+'</div>'
 +'<canvas width="220" height="16"></canvas>'
-d.querySelector('.bname').textContent=(b.removed?'[removed] ':'['+(b.number||i+1)+'] ')+b.id
+d.querySelector('.bname').textContent=b.id
 if(b.banned)d.title='Banned'+(b.banKind?' ('+b.banKind+')':'')+(b.kick?' — '+b.kick:'')
 else if(b.authFailed)d.title='Login rejected: '+b.authReason+' — fix the password and run /auth-retry '+b.id
 else if(b.coinflip)d.title='Coinflip run: '+b.coinflip.flips+' of '+b.coinflip.planned+' flips, net '+(b.coinflip.net>=0?'+':'')+b.coinflip.net+' — '+b.coinflip.stopped
-else if(b.disconnectReason)d.title='Disconnected'+(b.disconnectedAt?' at '+new Date(b.disconnectedAt).toISOString():'')+' — '+b.disconnectReason
 else if(b.kick)d.title=b.kick
 else if(b.connecting)d.title='Connecting to server...'
-if(!b.removed)d.onclick=(function(id){return function(){setView(id)}})(b.id)
-else d.title+=' — on removed list; /unban '+b.id+' restores it. Audit: /api/evidence?bot='+encodeURIComponent(b.id)
+d.onclick=(function(id){return function(){setView(id)}})(b.id)
 var viewerButton=d.querySelector('.manual-viewer')
 if(viewerButton)viewerButton.onclick=(function(port){return function(e){e.preventDefault();e.stopPropagation();window.open('http://'+location.hostname+':'+port+'/','_blank','noopener')}})(b.manual.viewerHostPort||b.manual.viewerPort)
 box.appendChild(d)
@@ -2047,7 +2007,7 @@ const handle = { clients, port: null, url: null }
 const appJsMatch = PAGE_HTML.match(/<script>([\s\S]*?)<\/script>/)
 const appJsBuf = Buffer.from(appJsMatch ? appJsMatch[1] : '', 'utf8')
 const pageHtml = PAGE_HTML
-.replace('<!--PLAYBTN-->', MC_WEB_ENABLED ? '<button class="vchip" id="playbtn" type="button" title="Play the server in your browser (zardoy minecraft-web-client)">PLAY</button>' : '')
+.replace('<button class="vchip" id="coinflipbtn" type="button" title="Coinflip fleet analytics">COINFLIP</button><!--PLAYBTN-->', MC_WEB_ENABLED ? '<button class="vchip" id="playbtn" type="button" title="Play the server in your browser (zardoy minecraft-web-client)">PLAY</button>' : '')
 .replace(/<script>[\s\S]*?<\/script>/, '<script src="/app.js"></script>')
 const pageBuf = Buffer.from(pageHtml, 'utf8')
 let pageGz = null
@@ -2479,15 +2439,8 @@ res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control'
 res.end(playPageHtml(clientBaseFor(req)))
 return
 }
-if (p === '/api/evidence' && req.method === 'GET') {
-  const id = url.searchParams.get('bot')
-  if (!id) { sendJson(res, { error: 'bot parameter required' }, 400); return }
-  sendJson(res, { ...evidenceStore.get(id), current: bots[id] ? botSnapshot().find(b => b.id === id) : null, ban: dataState.bots[id] || null })
-  return
-}
 if (p === '/api/coinflip/summary' && req.method === 'GET') {
-  const recent = Math.max(1, Math.min(1000, Number(url.searchParams.get('recent')) || 100))
-  sendJson(res, coinflipStore.summary({ recent, minSample: settings.get('COINFLIP_MIN_SAMPLE'), suspicionP: settings.get('COINFLIP_SUSPICION_P') }))
+  sendJson(res, coinflipStore.summary({ recent: 100, minSample: settings.get('COINFLIP_MIN_SAMPLE'), suspicionP: settings.get('COINFLIP_SUSPICION_P') }))
   return
 }
 if (p === '/api/coinflip/bot' && req.method === 'GET') {
@@ -2500,15 +2453,8 @@ if (p === '/api/coinflip/bot' && req.method === 'GET') {
 }
 if (p === '/api/coinflip/fairness' && req.method === 'GET') {
   const rows = coinflipStore.all()
-  const opts = { minSample: settings.get('COINFLIP_MIN_SAMPLE'), suspicionP: settings.get('COINFLIP_SUSPICION_P') }
-  const fairness = coinflip.analyzeFairness(rows, opts)
-  // One binomial test per bot alongside the fleet one — the panel's per-bot
-  // table reads this instead of re-deriving statistics in the browser.
-  const perBot = {}
-  for (const name of [...new Set(rows.map(r => r.bot))]) {
-    perBot[name] = coinflip.analyzeFairness(rows.filter(r => r.bot === name), opts)
-  }
-  sendJson(res, { ...fairness, perBot })
+  const fairness = coinflip.analyzeFairness(rows, { minSample: settings.get('COINFLIP_MIN_SAMPLE'), suspicionP: settings.get('COINFLIP_SUSPICION_P') })
+  sendJson(res, fairness)
   return
 }
 if (p === '/api/coinflip/deep' && req.method === 'GET') {
@@ -2523,11 +2469,9 @@ if (p === '/api/coinflip/bots' && req.method === 'GET') {
   for (const row of rows) {
     if (!botsMap[row.bot]) botsMap[row.bot] = { flips: 0, wins: 0, losses: 0, net: 0, lastSeen: 0 }
     botsMap[row.bot].flips++
-    // The records say 'won'/'lost' (coinflip.STREAK) — matching 'win'/'loss'
-    // here counted every bot as 0W/0L on the panel.
-    if (row.result === coinflip.STREAK.WON) botsMap[row.bot].wins++
-    else if (row.result === coinflip.STREAK.LOST) botsMap[row.bot].losses++
-    if (row.result === coinflip.STREAK.WON || row.result === coinflip.STREAK.LOST) botsMap[row.bot].net += Number.isFinite(row.delta) ? row.delta : row.result === coinflip.STREAK.WON ? row.wager || 0 : -(row.wager || 0)
+    if (row.result === 'win') botsMap[row.bot].wins++
+    else if (row.result === 'loss') botsMap[row.bot].losses++
+    botsMap[row.bot].net += row.delta || 0
     botsMap[row.bot].lastSeen = Math.max(botsMap[row.bot].lastSeen, row.ts || 0)
   }
   sendJson(res, { bots: botsMap })
@@ -2892,9 +2836,6 @@ lastPlayerChatAt: Date.now(), // chat activity watchdog — last time a player m
 lastPlayerChat: '', // latest player chat message
 }
 const entry = bots[id]
-entry.connectionState = 'connecting'
-entry.disconnectedAt = null
-recordEvidence(id, 'connections', { state: 'connecting', target: `${host}:${port}` })
 
 // Managed timers — all cleared on disconnect so nothing fires against a dead bot
 const timeouts = []
@@ -3183,11 +3124,7 @@ bot.acceptResourcePack(); // For older versions it still works fine
 bot.once('spawn', () => {
 connected = true
 const recoveredAfter = bots[id]?.reconnectAttempts || 0
-if (bots[id]?.bot === bot) {
-  bots[id].spawnTime = Date.now()
-  bots[id].connectionState = 'online'
-}
-recordEvidence(id, 'connections', { state: 'online', connection: connectionDetails(id, entry) })
+if (bots[id]) bots[id].spawnTime = Date.now()
 // Getting back in means the ban is gone (a temporary ban expired, or somebody
 // lifted it), so clear the flag instead of reporting a stale ban forever.
 if (dataState.bots[id]?.banned) {
@@ -3340,27 +3277,13 @@ notifyBotsChanged()
 
 bot.on('message', (jsonMsg) => { try { c(jsonMsg.toString()) } catch (_) {} })
 
-bot.on('death', () => {
-  recordEvidence(id, 'deaths', { source: 'mineflayer:death', position: botLocation(bot), reason: 'Death observed; killer/cause unknown unless the server supplies a death message.', recentServerMessages: (bots[id]?.chatHistory || []).slice(-5) })
-  spawnerDrop.stop(id, 'death')
-  manual.stopManualMode(id)
-})
-if (bot._client) bot._client.on('death_combat_event', packet => {
-  recordEvidence(id, 'deaths', { source: 'server:death_combat_event', reason: sanitize(typeof packet.message === 'string' ? packet.message : JSON.stringify(packet.message || {})), position: botLocation(bot) })
-})
-
 bot.on('kicked', (reason) => {
-if (bots[id]?.bot !== bot) return
 let text
 try { text = typeof reason === 'string' ? reason : JSON.stringify(reason) } catch (_) { text = 'unknown' }
 if (bots[id]) {
 bots[id].lastKickReason = text
 bots[id].lastDisconnectReason = text
-bots[id].connectionState = 'disconnected'
-bots[id].disconnectedAt = Date.now()
 }
-recordEvidence(id, 'connections', { state: 'kicked', reason: sanitize(text) })
-spawnerDrop.stop(id, 'kicked')
 e(`Kicked: ${sanitize(text)}`)
 // A ban arrives as an ordinary kick, so the wording is the only evidence. The
 // verdict is written to the persisted data state (not just memory) so a banned
@@ -3453,12 +3376,6 @@ e(`Client error: ${sanitize(err.message || String(err))}`)
 
 bot.on('end', (reason) => {
 connected = false
-if (bots[id]?.bot !== bot) return
-entry.connectionState = 'disconnected'
-entry.disconnectedAt = Date.now()
-entry.spawnTime = null
-recordEvidence(id, 'connections', { state: 'disconnected', reason: sanitize(entry.lastDisconnectReason || String(reason || 'socket closed')) })
-spawnerDrop.stop(id, 'disconnected')
 
 if (bots[id]?.dumpTimers?.length) {
   bots[id].dumpTimers.splice(0).forEach(clearTimeout)
@@ -3495,7 +3412,6 @@ if (!hasRealReason && PROXY_ENABLED && !bots[id]?.spawnTime && (reasonText === '
 classificationReason = 'pre-spawn socketClosed (proxy tunnel likely dropped)'
 }
 
-entry.lastDisconnectReason = entry.lastDisconnectReason || reasonText || 'socket closed'
 monitoring?.onDisconnect(id, classificationReason, manualDisconnect)
 scheduleReconnect('Connection lost', classificationReason)
 lastRawError = null
@@ -3507,9 +3423,6 @@ manualDisconnect = true
 try { manual.stopManualMode(id) } catch (_) {}
 
 if (bots[id]) {
-bots[id].connectionState = 'disconnected'
-bots[id].disconnectedAt = Date.now()
-spawnerDrop.stop(id, 'manual disconnect')
 bots[id].manualDisconnect = true // let the watchdog (outside this closure) know this was intentional
 bots[id].spawnTime = null // stop looking "spawned" to the watchdog now that we're intentionally offline
 }
@@ -3610,8 +3523,8 @@ else entry.bot?.emit('end', 'proxy-watchdog: forced')
 
 // ── Command registry (original + /stats) ──────────────────────────────────────
 const COMMANDS = {
-'/all [first-last|name:first..last] <cmd>': 'Optional inclusive displayed 1–N or exact-name range; a selector alone previews targets without changing selection. Run a local command on EVERY bot, or broadcast a server command to all. ALL_CHAT_GUARD (on by default) refuses plain chat so a typo like "/all .server lifesteal" cannot make every bot say it — prefix with "!" to send chat deliberately ( /all !hello )',
-'/all-slow [first-last|name:first..last] [delay] <cmd>': `Optional inclusive bot range before the optional delay; range alone previews targets. Like /all (chat guard included), but starts each bot ${ALL_SLOW_DELAY_MS / 1000}s apart (ALL_SLOW_DELAY_MS). An optional leading delay overrides it for that run, in the same units as sleep: /all-slow 30 /spawners, /all-slow 500ms /status`,
+'/all <cmd>': 'Run a local command on EVERY bot, or broadcast a server command to all. ALL_CHAT_GUARD (on by default) refuses plain chat so a typo like "/all .server lifesteal" cannot make every bot say it — prefix with "!" to send chat deliberately ( /all !hello )',
+'/all-slow [delay] <cmd>': `Like /all (chat guard included), but starts each bot ${ALL_SLOW_DELAY_MS / 1000}s apart (ALL_SLOW_DELAY_MS). An optional leading delay overrides it for that run, in the same units as sleep: /all-slow 30 /spawners, /all-slow 500ms /status`,
 '/all-slow-cancel [id]': 'Cancel a specific running /all-slow broadcast task by ID (e.g. /all-slow-cancel 1), or all tasks if no ID is specified',
 '/overview': 'Dashboard of every bot\'s health, food, ping, rank (via /fix + /rank), shards, coins, balance, and inventory slots',
 '/enchanted-golden-apple-extract': 'The full kit-extract routine (alias /ege): one pass per EAPPLE_REWARD_SLOTS entry — /kits, click EAPPLE_KIT_SLOT, click the reward slot, /dispose — moving ONLY the EAPPLE_DISPOSE_ITEMS junk each pass so the enchanted golden apples stay in the inventory',
@@ -3662,17 +3575,13 @@ const COMMANDS = {
 '/uptime': 'Show uptime for all bots',
 '/proxy': 'Show the currently configured outbound proxy',
 '/tor-newnym': 'Ask every local Tor instance for fresh circuits (control port = the SOCKS port + 1, or TOR_CONTROL_PORTS) — reconnects leave through a new path; live connections keep theirs until they reconnect',
-'/spawner-drop ["term"] [duration=60s] [cooldown=10s] [mode=duration|once|until-stop] [scope=all|inventory|gui]': 'Open the nearest in-reach spawner without walking or public chat; drop matching whole stacks from its GUI and/or carried inventory, including existing items. Default bones, 60s, one stack per 10s. Stop with /spawner-drop stop. GUI drops may be rejected by server plugins; stop on failure rather than retry',
-'/evidence': 'Persistent per-bot observed connection events, last 3 dump runs with outcome messages, and recent death observations. Full JSON: /api/evidence?bot=<name>; no inferred ban cause',
-'/connection': 'Show configured Minecraft destination and port, verified destination IP when available, direct/proxy route and TCP peer separately; never equate proxy IP with server or public egress IP',
-'/coordinates': 'Alias of /pos: coordinates, facing and dimension; local output only',
-'/manual-interact [action] [args]': 'With no args toggle manual interact mode; forward/back/left/right/jump/sneak/sprint [duration] runs one bounded step (MANUAL_STEP_MS=500, max10s), foward is an alias; stop cancels movement. Other manual actions accept their usual args. Toggle manual interact mode for the active bot (3D view, movement pad, direct world actions); disabled while crate/shardshop routines run',
+'/manual-interact': 'Toggle manual interact mode for the active bot (3D view, movement pad, direct world actions); disabled while crate/shardshop routines run',
 '/manual-stop': 'Stop manual interact mode, release held controls, stop pathfinding, close viewer',
 '/drop [count]': 'Drop the held stack (all of it, or [count] items from it)',
 '/pickup [all]': 'Walk to the nearest dropped item and collect it; /pickup all sweeps everything within reach',
 '/gui <cmd>': 'Send a server command (e.g. /gui /shardshop) and treat the GUI it opens as manual — no auto scan/click or warp',
 '/gui-tui': 'Toggle the ASCII GUI overlay on the dashboard for the open window (click a slot to interact, right-click for right button)',
-'/walk <x|~dx> <y|~dy> <z|~dz> [range]': 'Pathfind near absolute or current-position-relative coordinates (range defaults to 1, capped at 16); /walk stop cancels',
+'/walk <x> <y> <z> [range]': 'Pathfind near coordinates (range defaults to 1, capped at 16); /walk stop cancels',
 '/look <yaw> <pitch>': 'Turn the bot using yaw/pitch in degrees',
 '/lookat <x> <y> <z>': 'Turn the bot toward world coordinates',
 '/hotbar <1-9>': 'Select a hotbar slot in manual mode',
@@ -3814,12 +3723,10 @@ if (bots[id]?.dumpOperationActive) {
 // and the delayed AFK warp) while dumping — /dump opens chests only to
 // deposit into them, and none of that automation may run on them.
 if (bots[id]) bots[id].inDumpRoutine = true
-try { evidenceStore.startDump(id, { command: label, mode: useHome ? 'home' : options.target ? 'target' : 'tpa', filter, position: botLocation(bot) }) } catch (err) { logFor(id, `{red-fg}✗ Evidence save failed: ${sanitize(err.message)}{/red-fg}`) }
 try {
 
 if (bots[id]) bots[id].dumpOperationActive = true
 
-if (bots[id]?.spawnerDropRunning) { logFor(id, `{yellow-fg}⚠ Stop /spawner-drop before dumping.{/yellow-fg}`); return }
 if (!hasInventoryItems(bot.inventory)) {
   logFor(id, `{yellow-fg}⚠ ${label}: inventory is empty — nothing to dump.{/yellow-fg}`)
   return
@@ -3892,7 +3799,7 @@ await new Promise(r => setTimeout(r, DUMP_SETTLE_MS))
 logFor(id, `{yellow-fg}⚠ ${err.message}. Looking for chests nearby anyway...{/yellow-fg}`)
 }
 
-if (!botOnline(bots[id]) || bots[id]?.dumpCancelRequested) {
+if (!bot.entity || bots[id]?.dumpCancelRequested) {
   logFor(id, `{yellow-fg}⚠ ${label}: dump stopped because the bot disconnected or was cancelled.{/yellow-fg}`)
   return
 }
@@ -4038,12 +3945,7 @@ if (!skipWarp) {
   try { bot.chat(WARP_AFK) } catch (_) {}
 }
 
-} catch (err) {
-  logFor(id, `{red-fg}✗ ${label}: failed: ${sanitize(err.message)}{/red-fg}`)
-  try { evidenceStore.finishDump(id, 'failed') } catch (saveErr) { logFor(id, `{red-fg}✗ Evidence save failed: ${sanitize(saveErr.message)}{/red-fg}`) }
-  throw err
 } finally {
-  try { evidenceStore.finishDump(id, bots[id]?.dumpCancelRequested ? 'cancelled' : 'finished; see recorded outcome') } catch (err) { logFor(id, `{red-fg}✗ Evidence save failed: ${sanitize(err.message)}{/red-fg}`) }
 if (bots[id]) {
   bots[id].inDumpRoutine = false
   bots[id].dumpOperationActive = false
@@ -4146,28 +4048,8 @@ case '/tpauto': {
   logFor(id, `{green-fg}✓ TPA auto ${entry.tpautoEnabled ? 'enabled' : 'disabled'}; trusted names only.{/green-fg}`)
   return true
 }
-case '/connection': {
-  const info = connectionDetails(id, entry)
-  logFor(id, `{cyan-fg}› Connection: ${sanitize(JSON.stringify(info))}{/cyan-fg}`)
-  return true
-}
-case '/evidence': {
-  const audit = evidenceStore.get(id)
-  logFor(id, `{cyan-fg}› Evidence audit for ${id}: ${sanitize(audit.caveat)}{/cyan-fg}`)
-  for (const event of audit.connections.slice(-5)) logFor(id, ` Connection ${new Date(event.t).toISOString()}: ${sanitize(event.state)} ${sanitize(event.reason || '')}`)
-  for (const death of audit.deaths) logFor(id, ` Death observation ${new Date(death.t).toISOString()} (${sanitize(death.source)}): ${sanitize(death.reason)} at ${sanitize(JSON.stringify(death.position || null))}`)
-  for (const dump of audit.dumps) {
-    logFor(id, ` Dump ${new Date(dump.t).toISOString()}: ${sanitize(dump.command)} mode=${sanitize(dump.mode)} — ${sanitize(dump.status)}; filter=${sanitize(JSON.stringify(dump.filter || {}))}`)
-    for (const message of dump.messages || []) logFor(id, `   ${sanitize(message)}`)
-  }
-  logFor(id, '{gray-fg}Full untruncated audit: /api/evidence?bot=<name>. Death packets and health transitions are separate observations, not a deduplicated death count.{/gray-fg}')
-  return true
-}
-case '/spawner-drop': return spawnerDrop.route(id, String(cmd).slice('/spawner-drop'.length))
 case '/status': {
-logFor(id, `{cyan-fg}› State: ${botOnline(entry) ? 'online' : dataState.bots[id]?.banned ? 'banned' : entry.connectionState || 'disconnected'}${entry.lastDisconnectReason ? ' — ' + sanitize(entry.lastDisconnectReason) : ''}{/cyan-fg}`)
-logFor(id, ` Connection: ${sanitize(JSON.stringify(connectionDetails(id, entry)))}`)
-if (!botOnline(entry)) return true
+if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
 const pos = bot.entity.position
 const uptimeSec = entry.spawnTime ? Math.floor((Date.now() - entry.spawnTime) / 1000) : 0
 logFor(id, `{cyan-fg}› Status for ${id}:{/cyan-fg}`)
@@ -4457,7 +4339,6 @@ clickOnce()
 // windowOpen handler so the shulker box GUI doesn't trigger Fatal Crate logic.
 async function runCrateRoutine(id, blockNameOverride) {
 const entry = bots[id]
-if (entry?.spawnerDropRunning) { logFor(id, '{yellow-fg}⚠ Stop /spawner-drop before /crates.{/yellow-fg}'); return false }
 if (entry?.manualMode) { logFor(id, `{yellow-fg}⚠ Stop manual interact (/manual-stop) before starting /crates.{/yellow-fg}`); return false }
 // A GUI session armed by /chat or /gui must not swallow this routine's window
 if (entry.suppressNextWindowClick) entry.suppressNextWindowClick = false
@@ -4588,7 +4469,6 @@ return { moved, kept, failed: false }
 
 async function runAppleExtractRoutine (id) {
 const entry = bots[id]
-if (entry?.spawnerDropRunning) { logFor(id, '{yellow-fg}⚠ Stop /spawner-drop before /ege.{/yellow-fg}'); return false }
 if (!entry) return false
 if (entry.manualMode) { logFor(id, `{yellow-fg}⚠ Stop manual interact (/manual-stop) before starting /ege.{/yellow-fg}`); return false }
 if (!entry.bot?.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return false }
@@ -4729,7 +4609,6 @@ return { ok, balanceBefore, balanceAfter }
 async function runSpawnerRoutine (id) {
 const entry = bots[id]
 if (!entry) return false
-if (entry.spawnerDropRunning) { logFor(id, '{yellow-fg}⚠ Stop /spawner-drop before /spawners.{/yellow-fg}'); return false }
 if (entry.manualMode) { logFor(id, `{yellow-fg}⚠ Stop manual interact (/manual-stop) before starting /spawners.{/yellow-fg}`); return false }
 if (!entry.bot?.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return false }
 if (entry.spawnerRoutineRunning) { logFor(id, `{yellow-fg}⚠ /spawners is already running for ${id}.{/yellow-fg}`); return false }
@@ -4958,7 +4837,6 @@ sendOnce()
 }
 
 async function shardshopLoopCommand(id, customSlot = null) {
-if (bots[id]?.spawnerDropRunning) { logFor(id, '{yellow-fg}⚠ Stop /spawner-drop before /shardshop-loop.{/yellow-fg}'); return false }
 const result = await runShardshopLoop(id, customSlot)
 if (!result) return
 const { runs, stopReason } = result
@@ -5568,7 +5446,6 @@ async function stopCoinflipAll () {
 // Samples are taken on an interval, on demand, and after the routines that
 // already queried the server (so a shard count is never asked for twice).
 const lastSampleByBot = new Map()
-const runtimeStartedAt = Date.now() - process.uptime() * 1000
 let timeseriesSampling = false
 
 function recordTimeseriesSample (id, sample, source) {
@@ -5580,35 +5457,24 @@ function recordTimeseriesSample (id, sample, source) {
     // makes "banned bots over time" a chart instead of a guess.
     banned: Boolean(dataState.bots[id]?.banned),
     bannedKind: dataState.bots[id]?.banKind || null,
-    source, runStartedAt: runtimeStartedAt
+    source
   }, Date.now())
   timeseriesStore.append(row)
-  const previous = lastSampleByBot.get(id)
-  const merged = { ...(previous || {}), ...row, bot: id, metricAt: { ...(previous?.metricAt || {}) } }
-  for (const key of timeseries.METRICS) if (sample[key] !== undefined) merged.metricAt[key] = row.t
-  lastSampleByBot.set(id, merged)
+  lastSampleByBot.set(id, { ...row, bot: id })
   return row
 }
 
 function recordFleetSample (source) {
   if (!settings.get('TIMESERIES_ENABLED')) return null
   if (!lastSampleByBot.size) return null
-  const now = Date.now()
-  const maxAge = Math.max(60000, settings.get('TIMESERIES_INTERVAL_MS') * 2)
-  const samples = [...lastSampleByBot.values()].filter(sample => botOnline(bots[sample.bot])).map(sample => {
-    const fresh = { ...sample }
-    for (const key of timeseries.METRICS) if (!sample.metricAt?.[key] || now - sample.metricAt[key] > maxAge) delete fresh[key]
-    return fresh
-  })
-  const row = timeseries.fleetSample(samples, now, source, runtimeStartedAt)
-  row.banned = Object.values(dataState.bots).filter(bot => bot.banned).length
+  const row = timeseries.fleetSample([...lastSampleByBot.values()], Date.now(), source)
   timeseriesStore.append(row)
   return row
 }
 
 function persistTimeseriesSnapshot () {
   try {
-    const snapshot = timeseriesStore.snapshot({ bucketMs: settings.get('ANALYTICS_BUCKET_MS'), warmupMs: settings.get('ANALYTICS_WARMUP_MS') })
+    const snapshot = timeseriesStore.snapshot({ bucketMs: settings.get('ANALYTICS_BUCKET_MS') })
     fs.mkdirSync(path.dirname(TIMESERIES_SUMMARY_FILE), { recursive: true })
     fs.writeFileSync(TIMESERIES_SUMMARY_FILE, JSON.stringify(snapshot, null, 2))
   } catch (err) {
@@ -5624,7 +5490,7 @@ async function sampleTimeseriesNow (opts = {}) {
   if (timeseriesSampling) { logFor(SYSTEM_ID, '{yellow-fg}⚠ A time-series sample is already running.{/yellow-fg}'); return 0 }
   timeseriesSampling = true
   try {
-    const names = (opts.ids || Object.keys(bots)).filter(id => botOnline(bots[id]))
+    const names = (opts.ids || Object.keys(bots)).filter(id => bots[id]?.bot?.entity)
     if (!names.length) { logFor(SYSTEM_ID, '{yellow-fg}⚠ No spawned bots to sample.{/yellow-fg}'); return 0 }
     logFor(SYSTEM_ID, `{cyan-fg}› Sampling ${names.length} bot(s) for the time series (${source})…{/cyan-fg}`)
     let sampled = 0
@@ -5710,7 +5576,7 @@ function buildAnalyticsReport (opts = {}) {
     minSample: settings.get('COINFLIP_MIN_SAMPLE'),
     suspicionP: settings.get('COINFLIP_SUSPICION_P')
   })
-  const tsSnapshot = timeseriesStore.snapshot({ bucketMs: settings.get('ANALYTICS_BUCKET_MS'), warmupMs: settings.get('ANALYTICS_WARMUP_MS'), bot: opts.bot || null })
+  const tsSnapshot = timeseriesStore.snapshot({ bucketMs: settings.get('ANALYTICS_BUCKET_MS'), bot: opts.bot || null })
   // buildReport renders the deep and timeseries tabs to HTML for the client to
   // fetch on demand, so the first page paint only carries the coinflip tab.
   return analytics.buildReport({
@@ -5795,17 +5661,13 @@ function handleAnalyticsRequest (req, res, url) {
     const bot = url.searchParams.get('bot') || null
     const bucketMs = analytics.parseBucket(url.searchParams.get('bucket'), settings.get('ANALYTICS_BUCKET_MS'))
     const since = Number(url.searchParams.get('since')) || 0
-    // ?raw=1 turns the warm-up skip off for this request, for whoever wants to
-    // see the ramp the charts leave out.
-    const warmupMs = url.searchParams.get('raw') != null ? 0 : settings.get('ANALYTICS_WARMUP_MS')
     sendJson(res, {
       metric,
       bot,
       bucketMs,
       since,
-      warmupMs,
-      points: timeseriesStore.bucket(metric, { bucketMs, since, bot, kind: bot ? 'bot' : 'fleet', warmupMs }),
-      summary: timeseriesStore.summarize(metric, { bot, kind: bot ? 'bot' : 'fleet', since, warmupMs })
+      points: timeseriesStore.bucket(metric, { bucketMs, since, bot, kind: bot ? 'bot' : 'fleet' }),
+      summary: timeseriesStore.summarize(metric, { bot, since })
     })
     return
   }
@@ -6777,16 +6639,9 @@ if (cancelSlowMatch) {
 const broadcastMatch = trimmed.match(/^\/(all|all-slow)(?:\s+([\s\S]*))?$/)
 if (broadcastMatch) {
 const command = '/' + broadcastMatch[1]
-const roster = Object.keys(bots)
-const selection = parseBroadcastTargets(broadcastMatch[2], roster)
-if (selection.error) { logWarn(selection.error); return }
-const msg = selection.body
-const ids = selection.ids
-if (!msg) {
-  if (selection.selected) logInfo(`Selected ${ids.length} bot(s): ${ids.map(id => `[${roster.indexOf(id) + 1}] ${id}`).join(', ')} — preview only; add a command to run it.`)
-  else logWarn(`Usage: ${command} [first-last] ${command === '/all-slow' ? '[delay] ' : ''}<command or message>`)
-  return
-}
+const msg = (broadcastMatch[2] || '').trim()
+if (!msg) { logWarn(`Usage: ${command} <command or message>`); return }
+const ids = Object.keys(bots)
 if (command === '/all-slow') {
 // An optional leading delay overrides ALL_SLOW_DELAY_MS for this run:
 //   /all-slow 30 /spawners    → 30s apart
@@ -6814,7 +6669,7 @@ const slowDispatch = id => dispatchCommandToBot(guard.body, id)
 const taskId = slowBroadcast.start(ids, delayMs, slowDispatch, {
 command: guard.body,
 onError: (err, id) => logWarn(`[Task #${taskId}] ${id}: ${sanitize(err.message)}`),
-onDone: ({ taskId: doneId, sent, skipped }) => logSuccess(`[Task #${doneId}] Slow broadcast finished: ${sent} dispatched, ${skipped} skipped/failed.`)
+onDone: ({ sent, skipped }) => logSuccess(`[Task #${taskId}] Slow broadcast finished: ${sent} dispatched, ${skipped} skipped/failed.`)
 })
 const apart = delayMs % 1000 === 0 ? `${delayMs / 1000}s` : `${(delayMs / 1000).toFixed(1)}s`
 logInfo(`[Task #${taskId}] Slow broadcast to ${ids.length} bot(s), ${apart} apart: ${sanitize(guard.body)}`)
@@ -6969,7 +6824,7 @@ const names = Object.keys(bots)
 logInfo(`{bold}── Bots (${names.length}) ──{/bold}`)
 names.forEach((name, idx) => {
 const b = bots[name]
-if (botOnline(b)) {
+if (b?.bot?.entity) {
 const up = formatUptime(b.spawnTime ? Date.now() - b.spawnTime : 0)
 log(` [${idx + 1}] {cyan-fg}${name}{/cyan-fg} {green-fg}● Online{/green-fg} (${up})`)
 } else {
@@ -7048,7 +6903,7 @@ return
 if (trimmed === '/reconnect-all') {
 let count = 0
 Object.entries(bots).forEach(([id, entry]) => {
-if (!botOnline(entry)) {
+if (!entry.bot?.entity) {
 const { host, port, version } = entry
 try { entry.disconnectManually() } catch (_) {}
 setTimeout(() => createBotInstance(id, host, port, version), 1000 + count * 2000)
@@ -7803,7 +7658,7 @@ if (CHAT_WATCHDOG_ENABLED) {
     const now = Date.now()
     for (const id of Object.keys(bots)) {
       const e = bots[id]
-      if (!botOnline(e) || e.spawnerDropRunning) continue // not spawned or explicitly operating a spawner GUI — nothing to keep alive
+      if (!e?.bot?.entity) continue // not spawned — nothing to keep alive
       const idle = now - (e.lastPlayerChatAt || now)
       if (idle >= CHAT_WATCHDOG_TIMEOUT_MS) {
         e.lastPlayerChatAt = now // reset so it does not re-fire every check tick
