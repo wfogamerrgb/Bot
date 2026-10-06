@@ -85,61 +85,22 @@ the selected bot; requests from other names are logged and ignored. The
 setting defaults from `TPA_AUTO_DEFAULT` after a restart.
 
 `/dump` sends the selected bot to `TPA_MAIN_PLAYER`, deposits its inventory in
-nearby containers, and returns it to `WARP_COMMAND` (default `/warp afk`).
-`/dump home` uses `DUMP_HOME_COMMAND` (default `/home stash`) instead. Both do
-nothing when the inventory is empty.
+nearby chests, and returns it to `DUMP_WARP_COMMAND` (default `/warp afk`).
+`/dump home` uses `DUMP_HOME_COMMAND` (default `/home stash`) instead.
+Both modes do nothing when the inventory is empty. `/dump hidden` creates a
+randomized multi-bot TPA chain and spreads its actions across a random 8–12
+minute run, with at least three minutes between TPA actions. Because that
+minimum gap limits how many actions fit in 8–12 minutes, extra bots in a
+larger roster are logged as skipped for that run. `/dump cancel` cancels
+pending dump timers; disconnecting a bot cancels its own pending work. An
+unrecognized option (`/dump hiden`) is reported and then runs the default TPA
+dump instead of silently doing something you did not ask for.
 
-The full grammar is `/dump [mode] ["term" …] [type] [color]`:
-
-* **"terms"** — quoted strings filter WHAT is deposited. Multiple terms are
-  OR'd; matching is case-insensitive over the display name, custom (anvil)
-  name, alt/registry name **and the item's NBT/component text** — so
-  `/dump "netherite"` also dumps a renamed *Fatal Chestplate* whose base item or
-  `Material:` tag is netherite. Names fold `_`/`-`/spaces (`"light sword"` finds
-  `Light_Sword`). A bare word works too (`/dump sword` ≡ `/dump "sword"`)
-  unless it is a keyword. Filtered-out items stay in the inventory and are
-  reported as left behind, and a filter that matches nothing does **not**
-  teleport — it reports and stops.
-* **type** — `shulker`, `chest` (repeatable, OR'd) restricts WHICH containers
-  are opened: shulker boxes, or chest + trapped chest. Default `all` (both).
-* **color** — a shulker color (`yellow`, `light_blue`, …) narrows shulker boxes
-  to that color and implies the `shulker` type. Quoting forces a term:
-  `/dump "chest"` searches for items called chest, `/dump chest` restricts to
-  chests.
-
-```text
-/dump "fatal"                        dump every Fatal* item (name or NBT match)
-/dump hidden "fatal" shulker         same items, hidden fleet run, shulker boxes only
-/dump hidden "chestplate" chest      chestplate-named items into chests
-/dump "fatal" shulker yellow         Fatal items into YELLOW shulker boxes only
-/dump "fatal" "enchanted" shulker chest   fatal OR enchanted → shulker OR chest
-/dump "netherite"                    also finds renamed netherite gear
-```
-
-`/dump hidden` is the low-profile fleet dump. Every bot goes into a shuffled
-queue and a sliding-window scheduler keeps **at most `DUMP_HIDDEN_CONCURRENT`
-bots at the spot at any moment (default 4, hard ceiling 4)** — the next bot only
-starts when the previous one has fully finished and warped away, so 70 bots
-never pile into one room. Each bot `/tpa`s to `TPA_MAIN_PLAYER`, deposits, then
-resets with `/warp afk`; starts are spaced `DUMP_HIDDEN_MIN_GAP_MS`–
-`DUMP_HIDDEN_MAX_GAP_MS` apart (default 15–45s) so arrivals look organic. The
-run finishes when the queue is empty (expect roughly roster/cap × dump time —
-30–60 minutes for 70 bots at cap 4; drop the cap to 2–3 for an even smaller
-footprint). `/dump cancel` stops the chain and reports how many bots completed;
-disconnecting a bot cancels its own pending work. An unrecognized option
-(`/dump hiden`) is reported and ignored instead of silently doing something you
-did not ask for.
-
-Every step of a run is logged: what matched, which containers were used, stacks
-deposited per container, containers that could not be opened (with the reason),
-and stacks left behind, so a dump that finds nothing or gets stuck is
-diagnosable from the log alone. A container that would not open is abandoned
-after `DUMP_OPEN_TIMEOUT_MS` instead of stalling the rest of the run.
-`/dump-spawners` is the spawner-only variant. The same matching backs
-`/find <name> ["name" …]`, which searches every bot without moving anything.
-
-Full built-in documentation is available with `/doc` (and `/doc <topic>`), and
-in the web GUI's 📚 docs panel.
+Every step of a run is logged: chests opened, stacks deposited per chest, chests
+that could not be opened (with the reason), and stacks left behind, so a dump
+that finds nothing or gets stuck is diagnosable from the log alone. A chest that
+would not open is abandoned after `DUMP_OPEN_TIMEOUT_MS` instead of stalling the
+rest of the run.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -148,12 +109,9 @@ in the web GUI's 📚 docs panel.
 | `DUMP_SETTLE_MS` | `2500` | Pause after the teleport before scanning for chests |
 | `DUMP_WARP_DELAY_MS` | `2500` | Pause after dumping before warping back to AFK |
 | `DUMP_CLICK_DELAY_MS` | `120` | Pause between shift-clicks while depositing |
-| `DUMP_OPEN_TIMEOUT_MS` | `15000` | Give up on a container that will not open |
-| `CHEST_SCAN_RADIUS` | `30` | Container search radius around the bot |
-| `CHEST_SCAN_COUNT` | `50` | Maximum containers considered per dump |
-| `DUMP_HIDDEN_CONCURRENT` | `4` | Bots allowed at the spot at once during `/dump hidden` (max 4) |
-| `DUMP_HIDDEN_MIN_GAP_MS` | `15000` | Minimum gap between hidden-dump starts |
-| `DUMP_HIDDEN_MAX_GAP_MS` | `45000` | Maximum gap between hidden-dump starts |
+| `DUMP_OPEN_TIMEOUT_MS` | `15000` | Give up on a chest that will not open |
+| `CHEST_SCAN_RADIUS` | `30` | Chest search radius around the bot |
+| `CHEST_SCAN_COUNT` | `50` | Maximum chests considered per dump |
 
 #### `/crates-all` sequence options
 
@@ -171,18 +129,11 @@ exactly as before:
 The same two knobs work as per-run flags — `dump=off|tpa|home|hidden|<player>`
 and `afk=now|off|<seconds>` — so:
 
-The `/dump` filter grammar threads through to the dump step as well — quoted
-terms and bare `shulker`/`chest`/`all` words and shulker colors after the
-`[bot] [color]` positionals. On these commands quote your terms: the first bare
-color before any filter token is the CRATE color positional.
-
 ```text
 /crates-all 5 purple dump=off afk=now   5 bots, no dump, AFK the moment each finishes
 /crates-solo B dump=player:Smith                one bot, dump at Smith
 /crates-all dump=home afk=off            dump via /home stash, then stay there
-/crates-solo B dump=hidden               yes — hidden dump works per-run too
-/crates-solo B "fatal" shulker dump=hidden      only Fatal items, shulker boxes
-/crates-solo B "fatal" shulker yellow dump=hidden   …into yellow shulker boxes
+/crates-all dump=hidden                  arm the hidden chain, stay put
 ```
 
 Flags apply to that run only and beat the `.env` values. `dump=hidden` turns the
@@ -559,73 +510,6 @@ For a web-only process:
 TUI_GUI=false
 WEB_GUI=true
 ```
-
-## Fleet controls and evidence
-
-- `/all 40-65` previews inclusive displayed 1–N bot numbers; `/all 40-65 /status`
-  runs only on them. `/all-slow 40-65 1500ms /status` uses the same range before
-  the delay. Names work too: `/all name:Alpha..Bravo /status` (roster order).
-- `/coordinates` aliases `/pos`. `/walk ~2 ~ ~-3 0` targets world-axis offsets
-  from the current position. `/manual-interact forward 500ms` (also `foward`)
-  performs a bounded facing-relative press without starting the viewer or
-  toggling manual mode; max 10s. `/manual-interact stop` cancels movement.
-  These commands send no public chat; they still produce local diagnostics.
-- `/connection` labels destination, route and actual TCP peer. A proxied peer
-  is **not** the server IP or public egress IP. Unknown IPs remain unknown.
-- `/evidence` reports observed connection reasons/times, the last three dump
-  runs with outcome messages, and recent death observations. Full authenticated
-  JSON: `/api/evidence?bot=Alpha`. History begins after installation, persists
-  in `EVIDENCE_FILE` (default `data/evidence.json`), and survives reconnects.
-  Server death packets and health transitions are separate observations, not
-  a deduplicated death count. Correlation is not proof of a ban mechanism.
-- Offline/banned bots are visible by default. Online status uses lifecycle
-  state, not a stale avatar object. Turning off “Show offline bots” still keeps
-  banned bots and the selected bot visible.
-
-### Stationary spawner drop
-
-```text
-/spawner-drop bones duration=2min cooldown=10s
-/spawner-drop "bone" scope=gui mode=once
-/spawner-drop stop
-/run-script spawner-drop
-```
-
-Opens the nearest spawner already in reach, stays still, faces it, and throws
-one **whole matching stack** at a time with confirmation. Existing inventory
-items and server GUI slots are included by default. Matching uses the same
-name/NBT terms as dumps (multiple terms are OR matched). It does not click
-sell/claim menu buttons. A plugin may reject dropping GUI slots; unchanged
-slots or timeouts stop the run without replaying clicks. Cancellation stops
-future work, but packets already sent cannot be unsent.
-
-```dotenv
-SPAWNER_DROP_MATCH=bones
-SPAWNER_DROP_DURATION_MS=60000
-SPAWNER_DROP_COOLDOWN_MS=10000
-SPAWNER_DROP_MODE=duration
-SPAWNER_DROP_SCOPE=all
-MANUAL_STEP_MS=500
-# EVIDENCE_FILE=data/evidence.json
-```
-
-Per-run `duration=`, `cooldown=`, `mode=duration|once|until-stop`, and
-`scope=all|inventory|gui` override defaults. Cooldown minimum is 100ms;
-maximum duration/cooldown is 24h. `once` processes the initially matching
-slots once, still paced; `until-stop` has no duration deadline. No automatic
-chat-game behavior is enabled by these features; chat-game code is unchanged.
-
-### Analytics restart filtering
-
-`ANALYTICS_WARMUP_MS=3000000` excludes the first fifty minutes after each
-recorded process start. New samples carry explicit process-start timestamps;
-legacy data uses first sample/startup marker/three-hour gaps as estimates.
-Filtering happens before query cutoffs so a recent query does not invent a
-restart. Fleet charts and normalized deltas divide by metric contributor
-counts; raw totals and exports remain available. Offline/stale cached metric
-readings do not contribute to new fleet samples. Different contributor cohorts
-can still change the average: normalization is not proof of production gain.
-Hover tooltips show stored numeric precision, totals, counts and bucket bounds.
 
 ## Slow broadcasts and bot selection
 
@@ -1247,11 +1131,11 @@ Any unrecognized input is sent as a Minecraft chat message or command.
 | `/auth-retry <bot>` | Clear a recorded login/register failure and reconnect so it can authenticate again |
 | `/unban <bot>` | Take a bot off the removed list and reconnect it |
 | `/closeBot` | Disconnect and remove the active bot |
-| `/dump [home|hidden|cancel] ["term" …] [shulker|chest] [color]` | TPA and deposit inventory into nearby containers, with item filters (names + NBT) and container filters |
+| `/dump` | TPA and deposit inventory into nearby chests |
 | `/crates [color]` | Run one crate collection cycle |
 | `/crates-loop [n] [color]` | Repeat crate collection |
-| `/crates-all [n] [color] [dump=…] [afk=…] ["term" …] [shulker|chest] [color]` | Run shardshop, crates, and dump across bots; `dump=`/`afk=` override the sequence defaults, quoted terms filter the dump |
-| `/crates-solo [bot] [color] [dump=…] [afk=…] ["term" …] [shulker|chest] [color]` | Run that sequence for one bot, with the same flags and dump filters |
+| `/crates-all [n] [color] [dump=…] [afk=…]` | Run shardshop, crates, and dump across bots; `dump=`/`afk=` override the sequence defaults for that run |
+| `/crates-solo [bot] [color] [dump=…] [afk=…]` | Run that sequence for one bot, with the same flags |
 | `/drop [count]` | Drop the held stack (or `count` items from it) |
 | `/pickup [all]` | Pathfind to the nearest dropped item and collect it (`all` = sweep the area) |
 | `/gui <server command>` | Open a server GUI and manage it manually (no auto-click/auto-warp) |
@@ -1279,7 +1163,7 @@ Valid crate colors include `white`, `orange`, `magenta`, `light_blue`,
 `brown`, `green`, `red`, and `black`. A color may be written as a bare name or
 as a full block name such as `purple_shulker_box`.
 
-## `/find <name> ["name" …]` — search the whole fleet
+## `/find <name>` — search the whole fleet
 
 `/find` scans every bot's inventory **and** any open window and lists matching
 items, matching against the display name, the anvil custom name, and the

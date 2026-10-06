@@ -117,9 +117,117 @@ test('the snapshot carries the series, the latest value per bot and the events',
   assert.equal(snap.totalSamples, 3)
   assert.equal(snap.series.shards.length, 1)
   assert.equal(snap.summary.shards.last, 7)
-  assert.equal(snap.summary.shards.delta, 2)
+  assert.equal(snap.summary.shards.delta, 0, 'one fleet sample cannot infer a change from a bot sample')
+  const scoped = s.snapshot({ bucketMs: HOUR, since: T0 - 1, bot: 'BotA' })
+  assert.equal(scoped.summary.shards.delta, 2)
   assert.equal(snap.series.regents.length, 1)
   fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('charts skip the warm-up ramp after each run start', () => {
+  const { dir, store: s } = store()
+  // The first sample of a series starts a run; the ramp after it is warm-up.
+  s.append(ts.botSample({ bot: 'BotA', shards: 1, source: 'test' }, T0))
+  s.append(ts.botSample({ bot: 'BotA', shards: 2, source: 'test' }, T0 + 20 * 60000))
+  s.append(ts.botSample({ bot: 'BotA', shards: 9, source: 'test' }, T0 + 51 * 60000))
+  // A 'startup' sample is the bot script booting again: new run, new ramp.
+  s.append(ts.botSample({ bot: 'BotA', shards: 5, source: 'startup' }, T0 + 2 * HOUR))
+  s.append(ts.botSample({ bot: 'BotA', shards: 6, source: 'test' }, T0 + 2 * HOUR + 10 * 60000))
+
+  const warm = s.summarize('shards', { warmupMs: 50 * 60000 })
+  assert.deepEqual(warm.points.map(p => p.value), [9], 'only the sample past the ramp counts')
+  const raw = s.summarize('shards')
+  assert.equal(raw.points.length, 5, 'warm-up off keeps everything')
+  const buckets = s.bucket('shards', { bucketMs: 24 * HOUR, warmupMs: 50 * 60000 })
+  assert.equal(buckets.reduce((n, b) => n + b.count, 0), 1)
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('a long silence counts as a restart even without a startup sample', () => {
+  const { dir, store: s } = store()
+  s.append(ts.botSample({ bot: 'BotA', shards: 1, source: 'test' }, T0))
+  s.append(ts.botSample({ bot: 'BotA', shards: 2, source: 'test' }, T0 + 2 * HOUR))
+  // Four hours of silence: sampling resumed as if the script had just started,
+  // so this sample opens a new run and its ramp is skipped too.
+  s.append(ts.botSample({ bot: 'BotA', shards: 3, source: 'test' }, T0 + 6 * HOUR))
+  s.append(ts.botSample({ bot: 'BotA', shards: 4, source: 'test' }, T0 + 6 * HOUR + 61 * 60000))
+  const warm = s.summarize('shards', { warmupMs: 50 * 60000 })
+  assert.deepEqual(warm.points.map(p => p.value), [2, 4])
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('fleet buckets carry the bot count and a per-bot line that survives a restart', () => {
+  const { dir, store: s } = store()
+  s.append(ts.fleetSample([{ bot: 'A', shards: 100 }, { bot: 'B', shards: 100 }], T0))
+  // After a restart only one bot is back yet: the total falls, the per-bot
+  // average does not — which is the line the charts plot.
+  s.append(ts.fleetSample([{ bot: 'A', shards: 105 }], T0 + HOUR))
+
+  const buckets = s.bucket('shards', { bucketMs: HOUR, kind: 'fleet' })
+  assert.equal(buckets[0].last, 200)
+  assert.equal(buckets[0].bots, 2)
+  assert.equal(buckets[0].perLast, 100)
+  assert.equal(buckets[0].perMean, 100)
+  assert.equal(buckets[1].last, 105, 'the raw total drops when a bot is offline')
+  assert.equal(buckets[1].bots, 1)
+  assert.equal(buckets[1].perLast, 105, 'the per-bot line does not')
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('a per-bot average divides by the bots that reported, not the roster', () => {
+  const { dir, store: s } = store()
+  const fleet = ts.fleetSample([
+    { bot: 'A', shards: 10 },
+    { bot: 'B', shards: 20 },
+    { bot: 'C', shards: null, coins: 1 }
+  ], T0)
+  assert.equal(fleet.bots, 3)
+  assert.equal(fleet.shards, 30)
+  assert.equal(fleet.contrib.shards, 2, 'only two bots produced the shard sum')
+  assert.equal(fleet.contrib.coins, 1)
+  s.append(fleet)
+  const buckets = s.bucket('shards', { bucketMs: HOUR, kind: 'fleet' })
+  assert.equal(buckets[0].perLast, 15, '30 over the 2 bots that reported')
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('the snapshot reports what the warm-up skip left out', () => {
+  const { dir, store: s } = store()
+  s.append(ts.fleetSample([{ bot: 'A', shards: 10 }], T0))
+  s.append(ts.fleetSample([{ bot: 'A', shards: 20 }], T0 + 30 * 60000))
+  s.append(ts.fleetSample([{ bot: 'A', shards: 30 }], T0 + 2 * HOUR))
+
+  const snap = s.snapshot({ bucketMs: HOUR, since: T0 - 1, warmupMs: 50 * 60000 })
+  assert.equal(snap.warmupMs, 50 * 60000)
+  assert.equal(snap.warmupSkipped, 2)
+  assert.equal(snap.summary.shards.last, 30)
+  assert.equal(snap.series.shards.length, 1)
+  assert.ok(snap.series.bots.length >= 1, 'the snapshot charts how many bots the fleet had')
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('explicit process starts and query cutoffs do not create false warm-up windows', () => {
+  const { dir, store: s } = store()
+  try {
+    s.append({ t: T0 + HOUR, kind: 'fleet', shards: 200, bots: 2, runStartedAt: T0 })
+    s.append({ t: T0 + 2 * HOUR, kind: 'fleet', shards: 105, bots: 1, runStartedAt: T0 })
+    s.append({ t: T0 + 3 * HOUR, kind: 'bot', bot: 'A', shards: 9999, runStartedAt: T0 })
+    const snap = s.snapshot({ since: T0 + 2 * HOUR, warmupMs: 3000000 })
+    assert.equal(snap.series.shards.length, 1, 'cutoff is not a restart')
+    assert.equal(snap.summary.shards.last, 105, 'no mixing individual bot and fleet points')
+    assert.equal(s.snapshot({ since: T0, warmupMs: 3000000 }).summary.shardsPerBot.delta, 5)
+    s.append({ t: T0 + 4 * HOUR, kind: 'fleet', shards: 1, bots: 1, runStartedAt: T0 + 4 * HOUR })
+    assert.equal(s.snapshot({ since: T0, warmupMs: 3000000 }).warmupSkipped, 1)
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('fleet ban buckets preserve the full count and zero contributor count is not a denominator fallback', () => {
+  const { dir, store: s } = store()
+  try {
+    s.append({ t: T0, kind: 'fleet', banned: 7, shards: 10, bots: 20, contrib: { shards: 0 } })
+    assert.equal(s.bucket('banned')[0].last, 7)
+    assert.equal(s.bucket('shards')[0].perLast, undefined)
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
 })
 
 test('a missing data file is an empty history, not a crash', () => {

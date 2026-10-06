@@ -15,68 +15,8 @@
 
 const METRICS = ['shards', 'coins', 'balance', 'rank', 'banned', 'invUsed', 'invFree']
 
-// How long a series has to go silent before the next sample counts as a fresh
-// run of the bot script. A restart normally announces itself with a 'startup'
-// sample, but sampling can resume without one (startup sampling turned off, a
-// long outage), and data after such a gap is just as skewed.
-const RESTART_GAP_MS = 3 * 3600000
-
 function numeric (value) {
   return typeof value === 'number' && Number.isFinite(value) ? value : null
-}
-
-/** One series = every sample of one bot, or the fleet totals. */
-function seriesKey (row) {
-  return row.kind === 'bot' ? `bot:${row.bot || ''}` : `fleet:${row.kind || ''}`
-}
-
-/**
- * The timestamps where one series starts a fresh run: its first sample, a
- * sample the sampler stamped 'startup' after a boot, or a sample that follows
- * a long silence. Everything for the next warm-up window after one of these is
- * the ramp-up the caller asked to skip.
- */
-function warmupStarts (rows, restartGapMs = RESTART_GAP_MS) {
-  const starts = []
-  let prev = null
-  for (const row of rows) {
-    const explicit = numeric(row.runStartedAt)
-    const fresh = explicit != null
-      ? !prev || prev.runStartedAt !== explicit
-      : prev == null || (row.source === 'startup' && prev.source !== 'startup') || (prev != null && row.t - prev.t >= restartGapMs)
-    if (fresh) starts.push(explicit == null ? row.t : explicit)
-    prev = row
-  }
-  return starts
-}
-
-/**
- * Drops samples inside the warm-up window of each run start. The first minutes
- * after the bot script (re)starts are skewed — bots are still logging in and
- * the totals swing — so charts and summaries that skip them describe the
- * steady state instead of the ramp.
- */
-function filterWarm (rows, warmupMs, restartGapMs = RESTART_GAP_MS) {
-  if (!(warmupMs > 0) || !rows.length) return rows
-  const bySeries = new Map()
-  for (const row of rows) {
-    const key = seriesKey(row)
-    if (!bySeries.has(key)) bySeries.set(key, [])
-    bySeries.get(key).push(row)
-  }
-  const out = []
-  for (const list of bySeries.values()) {
-    list.sort((a, b) => a.t - b.t)
-    const starts = warmupStarts(list, restartGapMs)
-    let si = 0
-    for (const row of list) {
-      while (si + 1 < starts.length && starts[si + 1] <= row.t) si++
-      const start = starts[si]
-      if (start != null && row.t >= start && row.t - start < warmupMs) continue
-      out.push(row)
-    }
-  }
-  return out.sort((a, b) => a.t - b.t)
 }
 
 /** A per-bot sample. Only defined fields are kept, so a partial pass still records what it knows. */
@@ -87,29 +27,16 @@ function botSample (row, t = Date.now()) {
     sample[key] = key === 'rank' ? (row[key] || 'N/A') : key === 'banned' ? Boolean(row[key]) : numeric(row[key])
   }
   if (row.source) sample.source = row.source
-  if (numeric(row.runStartedAt) != null) sample.runStartedAt = row.runStartedAt
-  if (numeric(row.invTotal) != null) sample.invTotal = row.invTotal
-  if (row.bannedKind) sample.bannedKind = row.bannedKind
   return sample
 }
 
-/**
- * Fleet totals at one instant — what the graph's "whole operation" line shows.
- * `contrib` records how many bots actually reported each metric, so a per-bot
- * average can divide by the number that produced the sum rather than by the
- * roster size (a bot that was offline contributed nothing and must not dilute
- * the average).
- */
-function fleetSample (rows, t = Date.now(), source = 'fleet', runStartedAt = null) {
+/** Fleet totals at one instant — what the graph's "whole operation" line shows. */
+function fleetSample (rows, t = Date.now(), source = 'fleet') {
   const sample = { t, kind: 'fleet', bots: rows.length, source }
-  if (numeric(runStartedAt) != null) sample.runStartedAt = runStartedAt
-  const contrib = {}
   for (const key of ['shards', 'coins', 'balance', 'invUsed', 'invFree']) {
     const values = rows.map(r => numeric(r[key])).filter(v => v !== null)
-    contrib[key] = values.length
     sample[key] = values.length ? values.reduce((sum, v) => sum + v, 0) : null
   }
-  sample.contrib = contrib
   const ranks = rows.map(r => r.rank).filter(Boolean)
   sample.regents = ranks.filter(r => /regent/i.test(r)).length
   sample.banned = rows.filter(r => r.banned).length
@@ -176,21 +103,13 @@ function createTimeseriesStore (opts = {}) {
    * Buckets a metric into fixed windows for graphing. Each bucket reports the
    * last reading (what the value *was*), plus min/max so a spike that happened
    * between samples is visible rather than smoothed away.
-   *
-   * Fleet rows also carry the bot count they were summed over, so each bucket
-   * gets `bots` (how many bots the fleet had at the end of the window) and a
-   * per-bot `perLast`/`perMean`/`perMin`/`perMax` — the fleet total divided by
-   * the bots that produced it. That per-bot line is what survives a restart:
-   * the total drops when half the fleet is offline, the average per bot does
-   * not.
    */
-  function bucket (metric, { bucketMs = 3600000, since: from = 0, bot = null, kind = null, limit = 500, warmupMs = 0, restartGapMs = RESTART_GAP_MS } = {}) {
-    const raw = load().filter(row => (!bot || row.bot === bot) && (!kind || row.kind === kind))
-    const rows = filterWarm(raw, warmupMs, restartGapMs).filter(row => row.t >= from)
+  function bucket (metric, { bucketMs = 3600000, since: from = 0, bot = null, kind = null, limit = 500 } = {}) {
+    const rows = load().filter(row => row.t >= from && (!bot || row.bot === bot) && (!kind || row.kind === kind))
     const buckets = new Map()
     for (const row of rows) {
       const value = metric === 'rank' ? row.rank
-        : metric === 'banned' ? (row.banned === undefined ? undefined : row.kind === 'fleet' ? numeric(row.banned) : row.banned ? 1 : 0)
+        : metric === 'banned' ? (row.banned === undefined ? undefined : row.banned ? 1 : 0)
           : numeric(row[metric])
       if (value === undefined || value === null || value === '') continue
       const key = Math.floor(row.t / bucketMs) * bucketMs
@@ -202,41 +121,18 @@ function createTimeseriesStore (opts = {}) {
         b.max = typeof b.max === 'number' ? Math.max(b.max, value) : value
         b.sum += value
         b.mean = b.sum / b.count
-        // Per-bot numbers, for fleet rows only: a single bot's series is
-        // already per bot. Older rows have no `contrib`, so fall back to the
-        // roster count they were summed over.
-        const denom = numeric(row.contrib && row.contrib[metric]) ?? numeric(row.bots)
-        if (denom && denom > 0) {
-          const per = value / denom
-          b.bots = denom
-          b.perLast = per
-          b.perSum = (b.perSum || 0) + per
-          b.perCount = (b.perCount || 0) + 1
-          b.perMean = b.perSum / b.perCount
-          b.perMin = b.perMin == null ? per : Math.min(b.perMin, per)
-          b.perMax = b.perMax == null ? per : Math.max(b.perMax, per)
-        }
       }
       buckets.set(key, b)
     }
     return [...buckets.values()].sort((a, b) => a.t - b.t).slice(-limit)
   }
 
-  /**
-   * First/last/min/max/delta/per-hour for one metric — the headline numbers.
-   * With `warmupMs`, the ramp after each run start is left out of every number
-   * here, so the delta of a window is not a picture of the restart inside it.
-   */
+  /** First/last/min/max/delta/per-hour for one metric — the headline numbers. */
   function summarize (metric, opts2 = {}) {
-    const raw = load().filter(row => (!opts2.bot || row.bot === opts2.bot) && (!opts2.kind || row.kind === opts2.kind))
-    const rows = filterWarm(raw, opts2.warmupMs || 0, opts2.restartGapMs).filter(row => row.t >= (opts2.since || 0)).sort((a, b) => a.t - b.t)
+    const rows = load().filter(row => (!opts2.bot || row.bot === opts2.bot) && row.t >= (opts2.since || 0))
     const points = []
     for (const row of rows) {
-      let value = metric === 'rank' ? row.rank : numeric(row[metric])
-      if (opts2.perBot && row.kind === 'fleet') {
-        const denom = numeric(row.contrib && row.contrib[metric]) ?? numeric(row.bots)
-        value = denom > 0 && value != null ? value / denom : null
-      }
+      const value = metric === 'rank' ? row.rank : numeric(row[metric])
       if (value === null || value === undefined || value === '') continue
       points.push({ t: row.t, value })
     }
@@ -256,8 +152,8 @@ function createTimeseriesStore (opts = {}) {
       points
     }
     if (numbers.length) {
-      out.min = numbers.reduce((a, b) => Math.min(a, b), Infinity)
-      out.max = numbers.reduce((a, b) => Math.max(a, b), -Infinity)
+      out.min = Math.min(...numbers)
+      out.max = Math.max(...numbers)
       out.mean = numbers.reduce((sum, v) => sum + v, 0) / numbers.length
       out.delta = typeof last.value === 'number' && typeof first.value === 'number' ? last.value - first.value : null
       out.perHour = out.delta != null && spanMs > 0 ? out.delta / (spanMs / 3600000) : null
@@ -316,14 +212,7 @@ function createTimeseriesStore (opts = {}) {
       latest[bot] = mine[mine.length - 1] || null
     }
     const bucketMs = opts2.bucketMs || 3600000
-    const warmupMs = opts2.warmupMs || 0
-    const from = opts2.since ?? rows.reduce((min, row) => Math.min(min, row.t), Date.now()) - 7 * 24 * 3600000
-    const scope = { bucketMs, since: from, warmupMs, restartGapMs: opts2.restartGapMs, bot: opts2.bot || null, kind: opts2.bot ? 'bot' : 'fleet' }
-    const scoped = rows.filter(r => (!scope.bot || r.bot === scope.bot) && r.kind === scope.kind)
-    const kept = filterWarm(scoped, warmupMs, opts2.restartGapMs).filter(r => r.t >= from)
-    const summaryScope = { ...scope }
-    delete summaryScope.bucketMs
-    const perBotSummary = { ...summaryScope, perBot: !opts2.bot }
+    const from = opts2.since || Math.min(...(rows.length ? rows.map(r => r.t) : [Date.now()]), Date.now()) - 7 * 24 * 3600000
     return {
       file,
       updatedAt: Date.now(),
@@ -331,29 +220,19 @@ function createTimeseriesStore (opts = {}) {
       bots,
       latest,
       bucketMs,
-      // How the chart window was cleaned, so a page can say so rather than
-      // leaving the reader to wonder why points are missing.
-      warmupMs,
-      warmupSkipped: scoped.filter(r => r.t >= from).length - kept.length,
-      scope: opts2.bot || 'fleet',
-      warmupPolicy: 'Explicit process start for new samples; legacy samples infer start from first sample, startup marker or 3-hour gap.',
       series: {
-        shards: bucket('shards', scope),
-        coins: bucket('coins', scope),
-        balance: bucket('balance', scope),
-        regents: bucket('regents', { ...scope, kind: 'fleet' }),
-        banned: bucket('banned', { ...scope, kind: 'fleet' }),
-        bots: bucket('bots', { ...scope, kind: 'fleet' })
+        shards: bucket('shards', { bucketMs, since: from, bot: opts2.bot || null, kind: opts2.bot ? 'bot' : 'fleet' }),
+        coins: bucket('coins', { bucketMs, since: from, bot: opts2.bot || null, kind: opts2.bot ? 'bot' : 'fleet' }),
+        balance: bucket('balance', { bucketMs, since: from, bot: opts2.bot || null, kind: opts2.bot ? 'bot' : 'fleet' }),
+        regents: bucket('regents', { bucketMs, since: from, kind: 'fleet' }),
+        banned: bucket('banned', { bucketMs, since: from, kind: 'fleet' })
       },
       summary: {
-        shards: summarize('shards', summaryScope),
-        coins: summarize('coins', summaryScope),
-        balance: summarize('balance', summaryScope),
-        shardsPerBot: summarize('shards', perBotSummary),
-        coinsPerBot: summarize('coins', perBotSummary),
-        balancePerBot: summarize('balance', perBotSummary),
-        regents: summarize('regents', { ...summaryScope, bot: null, kind: 'fleet' }),
-        banned: summarize('banned', { ...summaryScope, bot: null, kind: 'fleet' })
+        shards: summarize('shards', { since: from }),
+        coins: summarize('coins', { since: from }),
+        balance: summarize('balance', { since: from, bot: opts2.bot || null }),
+        regents: summarize('regents', { since: from }),
+        banned: summarize('banned', { since: from })
       },
       events: events({ since: from })
     }
@@ -362,4 +241,4 @@ function createTimeseriesStore (opts = {}) {
   return { append, all, since, bucket, summarize, events, snapshot, clear, file }
 }
 
-module.exports = { METRICS, RESTART_GAP_MS, botSample, fleetSample, warmupStarts, filterWarm, createTimeseriesStore }
+module.exports = { METRICS, botSample, fleetSample, createTimeseriesStore }

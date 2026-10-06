@@ -13,7 +13,6 @@ const plain = value => JSON.parse(JSON.stringify(value))
 // connections, disk history writes, or process-wide handlers are started.
 function runtime(env = {}) {
   const timers = new Map()
-  const createdBots = []
   const authAlerts = []
   // Two HTTP servers run in production (dashboard, analytics) on different
   // ports, so handlers are routed by the port each one listens on. "Last
@@ -39,7 +38,6 @@ function runtime(env = {}) {
   const stateEnv = {
     DATA_FILE: path.join(stateDir, 'spawner-data.json'),
     REMOVED_BOTS_FILE: path.join(stateDir, 'removed-bots.json'),
-    EVIDENCE_FILE: path.join(stateDir, 'evidence.json'),
     TIMESERIES_FILE: path.join(stateDir, 'timeseries.jsonl'),
     TIMESERIES_SUMMARY_FILE: path.join(stateDir, 'timeseries-summary.json')
   }
@@ -103,15 +101,7 @@ function runtime(env = {}) {
       if (name === './coinflip-dashboard-static') return require('../coinflip-dashboard-static')
       if (name === './ai-chat') return require('../ai-chat')
       if (name === './bot-manual') return () => ({ routeCommand: () => false, key() {}, onWindowOpen: () => false, onWindowClose() {}, stopManualMode() {}, snapshotFor: () => null })
-      if (name === 'mineflayer') return { createBot() {
-        if (!env.TEST_CREATE_BOTS) throw Error('Live bot connections forbidden in tests')
-        const bot = new EventEmitter()
-        const client = new EventEmitter()
-        Object.assign(client, { write() {}, state: 'play', socket: { remoteAddress: '203.0.113.2', remotePort: 25565 } })
-        Object.assign(bot, { _client: client, loadPlugin() {}, quit() {}, entity: { position: { x: 1, y: 64, z: 2 } } })
-        createdBots.push(bot)
-        return bot
-      } }
+      if (name === 'mineflayer') return { createBot() { throw Error('Live bot connections forbidden in tests') } }
       if (name === 'mineflayer-armor-manager') return () => {}
       if (name === 'mineflayer-pathfinder') return { goals: {} }
       if (name === 'socks') return {}
@@ -160,94 +150,8 @@ function runtime(env = {}) {
     ws.command = msg => ws.emit('message', JSON.stringify(msg))
     return ws
   }
-  return { context, run, timers, initialOrder, request, login, socket, authAlerts, createdBots }
+  return { context, run, timers, initialOrder, request, login, socket, authAlerts }
 }
-
-test('real bot lifecycle events mark stale avatars offline and persist death evidence', () => {
-  const r = runtime({ TEST_CREATE_BOTS: true })
-  r.run(`createBotInstance('D', 'game.example', 25565, '1.21.1')`)
-  const bot = r.createdBots[0]
-  assert.equal(r.run(`bots.D.connectionState`), 'connecting')
-  bot.emit('spawn')
-  assert.equal(r.run(`botOnline(bots.D)`), true)
-  bot.emit('death')
-  assert.equal(r.run(`evidenceStore.get('D').deaths.length`), 1)
-  bot.emit('kicked', 'Disconnected by server')
-  assert.equal(r.run(`botOnline(bots.D)`), false)
-  bot.emit('end', 'socketClosed')
-  assert.equal(r.run(`bots.D.connectionState`), 'disconnected')
-  assert.ok(bot.entity, 'test retains stale avatar to reproduce the actual bug')
-  assert.equal(r.run(`bots.D.spawnTime`), null)
-})
-
-test('range broadcasts preview without sending, preserve arguments and reject invalid targets', () => {
-  const r = runtime()
-  r.run(`handleCommand('/all 2-3')`)
-  assert.deepEqual(plain(r.context.chats), [])
-  r.run(`handleCommand('/all 2-3 /server lifesteal')`)
-  assert.deepEqual(plain(r.context.chats), [['B', '/server lifesteal'], ['C', '/server lifesteal']])
-  r.context.chats.length = 0
-  r.run(`handleCommand('/all-slow B-C 1500ms /server afk')`)
-  assert.deepEqual(plain(r.context.chats), [['B', '/server afk']])
-  const timer = [...r.timers.values()].find(t => t.delay === 1500)
-  assert.ok(timer)
-  timer.fn()
-  assert.deepEqual(plain(r.context.chats.at(-1)), ['C', '/server afk'])
-  r.context.chats.length = 0
-  for (const text of ['/all 0-3 /status', '/all 3-2 /status', '/all 1-99 /status']) { r.context.text = text; r.run('handleCommand(text)') }
-  assert.deepEqual(plain(r.context.chats), [])
-  assert.equal(r.run(`destructiveCommandEffect('/all 2-3 /dc')`), 'disconnects every bot at once')
-})
-
-test('served dashboard retains both COINFLIP and PLAY buttons', async () => {
-  for (const enabled of ['true', 'false']) {
-    const r = runtime({ MC_WEB_ENABLED: enabled }), cookie = await r.login()
-    const res = await r.request('/', '', cookie, 'GET')
-    const html = res.body.toString('utf8')
-    assert.match(html, /id="coinflipbtn"/)
-    assert.equal(html.includes('id="playbtn"'), enabled === 'true')
-    assert.match(html, /id="show-all-bots" checked/)
-  }
-})
-
-test('removed permanent bans remain visible without becoming broadcast targets', () => {
-  const r = runtime()
-  r.run(`removedBotsStore.addRemovedBot(removedBots, { bot: 'Gone', kind: 'permanent', reason: 'Banned by server' })`)
-  const removed = plain(r.run('botSnapshot()')).find(b => b.id === 'Gone')
-  assert.equal(removed.online, false)
-  assert.equal(removed.removed, true)
-  assert.equal(removed.banned, true)
-  r.run(`handleCommand('/all !hello')`)
-  assert.equal(r.context.chats.some(([id]) => id === 'Gone'), false)
-})
-
-test('retained avatar does not make ended/banned bot online in dashboard snapshots', async () => {
-  const r = runtime(), cookie = await r.login()
-  r.run(`bots.B.connectionState = 'disconnected'; bots.B.disconnectedAt = 1234; bots.B.lastDisconnectReason = 'socketClosed'; dataState.bots.B = { bot: 'B', banned: true, banReason: 'Banned by server' }`)
-  const snapshot = plain(r.run('botSnapshot()')).find(b => b.id === 'B')
-  assert.equal(snapshot.online, false)
-  assert.equal(snapshot.connecting, false)
-  assert.equal(snapshot.state, 'banned')
-  assert.equal(snapshot.number, 2)
-  assert.equal(r.run('globalStats().online'), 2)
-  r.run(`handleCommand('/all /server afk')`)
-  assert.deepEqual(plain(r.context.chats), [['A', '/server afk'], ['C', '/server afk']])
-  const res = await r.request('/api/evidence?bot=B', '', cookie, 'GET')
-  assert.equal(res.status, 200)
-  assert.equal(JSON.parse(res.body).current.state, 'banned')
-  assert.equal(JSON.parse(res.body).deaths.length, 0)
-})
-
-test('connection report distinguishes destination and proxy peer without exposing passwords', () => {
-  const r = runtime({ PROXY_HOST: '127.0.0.1', PROXY_PORT: '9050', PROXY_USER: 'secret-user', PROXY_PASS: 'secret-pass' })
-  r.run(`bots.A.host = 'game.example'; bots.A.port = 25565; bots.A.bot._client = { socket: { remoteAddress: '127.0.0.1', remotePort: 9050 } }`)
-  const info = plain(r.run(`connectionDetails('A', bots.A)`))
-  assert.equal(info.route, 'proxied')
-  assert.equal(info.serverIp, null)
-  assert.equal(info.tcpPeer, '127.0.0.1')
-  assert.doesNotMatch(JSON.stringify(info), /secret-user|secret-pass/)
-  assert.equal(r.run(`settings.get('CHAT_GAME_AUTO')`), false, 'preserve the user-disabled server default')
-})
 
 test('startup randomization defaults on and false/off/0/no preserve configured order', () => {
   assert.equal(runtime().run('RANDOMIZE_BOT_ORDER'), true)
@@ -591,13 +495,9 @@ test('/unban-all restores everyone with a stagger between reconnects', () => {
 })
 
 // The chat-game default pace is a gameplay decision: too fast looks scripted.
-test('chat games stay disabled and preserve the user-configured server pace', () => {
+test('chat game guesses default to one every 350ms', () => {
   const r = runtime()
-  assert.equal(r.run("settings.get('CHAT_GAME_AUTO')"), false)
-  assert.equal(r.run("settings.get('CHAT_GAME_GUESS_MS')"), 1150)
-  assert.equal(r.run("settings.get('CHAT_GAME_MAX_BOTS')"), 10)
-  r.run(`feedChatGameLine('Hint: 1-15')`)
-  assert.deepEqual(plain(r.context.chats), [], 'disabled game never replies')
+  assert.equal(r.run("settings.get('CHAT_GAME_GUESS_MS')"), 350)
   const tuned = runtime({ CHAT_GAME_GUESS_MS: '50' })
   assert.equal(tuned.run("settings.get('CHAT_GAME_GUESS_MS')"), 50, 'and stays overridable')
 })
@@ -643,7 +543,7 @@ test('the ban sweep clears lapsed flags without touching connections', () => {
 // A "guess the number" chat game is answered by the fleet: every number in the
 // range exactly once, from more than one bot, as fast as the timer allows.
 test('chat game prompts are covered by the fleet in random order', () => {
-  const r = runtime({ CHAT_GAME_AUTO: 'true' })
+  const r = runtime()
   r.timers.clear()
   r.run(`feedChatGameLine('A chat event has started! You have 20 seconds to guess the number')`)
   assert.equal(r.run('chatGame.running'), false, 'a countdown alone starts nothing')
@@ -670,7 +570,7 @@ test('chat game prompts are covered by the fleet in random order', () => {
 // An equation round has ONE exact answer, so exactly ONE randomly chosen bot
 // says it — computed, never guessed, and never twice.
 test('an equation chat game is answered exactly once by one bot', () => {
-  const r = runtime({ CHAT_GAME_AUTO: 'true' })
+  const r = runtime()
   r.timers.clear()
   r.run(`feedChatGameLine('Solve: 3x+5=20 | Reward: $2,500')`)
   const chats = plain(r.context.chats)
@@ -2060,30 +1960,15 @@ test('/timeseries series reports the recorded samples and where the JSON is', ()
 })
 
 test('the analytics report is built from the same history and samples the page reads', () => {
-  // Warm-up skip off: this test records samples *now* and reads them straight
-  // back. The skip itself has its own test below and in timeseries.test.js.
-  const r = runtime(dataEnv({ ANALYTICS_WARMUP_MS: '0' }))
+  const r = runtime(dataEnv())
   r.run("coinflipStore.append({ id: 'x1', bot: 'A', ts: 1700000000000, wager: 1000, result: 'won', delta: 1000, method: 'message' })")
-  r.run("recordTimeseriesSample('A', { shards: 10, coins: 1, balance: 100 }, 'test'); recordFleetSample('test')")
+  r.run("recordTimeseriesSample('A', { shards: 10, coins: 1, balance: 100 }, 'test')")
   const report = plain(r.run('buildAnalyticsReport()'))
   assert.equal(report.headline.coinflips, 1)
   assert.equal(report.headline.shardsNow, 10)
   assert.equal(report.coinflip.stats.wins, 1)
   assert.ok(report.timeseries.bots.includes('A'))
   assert.match(r.run('analytics.renderHtml(buildAnalyticsReport())'), /Fairness verdict/)
-})
-
-test('charts and deltas skip the first 50 minutes after a run start by default', () => {
-  const r = runtime(dataEnv())
-  r.run("recordTimeseriesSample('A', { shards: 10, coins: 1, balance: 100 }, 'test'); recordFleetSample('test')")
-  assert.equal(r.run("settings.get('ANALYTICS_WARMUP_MS')"), 3000000)
-  const snap = plain(r.run("timeseriesStore.snapshot({ bucketMs: settings.get('ANALYTICS_BUCKET_MS'), warmupMs: settings.get('ANALYTICS_WARMUP_MS') })"))
-  assert.equal(snap.warmupMs, 3000000)
-  assert.equal(snap.warmupSkipped, 1, 'the sample inside the ramp is left out')
-  assert.equal(snap.summary.shards, null)
-  assert.equal(r.run('buildAnalyticsReport().timeseries.warmupSkipped'), 1, 'the report the page reads applies the same skip')
-  // …and raw=1 in /api/timeseries puts it back for whoever wants to see it.
-  assert.equal(r.run("timeseriesStore.bucket('shards', { warmupMs: 0 }).length"), 1)
 })
 
 test('the time-series sampler records a bot sample and a fleet total', async () => {

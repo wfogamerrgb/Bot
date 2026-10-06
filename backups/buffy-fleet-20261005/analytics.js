@@ -88,27 +88,17 @@ function buildHeadline (coinflip, timeseries) {
  * A single-series line chart. Points are {t, last} buckets in time order; the
  * x-axis is time, not index, so a gap in sampling shows as a gap rather than
  * being drawn as if it were continuous.
- *
- * `opts.valueKey` picks which field of a bucket is plotted (default `last`) —
- * fleet charts plot `perLast`, the total divided by the bots that produced it,
- * so a restart that takes half the fleet offline does not draw a crash.
- *
- * The chart is drawn for the eye but read with the mouse: every figure carries
- * its points as JSON and the page script puts a crosshair on the nearest one,
- * with a tooltip holding the exact numbers of that bucket.
  */
 function lineChart (buckets, opts = {}) {
   const width = opts.width || 640
   const height = opts.height || 140
   const pad = { top: 14, right: 54, bottom: 18, left: 8 }
   const label = opts.label || ''
-  const valueKey = opts.valueKey || 'last'
-  const valueOf = b => typeof b[valueKey] === 'number' && Number.isFinite(b[valueKey]) ? b[valueKey] : null
-  const points = (buckets || []).filter(b => typeof valueOf(b) === 'number')
+  const points = (buckets || []).filter(b => typeof b.last === 'number')
   if (points.length < 2) {
     return `<div class="empty">${esc(label)}: not enough samples yet</div>`
   }
-  const values = points.map(valueOf)
+  const values = points.map(p => p.last)
   const times = points.map(p => p.t)
   const min = Math.min(...values)
   const max = Math.max(...values)
@@ -121,7 +111,7 @@ function lineChart (buckets, opts = {}) {
   const x = t => pad.left + ((t - t0) / tSpan) * innerW
   const y = v => pad.top + innerH - ((v - min) / span) * innerH
 
-  const line = points.map((p, i) => `${i ? 'L' : 'M'}${x(p.t).toFixed(1)},${y(valueOf(p)).toFixed(1)}`).join(' ')
+  const line = points.map((p, i) => `${i ? 'L' : 'M'}${x(p.t).toFixed(1)},${y(p.last).toFixed(1)}`).join(' ')
   const area = `${line} L${x(t1).toFixed(1)},${(pad.top + innerH).toFixed(1)} L${x(t0).toFixed(1)},${(pad.top + innerH).toFixed(1)} Z`
   const grid = [0, 0.5, 1].map(f => {
     const gy = pad.top + innerH * f
@@ -131,49 +121,16 @@ function lineChart (buckets, opts = {}) {
   }).join('')
   const color = opts.color || 'var(--acc)'
 
-  // Everything the hover needs to find a point and say exactly what it is:
-  // the geometry, the window size, and the full-fidelity numbers behind each
-  // dot. JSON rather than data-attributes because a bucket carries up to nine
-  // fields and the reader deserves all of them, not a rounded echo.
-  const meta = {
-    label,
-    w: width,
-    h: height,
-    pad,
-    t0,
-    t1,
-    min,
-    max,
-    valueKey,
-    bucketMs: opts.bucketMs || null,
-    unit: opts.unit || '',
-    points: points.map(p => ({
-      t: p.t,
-      v: valueOf(p),
-      last: p.last,
-      per: p.perLast,
-      bots: p.bots == null ? null : p.bots,
-      min: typeof p.min === 'number' ? p.min : null,
-      max: typeof p.max === 'number' ? p.max : null,
-      n: p.count == null ? null : p.count
-    }))
-  }
-  const data = JSON.stringify(meta).replace(/</g, '\\u003c').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029')
-
   return `<figure class="chart">
-<figcaption>${esc(label)} <span class="range">${esc(fmt(min))} → ${esc(fmt(max))} · ${points.length} buckets · ${esc(duration(tSpan))}${opts.note ? ` · ${esc(opts.note)}` : ''}</span></figcaption>
+<figcaption>${esc(label)} <span class="range">${esc(fmt(min))} → ${esc(fmt(max))} · ${points.length} buckets · ${esc(duration(tSpan))}</span></figcaption>
 <svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="${esc(label)} trend">
 ${grid}
 <path d="${area}" fill="${color}" opacity="0.12"/>
 <path d="${line}" fill="none" stroke="${color}" stroke-width="1.8" stroke-linejoin="round"/>
-<circle cx="${x(points[points.length - 1].t).toFixed(1)}" cy="${y(valueOf(points[points.length - 1])).toFixed(1)}" r="3" fill="${color}"/>
-<line class="hoverline" x1="0" y1="${pad.top}" x2="0" y2="${pad.top + innerH}" visibility="hidden"/>
-<circle class="hoverdot" r="4" fill="${color}" stroke="#0a0e13" stroke-width="1.5" visibility="hidden"/>
+<circle cx="${x(points[points.length - 1].t).toFixed(1)}" cy="${y(points[points.length - 1].last).toFixed(1)}" r="3" fill="${color}"/>
 <text x="${pad.left}" y="${height - 5}" class="axis">${esc(fmtTime(t0))}</text>
 <text x="${pad.left + innerW - 90}" y="${height - 5}" class="axis">${esc(fmtTime(t1))}</text>
-</svg>
-<script type="application/json" class="chart-data">${data}</script>
-</figure>`
+</svg></figure>`
 }
 
 /** A horizontal bar for a rate, with the 50% line marked for coinflips. */
@@ -221,14 +178,7 @@ th{color:var(--dim);font-weight:500;text-transform:uppercase;font-size:10px;lett
 td.num{text-align:right}
 tr:hover td{background:var(--panel2)}
 .charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px}
-.chart{margin:0;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px;position:relative}
-.chart-tip{position:fixed;z-index:50;pointer-events:none;background:#0f151d;border:1px solid var(--acc);border-radius:8px;padding:8px 10px;font-size:11px;line-height:1.6;color:#e8f0f6;box-shadow:0 8px 24px rgba(0,0,0,.5);max-width:280px}
-.chart-tip .t{color:var(--dim);white-space:nowrap}
-.chart-tip .v{font-size:14px;font-weight:600;color:var(--acc);white-space:nowrap}
-.chart-tip .d{color:var(--txt);white-space:nowrap}
-.chart-tip .x{color:var(--dim);white-space:nowrap}
-.hoverline{stroke:var(--acc);stroke-width:1;stroke-dasharray:3 3;opacity:.7}
-.hoverdot{opacity:.9}
+.chart{margin:0;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px}
 .chart figcaption{color:#dbe6ee;font-size:12px;margin-bottom:6px}
 .chart .range{color:var(--dim);font-size:11px;float:right}
 .chart svg{width:100%;height:120px;display:block}
@@ -432,28 +382,23 @@ function timeseriesSection (ts, bucketMs) {
   const eventRows = (ts.events?.bans || []).slice(-15).reverse().map(e => `<tr><td>${esc(fmtTime(e.t))}</td><td>${esc(e.bot)}</td><td class="${e.banned ? 'loss' : 'win'}">${e.banned ? 'banned' : 'unbanned'}</td></tr>`).join('')
   const rankRows = (ts.events?.ranks || []).slice(-15).reverse().map(e => `<tr><td>${esc(fmtTime(e.t))}</td><td>${esc(e.bot)}</td><td>${esc(e.previous || '–')} → <b>${esc(e.rank)}</b></td></tr>`).join('')
 
-  const warmNote = ts.warmupMs > 0
-    ? `<p class="sub" style="margin:6px 0 0">Charts and window deltas skip the first ${esc(duration(ts.warmupMs))} after every bot-script (re)start — the ramp there is skewed${ts.warmupSkipped ? ` (${ts.warmupSkipped} sample(s) skipped)` : ''}. Fleet lines are per bot (total ÷ bots that reported), so changes in contributor count are explicit rather than mistaken for total losses. Averages can still shift when different bots contribute. Legacy restarts are inferred; new samples carry process-start timestamps. Hover a point for its exact numbers.</p>`
-    : `<p class="sub" style="margin:6px 0 0">Fleet lines are per bot (total ÷ bots that reported). Hover a point for its exact numbers.</p>`
   return `<h2>Fleet over time</h2>
 <div class="kpis">
 ${kpi('tracked bots', (ts.bots || []).length)}
 ${kpi('samples', fmt(ts.totalSamples))}
 ${kpi('shards now', fmt(sum.shards?.last))}
-${kpi('shards Δ per bot', fmt(sum.shardsPerBot?.delta), (sum.shardsPerBot?.delta || 0) >= 0 ? 'win' : 'loss')}
+${kpi('shards Δ window', fmt(sum.shards?.delta), (sum.shards?.delta || 0) >= 0 ? 'win' : 'loss')}
 ${kpi('balance now', fmt(sum.balance?.last, 2))}
-${kpi('balance Δ per bot', fmt(sum.balancePerBot?.delta, 2), (sum.balancePerBot?.delta || 0) >= 0 ? 'win' : 'loss')}
+${kpi('balance Δ window', fmt(sum.balance?.delta, 2), (sum.balance?.delta || 0) >= 0 ? 'win' : 'loss')}
 ${kpi('regent ranks', sum.regents?.last ?? '–')}
 ${kpi('banned bots', sum.banned?.last ?? '–')}
 </div>
-${warmNote}
 <div class="charts" style="margin-top:12px">
-${lineChart(s.shards, { label: 'Shards (fleet)', color: 'var(--cyan)', valueKey: 'perLast', bucketMs, note: 'per bot' })}
-${lineChart(s.coins, { label: 'Coins (fleet)', color: 'var(--yel)', valueKey: 'perLast', bucketMs, note: 'per bot' })}
-${lineChart(s.balance, { label: 'Balance (fleet, $)', color: 'var(--grn)', valueKey: 'perLast', bucketMs, unit: '$', note: 'per bot' })}
-${lineChart(s.bots, { label: 'Bots tracked (fleet)', color: 'var(--acc)', bucketMs })}
-${lineChart(s.regents, { label: 'Regent ranks', color: 'var(--mag)', bucketMs })}
-${lineChart(s.banned, { label: 'Banned bots', color: 'var(--red)', bucketMs })}
+${lineChart(s.shards, { label: 'Shards (fleet)', color: 'var(--cyan)' })}
+${lineChart(s.coins, { label: 'Coins (fleet)', color: 'var(--yel)' })}
+${lineChart(s.balance, { label: 'Balance (fleet, $)', color: 'var(--grn)' })}
+${lineChart(s.regents, { label: 'Regent ranks', color: 'var(--mag)' })}
+${lineChart(s.banned, { label: 'Banned bots', color: 'var(--red)' })}
 </div>
 <div class="panel" style="margin-top:12px">
 <h2 style="margin-top:0">Latest per bot</h2>
@@ -488,13 +433,13 @@ ${kpi('samples', fmt(h.samples))}
 ${kpi('shards now', fmt(h.shardsNow))}
 </div>
 ${renderTabs('coinflip')}
-<section id="tab-coinflip" data-tab="coinflip" data-loaded="1">
+<section id="tab-coinflip" data-tab="coinflip">
 ${coinflipSection(report.coinflip)}
 </section>
 <section id="tab-deep" data-tab="deep" hidden>
-<div class="panel"><div class="empty">Loading the deep dissection…</div></div></section>
+<div class="panel"><div class="empty">Loading the deep dissection…</div></section>
 <section id="tab-timeseries" data-tab="timeseries" hidden>
-<div class="panel"><div class="empty">Loading the fleet charts…</div></div></section>
+<div class="panel"><div class="empty">Loading the fleet charts…</div></section>
 <p class="sub" style="margin-top:22px">JSON: <a href="/api/analytics">/api/analytics</a> · coinflips only: <a href="/api/coinflip">/api/coinflip</a> · series: <a href="/api/timeseries?metric=shards&amp;bucket=1h">/api/timeseries?metric=shards&amp;bucket=1h</a> · deep: <a href="/api/coinflip/deep">/api/coinflip/deep</a></p>
 <script>
 (function () {
@@ -514,78 +459,15 @@ ${coinflipSection(report.coinflip)}
     try { location.hash = '#tab-' + key; } catch (e) {}
   }
   function loadTab (key, panel) {
-    var url = '/api/analytics';
+    var url = key === 'deep' ? '/api/coinflip/deep' : '/api/analytics';
     fetch(url, { cache: 'no-store' }).then(function (r) { return r.json(); }).then(function (data) {
       var html = key === 'deep' ? window.CFK_DEEP_HTML(data) : window.CFK_ANALYTICS_HTML(data);
       if (html != null) panel.innerHTML = html;
-    }).catch(function () { panel.innerHTML = '<div class="panel"><div class="empty">Could not load that tab.</div></div>'; panel.removeAttribute('data-loaded'); });
+    }).catch(function () { panel.innerHTML = '<div class="panel"><div class="empty">Could not load that tab.</div></div>'; });
   }
   tabs.forEach(function (t) { t.addEventListener('click', function (e) { e.preventDefault(); activate(t.getAttribute('data-tab')); }); });
   var hash = (location.hash || '').replace('#tab-', '');
   if (hash && panels[hash]) activate(hash); else activate('coinflip');
-  // Chart hover: a crosshair on the nearest point and a tooltip carrying the
-  // exact numbers behind it — the drawn line is for the eye, the tooltip is
-  // for the record. Delegated from the document so charts injected with
-  // innerHTML (the other tabs) behave like the ones in the first paint.
-  var tip = document.createElement('div');
-  tip.className = 'chart-tip';
-  tip.style.display = 'none';
-  document.body.appendChild(tip);
-  function fmtExact (v) {
-    if (typeof v !== 'number' || !isFinite(v)) return '\u2013';
-    return String(v);
-  }
-  function fmtT (t) { return new Date(t).toISOString().replace('T', ' ').slice(0, 16) + 'Z'; }
-  function hideHover () {
-    tip.style.display = 'none';
-    Array.prototype.forEach.call(document.querySelectorAll('.hoverline,.hoverdot'), function (n) { n.setAttribute('visibility', 'hidden'); });
-  }
-  document.addEventListener('mousemove', function (e) {
-    var fig = e.target && e.target.closest ? e.target.closest('figure.chart') : null;
-    if (!fig) { hideHover(); return; }
-    var svg = fig.querySelector('svg');
-    var dataEl = fig.querySelector('script.chart-data');
-    if (!svg || !dataEl) { hideHover(); return; }
-    var meta;
-    try { meta = JSON.parse(dataEl.textContent); } catch (err) { hideHover(); return; }
-    var rect = svg.getBoundingClientRect();
-    if (!rect.width || !rect.height) { hideHover(); return; }
-    var innerW = meta.w - meta.pad.left - meta.pad.right;
-    var innerH = meta.h - meta.pad.top - meta.pad.bottom;
-    var tSpan = (meta.t1 - meta.t0) || 1;
-    var span = (meta.max - meta.min) || 1;
-    var xOf = function (t) { return meta.pad.left + ((t - meta.t0) / tSpan) * innerW; };
-    var yOf = function (v) { return meta.pad.top + innerH - ((v - meta.min) / span) * innerH; };
-    var vbX = ((e.clientX - rect.left) / rect.width) * meta.w;
-    var best = null, bestD = Infinity;
-    (meta.points || []).forEach(function (p) {
-      var d = Math.abs(xOf(p.t) - vbX);
-      if (d < bestD) { bestD = d; best = p; }
-    });
-    if (!best) { hideHover(); return; }
-    var line = fig.querySelector('.hoverline');
-    if (line) { line.setAttribute('x1', xOf(best.t)); line.setAttribute('x2', xOf(best.t)); line.setAttribute('visibility', 'visible'); }
-    var dot = fig.querySelector('.hoverdot');
-    if (dot) { dot.setAttribute('cx', xOf(best.t)); dot.setAttribute('cy', yOf(best.v)); dot.setAttribute('visibility', 'visible'); }
-    var rows = [];
-    rows.push('<div class="t">' + fmtT(best.t) + (meta.bucketMs ? ' \u2192 ' + fmtT(best.t + meta.bucketMs) : '') + '</div>');
-    rows.push('<div class="v">' + fmtExact(best.v) + (meta.unit ? ' ' + meta.unit : '') + (meta.valueKey === 'perLast' ? ' <span class="t">per bot</span>' : '') + '</div>');
-    if (best.per != null && best.last != null && best.per !== best.last) {
-      rows.push('<div class="d">per bot ' + fmtExact(best.per) + ' \u00b7 fleet total ' + fmtExact(best.last) + '</div>');
-    }
-    if (best.bots != null) rows.push('<div class="x">' + best.bots + ' bot(s) counted</div>');
-    if (best.min != null && best.max != null) rows.push('<div class="x">bucket range ' + fmtExact(best.min) + ' \u2013 ' + fmtExact(best.max) + (best.n ? ' \u00b7 ' + best.n + ' sample(s)' : '') + '</div>');
-    else if (best.n) rows.push('<div class="x">' + best.n + ' sample(s)</div>');
-    tip.innerHTML = rows.join('');
-    tip.style.display = 'block';
-    var left = e.clientX + 14, top = e.clientY + 12;
-    if (left + tip.offsetWidth > window.innerWidth - 8) left = e.clientX - tip.offsetWidth - 14;
-    if (top + tip.offsetHeight > window.innerHeight - 8) top = e.clientY - tip.offsetHeight - 12;
-    tip.style.left = left + 'px';
-    tip.style.top = top + 'px';
-  });
-  document.addEventListener('scroll', hideHover, true);
-  window.addEventListener('blur', hideHover);
   // Expose the renderers so the client can build each tab from JSON.
   window.CFK_ANALYTICS_HTML = function (data) { return window.CFK_RENDER(data, 'timeseries'); };
   window.CFK_DEEP_HTML = function (data) { return window.CFK_RENDER(data, 'deep'); };

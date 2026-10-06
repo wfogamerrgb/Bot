@@ -30,26 +30,10 @@ const {
   parseDataArgs,
   hasInventoryItems,
   randomInt,
-  buildHiddenDumpQueue,
-  createDumpSlotScheduler,
-  parseDumpArgs,
-  tokenizeDumpArgs,
-  itemMatchesDumpTerms,
-  dumpContainerBlockNames,
+  buildHiddenDumpPlan,
   createChatGameManager,
-  parseItemGlobs,
-  itemMatchesGlobs,
-  parseRewardSlots,
-  selectScriptBots,
-  listBotScripts,
-  loadBotScript,
-  commandSuggestions,
   destructiveCommandEffect,
-  parseBroadcastTargets,
-  createCommandConfirmation,
-  parseTorControlPorts,
-  deriveTorControlPorts,
-  sendTorSignal
+  createCommandConfirmation
 } = require('./bot-controls')
 const os = require('os')
 const { createMonitoring, classifyKick } = require('./monitoring')
@@ -187,15 +171,9 @@ const TPA_MAIN_PLAYER = (process.env.TPA_MAIN_PLAYER || process.env.TPA_TARGET_P
 const TPA_TRUSTED_BOTS = parseNameList(process.env.TPA_TRUSTED_BOTS || BOT_NAMES.join(','))
 const TPA_AUTO_DEFAULT = /^(1|true|yes|on)$/i.test(process.env.TPA_AUTO_DEFAULT || 'false')
 const DUMP_HOME_COMMAND = (process.env.DUMP_HOME_COMMAND || '/home stash').trim()
-// /dump hidden pacing: at most DUMP_HIDDEN_CONCURRENT bots at the spot at any
-// moment (hard ceiling 4 — a 70-bot pile-up is never "hidden"). Starts are
-// spaced a random gap apart so arrivals look organic; the run finishes when the
-// queue is empty, not on a timer. Slots are released only when a bot has
-// finished depositing AND warped away (the reset), so "dumped" and "gone" are
-// the same event.
-const DUMP_HIDDEN_CONCURRENT = readInt(process.env.DUMP_HIDDEN_CONCURRENT, 4, 1, 4)
-const DUMP_HIDDEN_MIN_GAP_MS = Math.max(1000, readDelayMs(process.env.DUMP_HIDDEN_MIN_GAP_MS, 15000))
-const DUMP_HIDDEN_MAX_GAP_MS = Math.max(DUMP_HIDDEN_MIN_GAP_MS, readDelayMs(process.env.DUMP_HIDDEN_MAX_GAP_MS, 45000))
+const DUMP_MIN_TPA_GAP_MS = Math.max(180000, readDelayMs(process.env.DUMP_MIN_TPA_GAP_MS, 180000))
+const DUMP_HIDDEN_MIN_MS = Math.max(60000, readDelayMs(process.env.DUMP_HIDDEN_MIN_MS, 480000))
+const DUMP_HIDDEN_MAX_MS = Math.max(DUMP_HIDDEN_MIN_MS, readDelayMs(process.env.DUMP_HIDDEN_MAX_MS, 720000))
 // /dump + /dump-spawners tuning. Every value has the long-standing default, so
 // an existing .env needs no changes; invalid values fall back instead of
 // producing NaN timers.
@@ -223,17 +201,6 @@ const DATA_WEBHOOK_URL = (process.env.DATA_WEBHOOK_URL || '').trim()
 const DATA_WEBHOOK_SECRET = (process.env.DATA_WEBHOOK_SECRET || '').trim()
 const DATA_WEBHOOK_TIMEOUT_MS = readDelayMs(process.env.DATA_WEBHOOK_TIMEOUT_MS, 15000)
 const dataState = dataStore.loadState(DATA_FILE)
-const evidenceStore = require(path.join(__dirname, 'evidence')).createEvidenceStore({ file: process.env.EVIDENCE_FILE || path.join(__dirname, 'data', 'evidence.json') })
-function recordEvidence (id, kind, detail) {
-  try { return evidenceStore.record(id, kind, detail) } catch (err) { logFor(id, `{red-fg}✗ Evidence save failed: ${sanitize(err.message)}{/red-fg}`) }
-}
-function botOnline (entry) { return !!entry?.bot?.entity && (!entry.connectionState || entry.connectionState === 'online') }
-function connectionDetails (id, entry) {
-  const proxy = resolveBotProxy(id, PROXY_GROUPS, PROXY_DEFAULT)
-  const socket = entry?.bot?._client?.socket
-  const peer = socket?.remoteAddress || null
-  return { target: entry?.host || HOST, port: entry?.port || PORT, route: proxy ? 'proxied' : 'direct', proxy: proxy ? `${proxy.type || 'socks5'} ${proxy.host}:${proxy.port}` : 'direct', tcpPeer: peer, tcpPeerPort: socket?.remotePort || null, serverIp: !proxy && botOnline(entry) ? peer : (net.isIP(entry?.host || HOST) ? entry?.host || HOST : null), note: proxy ? 'TCP peer is the proxy; destination IP behind proxy is unknown unless the target is an IP literal. Public egress IP is not checked.' : 'TCP peer is the directly connected server; a hostname alone is not proof of its IP.' }
-}
 function persistData () {
   dataState.updatedAt = new Date().toISOString()
   dataStore.saveState(DATA_FILE, dataState)
@@ -369,7 +336,6 @@ if (username) q.set('username', username)
 if (proxy) q.set('proxy', proxy)
 return u.toString()
 }
-const { docsIndexText, docsSectionText, docsForApi } = require('./docs')
 const SSH_CONFIG = sshConfig()
 const SSH_ENABLED = SSH_CONFIG.enabled
 const WS_BROADCAST_INTERVAL_MS = readDelayMs(process.env.WS_BROADCAST_INTERVAL_MS, 100)
@@ -476,9 +442,8 @@ const CRATES_ALL_DUMP_ENV = parseCratesAllDump(process.env.CRATES_ALL_DUMP)
 const CRATES_ALL_AFK_WARP = /^(1|true|yes|on)$/i.test(process.env.CRATES_ALL_AFK_WARP ?? 'true')
 const CRATES_ALL_AFK_DELAY_MS = readInt(process.env.CRATES_ALL_AFK_DELAY_MS, 15000, 0, 2147483647)
 const CRATES_ALL_FLAGS_USAGE = '[dump=off|tpa|home|hidden|player:<name>] [afk=now|off|<seconds>]'
-const CRATES_DUMP_FILTER_USAGE = '["term" …] [shulker|chest] [shulker color]'
-const CRATES_ALL_USAGE = `/crates-all [n] [color] ${CRATES_ALL_FLAGS_USAGE} ${CRATES_DUMP_FILTER_USAGE}`
-const CRATES_ALL_SOLO_USAGE = `/crates-solo [bot name or number] [color] ${CRATES_ALL_FLAGS_USAGE} ${CRATES_DUMP_FILTER_USAGE}`
+const CRATES_ALL_USAGE = `/crates-all [n] [color] ${CRATES_ALL_FLAGS_USAGE}`
+const CRATES_ALL_SOLO_USAGE = `/crates-solo [bot name or number] [color] ${CRATES_ALL_FLAGS_USAGE}`
 
 // ── /shardshop-loop: keep running /shardshop until the server says there's nothing left ──
 const SHARDSHOP_STOP_PHRASES = (process.env.SHARDSHOP_STOP_PHRASES || 'insufficent fund,not enough,insufficient fund,no more shards,more shards')
@@ -509,36 +474,6 @@ const PROXY_DEFAULT = PROXY_ENABLED ? { host: PROXY_HOST, port: PROXY_PORT, type
 // Bots not listed in any group fall back to PROXY_DEFAULT (global proxy, or direct if unset).
 const PROXY_GROUPS = parseProxyGroups()
 const PROXY_GROUPS_ENABLED = PROXY_GROUPS.length > 0
-
-// ── Tor control ports ───────────────────────────────────────────────────────
-// scripts/restart-tor.sh gives each local Tor instance a control port at its
-// SOCKS port + 1 with CookieAuthentication 0 ("ControlPort <socks+1>" in the
-// generated torrc). TOR_CONTROL_PORTS overrides the list; empty means "derive
-// it from the local proxies", which is exactly the script's convention.
-function torControlPorts () {
-  const explicit = parseTorControlPorts(settings.get('TOR_CONTROL_PORTS'))
-  return explicit.length ? explicit : deriveTorControlPorts(PROXY_GROUPS, PROXY_DEFAULT)
-}
-
-// SIGNAL NEWNYM on every local Tor instance: the NEXT connection (each bot's
-// next reconnect) leaves through a fresh circuit — a live connection keeps the
-// circuit it is already on. Shared by /tor-newnym and the dashboard button,
-// and reported per port: one dead instance must not hide the others' results.
-async function requestTorCircuits () {
-  const ports = torControlPorts()
-  if (!ports.length) {
-    logFor(SYSTEM_ID, '{yellow-fg}⚠ No Tor control ports known — set TOR_CONTROL_PORTS (or point PROXY_* / PROXY_GROUP_* at a local Tor).{/yellow-fg}')
-    return { ok: false, results: [], error: 'no Tor control ports configured' }
-  }
-  const results = []
-  for (const port of ports) {
-    const r = await sendTorSignal(port)
-    results.push(r)
-    if (r.ok) logFor(SYSTEM_ID, `{green-fg}✓ Tor control :${port} — new circuits requested; reconnects leave through a new path.{/green-fg}`)
-    else logFor(SYSTEM_ID, `{red-fg}✗ Tor control :${port} — ${sanitize(r.error)}{/red-fg}`)
-  }
-  return { ok: results.every(r => r.ok), results }
-}
 
 // ── Proxy stall watchdog ────────────────────────────────────────────────────
 const PROXY_STALL_ENABLED = PROXY_ENABLED && process.env.PROXY_STALL_WATCHDOG !== '0'
@@ -864,12 +799,10 @@ cfDefine('ANALYTICS_ENABLED', { type: 'bool', def: true, group: 'Analytics', des
 cfDefine('ANALYTICS_PORT', { type: 'int', def: 8080, min: 1, max: 65535, group: 'Analytics', live: false, desc: 'Port for the analytics page — the listener starts at boot, so this one needs a restart' })
 cfDefine('ANALYTICS_OPEN', { type: 'bool', def: false, group: 'Analytics', desc: 'Serve analytics with no login at all (default: the dashboard session is required)' })
 cfDefine('ANALYTICS_BUCKET_MS', { type: 'ms', def: 3600000, min: 60000, group: 'Analytics', desc: 'Bucket size for the charts (also ?bucket=1h)' })
-cfDefine('ANALYTICS_WARMUP_MS', { type: 'ms', def: 3000000, min: 0, group: 'Analytics', desc: 'Skip the first 50 minutes after every bot-script (re)start in the charts and window deltas — that ramp is skewed (bots still logging in). 0 shows everything' })
 // Keys that are read once at startup. They are listed so the tab is a complete
 // picture of the configuration rather than only the new half of it.
 cfDefine('ALL_SLOW_DELAY_MS', { type: 'ms', def: 15000, min: 0, group: 'Timing', desc: 'Default gap between bots in /all-slow (live)' })
 cfDefine('REPEAT_DELAY_MS', { type: 'ms', def: 2000, min: 0, group: 'Timing', desc: 'Gap between /repeat runs (live); a per-run delay token overrides it for that run' })
-cfDefine('UNBAN_ALL_STAGGER_MS', { type: 'ms', def: 30000, min: 0, group: 'Timing', desc: 'Gap between the reconnects /unban-all schedules, so restored bots don\'t all hit the server at once (live)' })
 cfDefine('ALL_CHAT_GUARD', { type: 'bool', def: true, group: 'Safety', desc: 'Refuse /all and /all-slow broadcasts that are not /commands — a typo like "/all .server lifesteal" would make every bot say it in chat and expose the fleet. Prefix with "!" to send chat deliberately ( /all !hello )' })
 cfDefine('BOOK_AUTO', { type: 'bool', def: false, group: 'Book', desc: 'Run /use-book automatically whenever a GUI opens with a matching item in it — when there is no match, nothing happens at all' })
 cfDefine('BOOK_ITEM_QUERY', { type: 'string', def: 'book', group: 'Book', desc: 'What /use-book scans for: a substring of the display, custom or registry name' })
@@ -880,13 +813,9 @@ cfDefine('AUTH_MAX_THROTTLED_RETRIES', { type: 'int', def: 2, min: 1, group: 'Au
 cfDefine('AUTH_REPLY_WINDOW_MS', { type: 'ms', def: 30000, min: 1000, group: 'Auth', desc: 'How long a reply counts as an answer to our auth command (live)' })
 cfDefine('AUTH_FALLBACK_DELAY_MS', { type: 'ms', def: 6000, min: 0, group: 'Auth', desc: 'Wait after a rejected /login before the fallback password is tried (live)' })
 cfDefine('LOGIN_PASSWORD_FALLBACK', { type: 'string', def: '', group: 'Auth', desc: 'Second /login password tried once after a rejection, when no group fallback applies (live)' })
-cfDefine('CHAT_GAME_AUTO', { type: 'bool', def: false, group: 'Chat game', desc: 'Auto-play chat events: "guess the number" rounds are covered number by number, equation rounds answered exactly by one random bot' })
-cfDefine('CHAT_GAME_GUESS_MS', { type: 'ms', def: 1150, min: 25, group: 'Chat game', desc: 'Gap between guesses — 350 ms is about three numbers per second (live)' })
-cfDefine('CHAT_GAME_MAX_BOTS', { type: 'int', def: 10, min: 1, group: 'Chat game', desc: 'How many connected bots (roster order) are used as guessers (live)' })
-cfDefine('EAPPLE_KIT_SLOT', { type: 'int', def: 14, min: 0, group: 'Kits', desc: 'Slot clicked in the /kits GUI before the reward slot — /ege (live)' })
-cfDefine('EAPPLE_REWARD_SLOTS', { type: 'string', def: '21,15,13,11', group: 'Kits', desc: 'One /ege pass per slot: /kits → kit slot → this slot → /dispose (live)' })
-cfDefine('EAPPLE_DISPOSE_ITEMS', { type: 'string', def: 'experience_bottle,golden_apple,shield,totem_of_undying,*shulker_box', group: 'Kits', desc: 'Comma-separated globs moved into /dispose — exact names keep enchanted_golden_apple safe (live)' })
-cfDefine('EAPPLE_STEP_DELAY_MS', { type: 'ms', def: 1200, min: 100, group: 'Kits', desc: 'Pause between /ege GUI clicks and window opens (live)' })
+cfDefine('CHAT_GAME_AUTO', { type: 'bool', def: true, group: 'Chat game', desc: 'Auto-play "guess the number" chat events: a random bot shouts one unguessed number per tick until the round ends' })
+cfDefine('CHAT_GAME_GUESS_MS', { type: 'ms', def: 100, min: 25, group: 'Chat game', desc: 'Gap between guesses — 100 ms is ten numbers per second (live)' })
+cfDefine('CHAT_GAME_MAX_BOTS', { type: 'int', def: 30, min: 1, group: 'Chat game', desc: 'How many connected bots (roster order) are used as guessers (live)' })
 cfDefine('LOGIN_PASSWORD', { type: 'string', def: '123456', group: 'Auth', desc: 'Global /register + /login password. Resolved at each auth attempt, so a change applies to the next /auth-retry — a per-bot or group password is read at boot and still wins for those bots' })
 cfDefine('HOST', { type: 'string', def: 'play.fatalmc.org', group: 'Server', live: false, desc: 'Default server host (startup-only)' })
 cfDefine('PORT', { type: 'int', def: 25565, group: 'Server', live: false, desc: 'Default server port (startup-only)' })
@@ -906,7 +835,6 @@ cfDefine('TPA_MAIN_PLAYER', { type: 'string', def: (process.env.TPA_MAIN_PLAYER 
 cfDefine('WARP_COMMAND', { type: 'string', def: '/warp afk', group: 'Dump', live: false, desc: 'The AFK warp command (startup-only)' })
 cfDefine('WEB_PORT', { type: 'int', def: 80, min: 1, max: 65535, group: 'Dashboard', live: false, desc: 'Dashboard port (startup-only)' })
 cfDefine('WEB_PASSWORD', { type: 'string', group: 'Dashboard', live: false, desc: 'Dashboard login (startup-only; leave empty for a generated one)' })
-cfDefine('TOR_CONTROL_PORTS', { type: 'string', def: '', group: 'Tor', desc: 'Tor control ports for /tor-newnym and the dashboard button — empty = every local proxy SOCKS port + 1, matching scripts/restart-tor.sh (live)' })
 
 const COINFLIP_FILE = process.env.COINFLIP_FILE || path.join(__dirname, 'data', 'coinflip-history.jsonl')
 const COINFLIP_SUMMARY_FILE = process.env.COINFLIP_SUMMARY_FILE || path.join(__dirname, 'data', 'coinflip-stats.json')
@@ -918,19 +846,7 @@ const coinflipStore = coinflip.createCoinflipStore({ file: COINFLIP_FILE, maxRec
 const timeseriesStore = timeseries.createTimeseriesStore({ file: TIMESERIES_FILE })
 
 
-cfDefine('SPAWNER_DROP_DURATION_MS', { type: 'ms', def: 60000, min: 1, max: 86400000, group: 'Spawner drop', desc: 'Default bounded drop duration; explicit duration= overrides it' })
-cfDefine('SPAWNER_DROP_COOLDOWN_MS', { type: 'ms', def: 10000, min: 100, max: 86400000, group: 'Spawner drop', desc: 'Gap after each confirmed whole-stack drop (live)' })
-cfDefine('SPAWNER_DROP_MODE', { type: 'string', def: 'duration', group: 'Spawner drop', desc: 'duration|once|until-stop; per-run mode= overrides it' })
-cfDefine('SPAWNER_DROP_SCOPE', { type: 'string', def: 'all', group: 'Spawner drop', desc: 'all|inventory|gui; all includes GUI and existing inventory stacks' })
-cfDefine('SPAWNER_DROP_MATCH', { type: 'string', def: 'bones', group: 'Spawner drop', desc: 'Default item name/NBT search term; per-run terms override it' })
-const spawnerDrop = require(path.join(__dirname, 'spawner-drop')).createSpawnerDrop({
-  bots, online: botOnline, reach: SPAWNER_REACH, blockName: SPAWNER_BLOCK,
-  log: (id, text, error) => logFor(id, error ? `{red-fg}✗ ${sanitize(text)}{/red-fg}` : `{cyan-fg}› ${sanitize(text)}{/cyan-fg}`),
-  matches: (item, terms) => terms.some(term => term.toLowerCase() === 'bones' && item.name === 'bone') || itemMatchesDumpTerms(itemSearchNames(item), itemNbtText(item), terms),
-  defaults: () => ({ durationMs: settings.get('SPAWNER_DROP_DURATION_MS'), cooldownMs: settings.get('SPAWNER_DROP_COOLDOWN_MS'), mode: settings.get('SPAWNER_DROP_MODE'), scope: settings.get('SPAWNER_DROP_SCOPE'), terms: [settings.get('SPAWNER_DROP_MATCH')] })
-})
-
-const LOCAL_COMMANDS = ['/evidence', '/connection', '/spawner-drop', '/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dump-spawners', '/dc', '/reconnect', '/crates', '/crates-loop', '/spawners', '/data', '/shardshop-loop', '/closeBot', '/bot-coinflip', '/bot-coinflip-all', '/ai-chat', '/repeat', '/use-book', '/enchanted-golden-apple-extract', '/ege', '/scripts', '/run-script']
+const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dump-spawners', '/dc', '/reconnect', '/crates', '/crates-loop', '/spawners', '/data', '/shardshop-loop', '/closeBot', '/bot-coinflip', '/bot-coinflip-all', '/ai-chat', '/repeat', '/use-book']
 
 const logSubscribers = new Set()
 function subscribeLog(fn) { logSubscribers.add(fn); return () => logSubscribers.delete(fn) }
@@ -938,7 +854,6 @@ function subscribeLog(fn) { logSubscribers.add(fn); return () => logSubscribers.
 function logFor(id, msg) {
 if (id !== SYSTEM_ID && !bots[id]) return
 const line = `${timestamp()} ${msg}`
-evidenceStore.captureDumpLine(id, line)
 const store = id === SYSTEM_ID ? systemLogs : bots[id].logs
 store.push({ text: line, time: Date.now() })
 if (store.length > LOG_MAX_LINES) store.splice(0, store.length - LOG_MAX_LINES)
@@ -974,7 +889,7 @@ function dispatchCommandToBot (msg, id) {
     handleCommand(command, { selectedId: id })
     return true
   }
-  if (!botOnline(bots[id])) return false
+  if (!bots[id].bot?.entity) return false
   bots[id].bot.chat(command)
   return true
 }
@@ -1088,7 +1003,7 @@ return {
 rssMB: Math.round(m.rss / 1048576), heapMB: Math.round(m.heapUsed / 1048576),
 uptimeSec: Math.floor(process.uptime()), clients: webHandle ? webHandle.clients.size : 0,
 evlLagMs, logPerSec: Math.round(logRateWindow / 2),
-bots: Object.keys(bots).length, online: Object.values(bots).filter(botOnline).length,
+bots: Object.keys(bots).length, online: Object.values(bots).filter(b => b.bot && b.bot.entity).length,
 memory: monitoring ? monitoring.getMemorySnapshot() : null
 }
 }
@@ -1102,19 +1017,15 @@ monitoring = createMonitoring({
 function botSnapshot() {
 return Object.entries(bots).map(([id, e]) => {
 const b = e.bot
-const ping = botOnline(e) && b.player ? b.player.ping : null
+const ping = b && b.player ? b.player.ping : null
 const histArr = e.pingHist || (e.pingHist = [])
 if (typeof ping === 'number') { histArr.push(Math.max(0, ping)); if (histArr.length > 60) histArr.shift() }
-const online = botOnline(e)
+const online = !!(b && b.entity)
 return {
-id, online, number: Object.keys(bots).indexOf(id) + 1,
-state: online ? 'online' : dataState.bots[id]?.banned ? 'banned' : e.connectionState || 'disconnected',
-disconnectedAt: e.disconnectedAt || null,
-disconnectReason: sanitize(e.lastDisconnectReason || dataState.bots[id]?.banReason || ''),
-connection: connectionDetails(id, e),
+id, online,
 ping: typeof ping === 'number' ? Math.max(0, ping) : null,
-health: online ? (b.health ?? null) : null, food: online ? (b.food ?? null) : null,
-uptimeSec: online && e.spawnTime ? Math.floor((Date.now() - e.spawnTime) / 1000) : null,
+health: b ? (b.health ?? null) : null, food: b ? (b.food ?? null) : null,
+uptimeSec: e.spawnTime ? Math.floor((Date.now() - e.spawnTime) / 1000) : null,
 attempts: e.reconnectAttempts || 0,
 kick: e.lastKickReason ? escHtml(sanitize(e.lastKickReason).slice(0, 140)) : null,
 banned: Boolean(dataState.bots[id]?.banned),
@@ -1128,15 +1039,9 @@ coinflip: coinflipSessions.get(id) || coinflipLastRun.get(id) || null,
 pingHist: histArr,
 manual: manual.snapshotFor(e),
 // connecting: bot exists but hasn't spawned yet (useful for filtering in web UI)
-connecting: !online && !dataState.bots[id]?.banned && e.connectionState === 'connecting'
+connecting: !online && !!b
 }
-}).concat((removedBots.bots || []).filter(row => !Object.hasOwn(bots, row.bot)).map(row => ({
-  id: row.bot, number: null, online: false, connecting: false, state: 'banned', banned: true, removed: true,
-  banKind: row.kind || dataState.bots[row.bot]?.banKind || 'removed',
-  kick: escHtml(sanitize(row.reason || dataState.bots[row.bot]?.banReason || 'On removed list')),
-  disconnectReason: sanitize(row.reason || dataState.bots[row.bot]?.banReason || 'On removed list'),
-  disconnectedAt: dataState.bots[row.bot]?.bannedAt || null, pingHist: []
-})))
+})
 }
 function notifyBotsChanged() {
 if (tui) { try { tui.updateHeader() } catch (_) {} }
@@ -1236,37 +1141,9 @@ inputOnFocus: true
 })
 inputBox.setLabel(' {green-fg}{bold}❯{/bold}{/green-fg} Command ')
 
-// ── Command suggestions (the web GUI's list, in the terminal) ─────────────
-// A live panel above the input: as soon as the value looks like a command, the
-// matching commands and their descriptions are listed, exactly like the web
-// GUI's suggestion dropdown. Tab cycles through the matches.
-const suggestionBox = blessed.box({
-bottom: 3, left: 0, width: '100%', height: 0,
-border: { type: 'line' },
-label: ' Commands ',
-tags: true,
-hidden: true,
-style: { border: { fg: 'gray' }, label: { fg: 'cyan', bold: true } }
-})
-let tabCyclePrefix = null
-let tabCycleIndex = -1
-function updateSuggestions () {
-const val = inputBox.getValue()
-const matches = commandSuggestions(val, COMMANDS, 8)
-if (!matches.length) {
-if (!suggestionBox.hidden) { suggestionBox.hide(); debouncedRender() }
-return
-}
-suggestionBox.setContent(matches.map(m => ` {white-fg}${escBlessed(m.key)}{/white-fg} {gray-fg}${escBlessed(m.desc.slice(0, 140))}{/gray-fg}`).join('\n'))
-suggestionBox.height = Math.min(matches.length, 8) + 2
-if (suggestionBox.hidden) suggestionBox.show()
-debouncedRender()
-}
-
 screen.append(header)
 screen.append(logBox)
 screen.append(inputBox)
-screen.append(suggestionBox)
 inputBox.focus()
 
 screen.key(['C-c'], () => process.exit(0))
@@ -1282,9 +1159,6 @@ inputBox.focus()
 if (ch && ch.length === 1 && !key.ctrl && !key.meta) inputBox.setValue(inputBox.getValue() + ch)
 screen.render()
 }
-// Every keystroke ends here first, so refresh the suggestion panel after the
-// textbox has processed the key (typing, history, tab cycles alike).
-setImmediate(updateSuggestions)
 })
 
 function updateHeader() {
@@ -1331,18 +1205,19 @@ debouncedRender()
 
 inputBox.key('tab', () => {
 const val = inputBox.getValue()
-if (!val.startsWith('/')) return
-const matches = commandSuggestions(val, COMMANDS, 20)
-if (!matches.length) return
-// Repeated Tab cycles through the matches; typing anything else starts fresh.
-if (val !== tabCyclePrefix) { tabCyclePrefix = val; tabCycleIndex = -1 }
-tabCycleIndex = (tabCycleIndex + 1) % matches.length
+if (val.startsWith('/')) {
+const available = Object.keys(COMMANDS)
+const prefix = val.split(' ')[0]
+const matches = available.filter(c => c.startsWith(prefix))
+if (matches.length === 1) {
 // Strip parameter hints (e.g. "/warp <place>" → "/warp ")
-const base = matches[tabCycleIndex].key.replace(/ [<\[].*$/, '')
+const base = matches[0].replace(/ [<\[].*$/, '')
 inputBox.setValue(base + ' ')
-tabCyclePrefix = base + ' '
 debouncedRender()
-updateSuggestions()
+} else if (matches.length > 1) {
+logInfo(`{cyan-fg}Matches:{/cyan-fg} ${matches.map(m => m.split(' ')[0]).join(', ')}`)
+}
+}
 })
 
 inputBox.on('submit', (input) => {
@@ -1534,11 +1409,11 @@ button.tb:hover{color:var(--txt);border-color:var(--acc)}
 </style><script src="/chart.js"></script><script src="/coinflip-dashboard.js"></script></head><body>
 <div id="app">
 <header><div class="logo">⛏ AFK<b>CONSOLE</b></div><div id="chips"></div><div id="wsstate" class="wsstate down">offline</div><button id="logout">sign out</button></header>
-<aside><div class="views"><div class="vchip on" data-view="all">ALL</div><div class="vchip" data-view="system">SYSTEM</div><button class="vchip" id="terminalbtn" type="button">TERMINAL</button><button class="vchip" id="envbtn" type="button" title="Temporary .env overrides — nothing is written to disk">.ENV</button><button class="vchip" id="coinflipbtn" type="button" title="Coinflip fleet analytics">COINFLIP</button><!--PLAYBTN--></div><label style="display:flex;align-items:center;gap:6px;padding:4px 0;font-size:11px;color:var(--dim);cursor:pointer"><input type="checkbox" id="show-all-bots" checked style="accent-color:var(--acc)">Show offline bots</label><div id="botlist"></div></aside>
+<aside><div class="views"><div class="vchip on" data-view="all">ALL</div><div class="vchip" data-view="system">SYSTEM</div><button class="vchip" id="terminalbtn" type="button">TERMINAL</button><button class="vchip" id="envbtn" type="button" title="Temporary .env overrides — nothing is written to disk">.ENV</button><button class="vchip" id="coinflipbtn" type="button" title="Coinflip fleet analytics">COINFLIP</button><!--PLAYBTN--></div><label style="display:flex;align-items:center;gap:6px;padding:4px 0;font-size:11px;color:var(--dim);cursor:pointer"><input type="checkbox" id="show-all-bots" style="accent-color:var(--acc)">Show offline bots</label><div id="botlist"></div></aside>
 <main>
 <div id="loghead"><span id="channame">ALL CHANNELS</span><span id="newchip"></span>
 <input id="search" placeholder="filter logs…"><button class="tb" id="topbtn" type="button" title="scroll to top">↑ top</button><button class="tb" id="bottombtn" type="button" title="scroll to newest">↓ bottom</button><button class="tb" id="followbtn" type="button">⏸ pause</button>
-<button class="tb" id="clearbtn">clear</button><button class="tb" id="torbtn" type="button" title="Request fresh Tor circuits — the next reconnects leave through a new path">⟳ tor</button><button class="tb" id="docsbtn" type="button" title="Built-in documentation — commands, /dump grammar, troubleshooting">📚 docs</button><button class="tb" id="helpbtn">? cmds</button></div>
+<button class="tb" id="clearbtn">clear</button><button class="tb" id="helpbtn">? cmds</button></div>
 <div id="logwrap"><div id="log"></div></div>
 <div id="guitui" hidden></div>
 <div id="manualbar" aria-label="Manual bot controls">
@@ -1571,7 +1446,6 @@ button.tb:hover{color:var(--txt);border-color:var(--acc)}
 <button class="tb" id="sendbtn">send</button>
 </form>
 <div id="help" hidden></div>
-<div id="docs" hidden style="position:fixed;inset:0;z-index:40;background:var(--bg);overflow:auto;padding:14px"><div id="docsbox" style="max-width:1100px;margin:0 auto"><div class="ehead"><b>DOCS</b><span class="enote">built-in documentation — type /doc in the command bar to open this panel</span><input id="docsfilter" placeholder="filter docs…" autocomplete="off" spellcheck="false"><button class="tb" id="docsclose" type="button">close</button></div><div id="docsbody">loading…</div></div></div>
 <div id="envpanel" hidden><div id="envbox"><div class="ehead"><b>.ENV</b><span class="enote">temporary — applied to this running process only, and forgotten on the next restart (edit the file for a permanent change)</span><button class="tb" id="envresetall" type="button">reset all</button><button class="tb" id="envclose" type="button">close</button></div><div id="envbody">loading…</div></div></div>
 <div id="terminal" hidden><div class="terminal-head"><b>bash</b><button class="tb" id="terminalclose" type="button">close</button></div><pre id="terminalout"></pre><form id="terminalform"><span class="prompt">$</span><input id="terminalinput" autocomplete="off" spellcheck="false"><button class="tb" type="submit">run</button></form></div>
 </main>
@@ -1810,17 +1684,16 @@ if(!control)return
 releaseManualKey(control,document.querySelector('.mkey[data-control="'+control+'"]'))
 })
 }
-var lastBotSnapshot=[]
-el('show-all-bots').onchange=function(){renderBots(lastBotSnapshot)}
-function renderBots(bs){lastBotSnapshot=bs;var box=el('botlist');box.innerHTML='';botStates={}
+function renderBots(bs){var box=el('botlist');box.innerHTML='';botStates={}
 var showAll = el('show-all-bots')?.checked || false
 for(var i=0;i<bs.length;i++){var b=bs[i]
+// Filter out offline non-connecting bots unless showAll is checked
+if(!showAll && !b.online && !b.connecting) continue
 botStates[b.id]=b
 var old=prevOnline[b.id]
 if(old===true&&!b.online)toast(b.id+(b.banned?' was banned':' went offline')+(b.kick?' — '+b.kick:''),'bad')
 if(old===false&&b.online)toast(b.id+' is online','good')
 prevOnline[b.id]=b.online
-if(!showAll && !b.online && !b.connecting && !b.banned && b.id!==view) continue
 var d=document.createElement('div')
 var cls = 'bot'
 if(b.online) cls += ' on'
@@ -1835,20 +1708,17 @@ var bannedHtml=b.banned?'<span class="manual-badge" style="color:var(--red);bord
 var authHtml=b.authFailed?'<span class="manual-badge" style="color:var(--red);border-color:rgba(248,113,113,.45)">🔑 '+b.authKind+'</span>':''
 var viewerHtml=b.manual&&b.manual.viewerPort?'<button class="manual-viewer" type="button" data-port="'+String(b.manual.viewerPort)+'">🌐 viewer</button>':''
 var cfHtml=b.coinflip?'<span class="manual-badge" style="color:var(--cyan);border-color:rgba(103,232,249,.4)">🎲 '+b.coinflip.flips+'/'+b.coinflip.planned+'</span>':''
-var offlineHtml = !b.online && !b.connecting ? '<span class="manual-badge" style="color:var(--red)">disconnected</span>' : ''
 var connectingHtml = b.connecting ? '<span class="manual-badge" style="color:var(--yellow);border-color:rgba(255,200,0,.4)">⏳ connecting</span>' : ''
-d.innerHTML='<div class="bhead"><div class="dot"></div><div class="bname"></div>'+bannedHtml+authHtml+cfHtml+manualHtml+guiHtml+viewerHtml+connectingHtml+offlineHtml+(b.attempts?'<div class="batt">↻'+b.attempts+'</div>':'')+'</div>'
+d.innerHTML='<div class="bhead"><div class="dot"></div><div class="bname"></div>'+bannedHtml+authHtml+cfHtml+manualHtml+guiHtml+viewerHtml+connectingHtml+(b.attempts?'<div class="batt">↻'+b.attempts+'</div>':'')+'</div>'
 +'<div class="bmeta"><span>'+(b.ping==null?'—':b.ping)+'ms</span><span>'+(b.health==null?'—':b.health)+'❤</span><span>'+(b.food==null?'—':b.food)+'🍗</span>'+(up?'<span>'+up+'</span>':'')+'</div>'
 +'<canvas width="220" height="16"></canvas>'
-d.querySelector('.bname').textContent=(b.removed?'[removed] ':'['+(b.number||i+1)+'] ')+b.id
+d.querySelector('.bname').textContent=b.id
 if(b.banned)d.title='Banned'+(b.banKind?' ('+b.banKind+')':'')+(b.kick?' — '+b.kick:'')
 else if(b.authFailed)d.title='Login rejected: '+b.authReason+' — fix the password and run /auth-retry '+b.id
 else if(b.coinflip)d.title='Coinflip run: '+b.coinflip.flips+' of '+b.coinflip.planned+' flips, net '+(b.coinflip.net>=0?'+':'')+b.coinflip.net+' — '+b.coinflip.stopped
-else if(b.disconnectReason)d.title='Disconnected'+(b.disconnectedAt?' at '+new Date(b.disconnectedAt).toISOString():'')+' — '+b.disconnectReason
 else if(b.kick)d.title=b.kick
 else if(b.connecting)d.title='Connecting to server...'
-if(!b.removed)d.onclick=(function(id){return function(){setView(id)}})(b.id)
-else d.title+=' — on removed list; /unban '+b.id+' restores it. Audit: /api/evidence?bot='+encodeURIComponent(b.id)
+d.onclick=(function(id){return function(){setView(id)}})(b.id)
 var viewerButton=d.querySelector('.manual-viewer')
 if(viewerButton)viewerButton.onclick=(function(port){return function(e){e.preventDefault();e.stopPropagation();window.open('http://'+location.hostname+':'+port+'/','_blank','noopener')}})(b.manual.viewerHostPort||b.manual.viewerPort)
 box.appendChild(d)
@@ -1874,7 +1744,7 @@ function toast(text,kind){var d=document.createElement('div');d.className='toast
 el('toasts').appendChild(d)
 setTimeout(function(){d.classList.add('out');setTimeout(function(){d.remove()},500)},6000)}
 var cinput=el('cmd')
-function sendCmd(v){if(v==='/doc'||v.indexOf('/doc ')===0){hist.push(v);hIdx=-1;openDocs(v.slice(4).trim());return}hist.push(v);hIdx=-1;setFollow(true);scrollOnNextLog=true;scrollBottom();setTimeout(scrollBottom,0);setTimeout(scrollBottom,180)
+function sendCmd(v){hist.push(v);hIdx=-1;setFollow(true);scrollOnNextLog=true;scrollBottom();setTimeout(scrollBottom,0);setTimeout(scrollBottom,180)
 var selectedId=view
 if(ws&&ws.readyState===1){ws.send(JSON.stringify({t:'cmd',text:v,selectedId:selectedId}));return}
 fetch('/api/command',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:v,selectedId:selectedId})}).then(function(r){if(!r.ok)throw Error('HTTP '+r.status);return r.json()}).then(function(m){if(m.selectedId)setView(m.selectedId)}).catch(function(){toast('Command delivery could not be confirmed. Check logs before retrying.','bad');connect()})}
@@ -1967,35 +1837,6 @@ Object.keys(cmds).forEach(function(k){var r=document.createElement('div');r.clas
 var b=document.createElement('b');b.textContent=k
 var sp=document.createElement('span');sp.textContent=cmds[k]||''
 r.appendChild(b);r.appendChild(sp);h.appendChild(r)})}
-el('torbtn').onclick=function(){var b=el('torbtn');b.disabled=true;toast('requesting new Tor circuits…')
-fetch('/api/tor/newnym',{method:'POST',credentials:'same-origin'}).then(function(r){return r.json()}).then(function(m){
-var rs=m.results||[],ok=rs.filter(function(x){return x.ok}).length
-toast(m.ok?'new Tor circuits on all '+rs.length+' instance(s)':'new circuits on '+ok+' of '+rs.length+' Tor instance(s) — see the system log',m.ok?'good':'bad')
-b.disabled=false}).catch(function(){toast('could not request Tor circuits — see the system log','bad');b.disabled=false})}
-var docsData=null
-function renderDocs(){var body=el('docsbody');body.innerHTML='';if(!docsData){body.textContent='could not load the docs';return}
-var q=(el('docsfilter').value||'').toLowerCase(),shown=0
-for(var si=0;si<docsData.sections.length;si++){var sec=docsData.sections[si]
-var entries=(sec.entries||[]).filter(function(e){if(!q)return true
-return ((sec.title||'')+' '+(e.title||'')+' '+(e.desc||'')).toLowerCase().indexOf(q)>=0})
-if(!entries.length)continue
-shown++
-var h=document.createElement('h3');h.textContent=sec.title;body.appendChild(h)
-for(var ei=0;ei<entries.length;ei++){var e=entries[ei]
-var row=document.createElement('div');row.className='hcmd'
-var b=document.createElement('b');b.textContent=e.title||''
-var sp=document.createElement('span');sp.textContent=e.desc||''
-row.appendChild(b);row.appendChild(sp);body.appendChild(row)
-for(var xi=0;xi<(e.examples||[]).length;xi++){var ex=document.createElement('div');ex.className='hcmd';ex.style.paddingLeft='16px'
-var code=document.createElement('code');code.textContent=e.examples[xi];ex.appendChild(code);body.appendChild(ex)}}}
-if(!shown)body.textContent='nothing matches that filter'}
-function openDocs(topic){if(topic!=null)el('docsfilter').value=topic||''
-el('docs').hidden=false
-if(docsData){renderDocs();return}
-fetch('/api/docs',{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.json()}).then(function(m){docsData=m;renderDocs()}).catch(function(){el('docsbody').textContent='could not load the docs'})}
-el('docsbtn').onclick=function(){openDocs()}
-el('docsclose').onclick=function(){el('docs').hidden=true}
-el('docsfilter').addEventListener('input',renderDocs)
 el('helpbtn').onclick=function(){el('help').hidden=!el('help').hidden}
 el('help').onclick=function(){el('help').hidden=true}
 el('clearbtn').onclick=function(){lines=[];el('log').innerHTML=''
@@ -2047,7 +1888,7 @@ const handle = { clients, port: null, url: null }
 const appJsMatch = PAGE_HTML.match(/<script>([\s\S]*?)<\/script>/)
 const appJsBuf = Buffer.from(appJsMatch ? appJsMatch[1] : '', 'utf8')
 const pageHtml = PAGE_HTML
-.replace('<!--PLAYBTN-->', MC_WEB_ENABLED ? '<button class="vchip" id="playbtn" type="button" title="Play the server in your browser (zardoy minecraft-web-client)">PLAY</button>' : '')
+.replace('<button class="vchip" id="coinflipbtn" type="button" title="Coinflip fleet analytics">COINFLIP</button><!--PLAYBTN-->', MC_WEB_ENABLED ? '<button class="vchip" id="playbtn" type="button" title="Play the server in your browser (zardoy minecraft-web-client)">PLAY</button>' : '')
 .replace(/<script>[\s\S]*?<\/script>/, '<script src="/app.js"></script>')
 const pageBuf = Buffer.from(pageHtml, 'utf8')
 let pageGz = null
@@ -2386,20 +2227,6 @@ res.writeHead(result.ok ? 200 : 400, { 'Content-Type': 'application/json; charse
 res.end(JSON.stringify(result))
 return
 }
-if (p === '/api/tor/newnym' && req.method === 'POST') {
-// The dashboard's "⟳ tor" button — the same code path as /tor-newnym.
-const result = await requestTorCircuits()
-res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
-res.end(JSON.stringify(result))
-return
-}
-if (p === '/api/docs' && req.method === 'GET') {
-// The web-GUI docs panel — same content as /doc, generated from the live
-// COMMANDS map so the reference can never drift from /help.
-res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
-res.end(JSON.stringify(docsForApi({ commands: COMMANDS })))
-return
-}
 if (p === '/api/state' && req.method === 'GET') {
 const view = normalizeView(url.searchParams.get('view') || 'all') || 'all'
 res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
@@ -2479,15 +2306,8 @@ res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control'
 res.end(playPageHtml(clientBaseFor(req)))
 return
 }
-if (p === '/api/evidence' && req.method === 'GET') {
-  const id = url.searchParams.get('bot')
-  if (!id) { sendJson(res, { error: 'bot parameter required' }, 400); return }
-  sendJson(res, { ...evidenceStore.get(id), current: bots[id] ? botSnapshot().find(b => b.id === id) : null, ban: dataState.bots[id] || null })
-  return
-}
 if (p === '/api/coinflip/summary' && req.method === 'GET') {
-  const recent = Math.max(1, Math.min(1000, Number(url.searchParams.get('recent')) || 100))
-  sendJson(res, coinflipStore.summary({ recent, minSample: settings.get('COINFLIP_MIN_SAMPLE'), suspicionP: settings.get('COINFLIP_SUSPICION_P') }))
+  sendJson(res, coinflipStore.summary({ recent: 100, minSample: settings.get('COINFLIP_MIN_SAMPLE'), suspicionP: settings.get('COINFLIP_SUSPICION_P') }))
   return
 }
 if (p === '/api/coinflip/bot' && req.method === 'GET') {
@@ -2500,15 +2320,8 @@ if (p === '/api/coinflip/bot' && req.method === 'GET') {
 }
 if (p === '/api/coinflip/fairness' && req.method === 'GET') {
   const rows = coinflipStore.all()
-  const opts = { minSample: settings.get('COINFLIP_MIN_SAMPLE'), suspicionP: settings.get('COINFLIP_SUSPICION_P') }
-  const fairness = coinflip.analyzeFairness(rows, opts)
-  // One binomial test per bot alongside the fleet one — the panel's per-bot
-  // table reads this instead of re-deriving statistics in the browser.
-  const perBot = {}
-  for (const name of [...new Set(rows.map(r => r.bot))]) {
-    perBot[name] = coinflip.analyzeFairness(rows.filter(r => r.bot === name), opts)
-  }
-  sendJson(res, { ...fairness, perBot })
+  const fairness = coinflip.analyzeFairness(rows, { minSample: settings.get('COINFLIP_MIN_SAMPLE'), suspicionP: settings.get('COINFLIP_SUSPICION_P') })
+  sendJson(res, fairness)
   return
 }
 if (p === '/api/coinflip/deep' && req.method === 'GET') {
@@ -2523,11 +2336,9 @@ if (p === '/api/coinflip/bots' && req.method === 'GET') {
   for (const row of rows) {
     if (!botsMap[row.bot]) botsMap[row.bot] = { flips: 0, wins: 0, losses: 0, net: 0, lastSeen: 0 }
     botsMap[row.bot].flips++
-    // The records say 'won'/'lost' (coinflip.STREAK) — matching 'win'/'loss'
-    // here counted every bot as 0W/0L on the panel.
-    if (row.result === coinflip.STREAK.WON) botsMap[row.bot].wins++
-    else if (row.result === coinflip.STREAK.LOST) botsMap[row.bot].losses++
-    if (row.result === coinflip.STREAK.WON || row.result === coinflip.STREAK.LOST) botsMap[row.bot].net += Number.isFinite(row.delta) ? row.delta : row.result === coinflip.STREAK.WON ? row.wager || 0 : -(row.wager || 0)
+    if (row.result === 'win') botsMap[row.bot].wins++
+    else if (row.result === 'loss') botsMap[row.bot].losses++
+    botsMap[row.bot].net += row.delta || 0
     botsMap[row.bot].lastSeen = Math.max(botsMap[row.bot].lastSeen, row.ts || 0)
   }
   sendJson(res, { bots: botsMap })
@@ -2872,8 +2683,6 @@ inCrateRoutine: false, // suppresses windowOpen handler during /crates
   dumpTimers: [],
   dumpCancelRequested: false,
 inSpawnerRoutine: false, // suppresses windowOpen handler during /spawners (slots 13/53 are clicked by the routine)
-inAppleRoutine: false, // suppresses windowOpen handler during /ege (its windows are clicked by the routine)
-appleRoutineRunning: false, // prevents concurrent /ege runs
 shardshopLoopRunning: false, // prevents concurrent /shardshop-loop runs
 lastActivity: Date.now(), // updated on every inbound packet — used by the proxy stall watchdog
 forceKilled: false, // set by the watchdog so scheduleReconnect logs it distinctly
@@ -2892,9 +2701,6 @@ lastPlayerChatAt: Date.now(), // chat activity watchdog — last time a player m
 lastPlayerChat: '', // latest player chat message
 }
 const entry = bots[id]
-entry.connectionState = 'connecting'
-entry.disconnectedAt = null
-recordEvidence(id, 'connections', { state: 'connecting', target: `${host}:${port}` })
 
 // Managed timers — all cleared on disconnect so nothing fires against a dead bot
 const timeouts = []
@@ -3183,11 +2989,7 @@ bot.acceptResourcePack(); // For older versions it still works fine
 bot.once('spawn', () => {
 connected = true
 const recoveredAfter = bots[id]?.reconnectAttempts || 0
-if (bots[id]?.bot === bot) {
-  bots[id].spawnTime = Date.now()
-  bots[id].connectionState = 'online'
-}
-recordEvidence(id, 'connections', { state: 'online', connection: connectionDetails(id, entry) })
+if (bots[id]) bots[id].spawnTime = Date.now()
 // Getting back in means the ban is gone (a temporary ban expired, or somebody
 // lifted it), so clear the flag instead of reporting a stale ban forever.
 if (dataState.bots[id]?.banned) {
@@ -3232,7 +3034,7 @@ if (manual.onWindowOpen(id, window)) return
 // window. /dump opens chests to deposit items — the GUI item search, slot
 // auto-click, and delayed AFK warp must never run on them (it would grab
 // items out of the chest and warp away mid-dump).
-if (bots[id]?.inCrateRoutine || bots[id]?.inDumpRoutine || bots[id]?.inSpawnerRoutine || bots[id]?.inAppleRoutine) return
+if (bots[id]?.inCrateRoutine || bots[id]?.inDumpRoutine || bots[id]?.inSpawnerRoutine) return
 
 // Book auto mode (BOOK_AUTO): a GUI that holds a matching item hands the
 // window to /use-book (scan → hotbar slot 1 → /use && /use) and nothing else
@@ -3340,27 +3142,13 @@ notifyBotsChanged()
 
 bot.on('message', (jsonMsg) => { try { c(jsonMsg.toString()) } catch (_) {} })
 
-bot.on('death', () => {
-  recordEvidence(id, 'deaths', { source: 'mineflayer:death', position: botLocation(bot), reason: 'Death observed; killer/cause unknown unless the server supplies a death message.', recentServerMessages: (bots[id]?.chatHistory || []).slice(-5) })
-  spawnerDrop.stop(id, 'death')
-  manual.stopManualMode(id)
-})
-if (bot._client) bot._client.on('death_combat_event', packet => {
-  recordEvidence(id, 'deaths', { source: 'server:death_combat_event', reason: sanitize(typeof packet.message === 'string' ? packet.message : JSON.stringify(packet.message || {})), position: botLocation(bot) })
-})
-
 bot.on('kicked', (reason) => {
-if (bots[id]?.bot !== bot) return
 let text
 try { text = typeof reason === 'string' ? reason : JSON.stringify(reason) } catch (_) { text = 'unknown' }
 if (bots[id]) {
 bots[id].lastKickReason = text
 bots[id].lastDisconnectReason = text
-bots[id].connectionState = 'disconnected'
-bots[id].disconnectedAt = Date.now()
 }
-recordEvidence(id, 'connections', { state: 'kicked', reason: sanitize(text) })
-spawnerDrop.stop(id, 'kicked')
 e(`Kicked: ${sanitize(text)}`)
 // A ban arrives as an ordinary kick, so the wording is the only evidence. The
 // verdict is written to the persisted data state (not just memory) so a banned
@@ -3453,12 +3241,6 @@ e(`Client error: ${sanitize(err.message || String(err))}`)
 
 bot.on('end', (reason) => {
 connected = false
-if (bots[id]?.bot !== bot) return
-entry.connectionState = 'disconnected'
-entry.disconnectedAt = Date.now()
-entry.spawnTime = null
-recordEvidence(id, 'connections', { state: 'disconnected', reason: sanitize(entry.lastDisconnectReason || String(reason || 'socket closed')) })
-spawnerDrop.stop(id, 'disconnected')
 
 if (bots[id]?.dumpTimers?.length) {
   bots[id].dumpTimers.splice(0).forEach(clearTimeout)
@@ -3495,7 +3277,6 @@ if (!hasRealReason && PROXY_ENABLED && !bots[id]?.spawnTime && (reasonText === '
 classificationReason = 'pre-spawn socketClosed (proxy tunnel likely dropped)'
 }
 
-entry.lastDisconnectReason = entry.lastDisconnectReason || reasonText || 'socket closed'
 monitoring?.onDisconnect(id, classificationReason, manualDisconnect)
 scheduleReconnect('Connection lost', classificationReason)
 lastRawError = null
@@ -3507,9 +3288,6 @@ manualDisconnect = true
 try { manual.stopManualMode(id) } catch (_) {}
 
 if (bots[id]) {
-bots[id].connectionState = 'disconnected'
-bots[id].disconnectedAt = Date.now()
-spawnerDrop.stop(id, 'manual disconnect')
 bots[id].manualDisconnect = true // let the watchdog (outside this closure) know this was intentional
 bots[id].spawnTime = null // stop looking "spawned" to the watchdog now that we're intentionally offline
 }
@@ -3610,20 +3388,16 @@ else entry.bot?.emit('end', 'proxy-watchdog: forced')
 
 // ── Command registry (original + /stats) ──────────────────────────────────────
 const COMMANDS = {
-'/all [first-last|name:first..last] <cmd>': 'Optional inclusive displayed 1–N or exact-name range; a selector alone previews targets without changing selection. Run a local command on EVERY bot, or broadcast a server command to all. ALL_CHAT_GUARD (on by default) refuses plain chat so a typo like "/all .server lifesteal" cannot make every bot say it — prefix with "!" to send chat deliberately ( /all !hello )',
-'/all-slow [first-last|name:first..last] [delay] <cmd>': `Optional inclusive bot range before the optional delay; range alone previews targets. Like /all (chat guard included), but starts each bot ${ALL_SLOW_DELAY_MS / 1000}s apart (ALL_SLOW_DELAY_MS). An optional leading delay overrides it for that run, in the same units as sleep: /all-slow 30 /spawners, /all-slow 500ms /status`,
+'/all <cmd>': 'Run a local command on EVERY bot, or broadcast a server command to all. ALL_CHAT_GUARD (on by default) refuses plain chat so a typo like "/all .server lifesteal" cannot make every bot say it — prefix with "!" to send chat deliberately ( /all !hello )',
+'/all-slow [delay] <cmd>': `Like /all (chat guard included), but starts each bot ${ALL_SLOW_DELAY_MS / 1000}s apart (ALL_SLOW_DELAY_MS). An optional leading delay overrides it for that run, in the same units as sleep: /all-slow 30 /spawners, /all-slow 500ms /status`,
 '/all-slow-cancel [id]': 'Cancel a specific running /all-slow broadcast task by ID (e.g. /all-slow-cancel 1), or all tasks if no ID is specified',
 '/overview': 'Dashboard of every bot\'s health, food, ping, rank (via /fix + /rank), shards, coins, balance, and inventory slots',
-'/enchanted-golden-apple-extract': 'The full kit-extract routine (alias /ege): one pass per EAPPLE_REWARD_SLOTS entry — /kits, click EAPPLE_KIT_SLOT, click the reward slot, /dispose — moving ONLY the EAPPLE_DISPOSE_ITEMS junk each pass so the enchanted golden apples stay in the inventory',
-'/ege': 'Alias for /enchanted-golden-apple-extract',
-'/scripts': 'List the bot-scripts/*.txt files available to /run-script',
-'/run-script <name>': 'Run bot-scripts/<name>.txt: one command per line, in order. \"*<fragment> <cmd>\" = every bot whose name contains the fragment, \"* <cmd>\" = all bots, a bare line = the invoking bot. &&, ; and sleep work inside a line',
 '/stats': 'Runtime stats: memory, event-loop lag, log rate, web viewers, uptime',
 '/crates [color]': `Warp to crates, find + walk to the nearest shulker box of [color] (default: ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')}, within ${CRATE_SCAN_RADIUS} blocks) and right-click it; falls back to ${WARP_AFK} if not found or unreachable. [color] can be a name like "purple" or a full block id like "purple_shulker_box"`,
 '/crates-loop [n] [color]': 'Run /crates repeatedly (default: until failure). Specify n for a fixed count and/or a crate [color]',
 '/shardshop-loop [slot]': `Repeatedly run ${SHARDSHOP_COMMAND} until the server signals it's empty (grep: SHARDSHOP_STOP_PHRASES) or hits the ${SHARDSHOP_LOOP_MAX_RUNS}-run safety cap; optional [slot] overrides default GUI slot`,
-'/crates-all [n] [color] [dump=…] [afk=…] ["term" …] [shulker|chest] [shulker color]': `Run shardshop → crates → dump on bots 1 through n (default: all bots) targeting crate [color] (default: ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')}), ${(CRATES_ALL_STAGGER_MS / 1000).toFixed(0)}s apart so they don't hit the server at once. dump=off|tpa|home|hidden|player:<name> chooses the dump step and afk=now|off|<seconds> chooses the AFK warp; both override CRATES_ALL_DUMP / CRATES_ALL_AFK_WARP / CRATES_ALL_AFK_DELAY_MS for that run`,
-'/crates-solo [bot] [color] [dump=…] [afk=…] ["term" …] [shulker|chest] [shulker color]': 'Run shardshop → crates → dump on just one bot (default: active bot) targeting crate [color] — not all bots. Takes the same dump= / afk= flags as /crates-all',
+'/crates-all [n] [color] [dump=…] [afk=…]': `Run shardshop → crates → dump on bots 1 through n (default: all bots) targeting crate [color] (default: ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')}), ${(CRATES_ALL_STAGGER_MS / 1000).toFixed(0)}s apart so they don't hit the server at once. dump=off|tpa|home|hidden|player:<name> chooses the dump step and afk=now|off|<seconds> chooses the AFK warp; both override CRATES_ALL_DUMP / CRATES_ALL_AFK_WARP / CRATES_ALL_AFK_DELAY_MS for that run`,
+'/crates-solo [bot] [color] [dump=…] [afk=…]': 'Run shardshop → crates → dump on just one bot (default: active bot) targeting crate [color] — not all bots. Takes the same dump= / afk= flags as /crates-all',
   '/bot-coinflip [run|stats|deep|history|export] [args]': `The whole coinflip suite. \`run [PRICE] [AMOUNT] [BOT|all]\` plays AMOUNT flips (default ${settings.get('COINFLIP_DEFAULT_FLIPS')}) and records every one: PRICE is a fixed wager (500000) or a random range (10k-1m — the COINFLIP_WAGER_MIN–MAX defaults), a busy or rate-limited create is waited for and re-asked (never deleted), and the run stops at COINFLIP_STOP_LOSS. \`stats [BOT]\` is the win/loss picture with the fairness verdict. \`deep [BOT]\` dissects the history fourteen ways (what follows a loss run, transition table and lag correlation, run lengths, wager against balance and against absolute size, richest vs poorest, hour of day on the server clock, pace, session position, raising after a loss, opponents, money curve) with a confidence interval per bucket and p-values corrected across the whole family. \`history [n|clear confirm]\` lists or wipes the raw records. \`export [BOT]\` writes data/coinflip-export.csv. Anything else is refused with the list. The game's own /coinflip (create, delete, …) is a separate server command: this console does not intercept that name at all, so /coinflip create 10k reaches the selected bot untouched. Works with /all-slow: /all-slow /bot-coinflip run 10k-1m 20`,
   '/coinflip …': 'The game\'s own coinflip command, owned by the server. The console never intercepts it — /coinflip, /coinflip create 10k and /coinflip delete all reach the selected bot (or every bot with /all-slow) untouched',
   '/timeseries [sample [ranks]|series <metric> [bucket] [bot]|events|clear confirm|status]': 'The recorded samples of shards, coins, balance, rank and bans over time — a sparkline, the last buckets, and where the JSON lives. \`sample\` records one right now',
@@ -3636,18 +3410,16 @@ const COMMANDS = {
 '/auth-retry <bot>': 'Clear a recorded login/register failure for a bot and reconnect it so it can authenticate again (the failure is otherwise only cleared by a restart)',
 '/removed': 'List the removed / permanently-banned bots (the removed-bots.json roster)',
 '/unban <bot>': 'Take a bot off the removed list and reconnect it',
-'/unban-all': 'Empty the removed list and bring EVERY removed bot back, reconnecting them UNBAN_ALL_STAGGER_MS apart so they don\'t all hit the server at once',
 '/chat <msg>': 'Send a chat message from the active bot (avoids triggering local commands); /-prefixed server commands open their GUI without auto-clicking',
 '/disconnect': 'Disconnect the active bot (stops auto-reconnect). Alias: /dc',
 '/closeBot': 'Disconnect the active bot and completely remove it from the UI',
 '/clear': 'Clear the active bot\'s log view',
-'/doc [topic]': 'Built-in documentation: /doc lists the topics (dump grammar, hidden dump, crates chain, settings, API, troubleshooting) and /doc <topic> opens one. The web GUI shows the same docs, searchable, in its 📚 docs panel',
 '/help': 'List all available commands',
 '/repeat [n|duration] [delay] <cmd>': `Re-run a command n times (default 1, max 50) or for a duration (e.g. /repeat 30s /spawners), leaving ${settings.get('REPEAT_DELAY_MS')}ms between runs (REPEAT_DELAY_MS) so a repeat takes time instead of machine-gunning the server. An explicit delay token overrides the gap for that run: /repeat 5 30s /spawners (5 runs, 30s apart), /repeat 30s 2s /spawners (every 2s for 30s). With no command given, repeats the previous command from history. /repeat stop cancels the runs still pending. /all-slow is not affected — it is a separate command with its own staggered dispatch.`,
 '/status': 'Show active bot\'s connection, position, health, ping, uptime',
 '/inv': 'List active bot\'s inventory',
 '/tpauto on|off': 'Toggle automatic /tpaccept for trusted bot names only',
-'/find <name> ["name" …]': 'Search EVERY bot\'s inventory and open window for an item by display, custom, registry name, or NBT text — multiple quoted terms are OR\'d (same matching as /dump filters)',
+'/find <name>': 'Search EVERY bot\'s inventory and open window for an item by display, custom, or registry name',
   '/use-book [name]': `Scan the open GUI (or, with none open, the inventory) for a book, swap it into hotbar slot 1, select it and run /use && /use — every step ${settings.get('BOOK_USE_DELAY_MS')}ms apart (BOOK_USE_DELAY_MS) so the server is never spammed. [name] overrides the scan term (default "${settings.get('BOOK_ITEM_QUERY')}"). /use-book auto on|off (BOOK_AUTO) runs it automatically whenever a GUI opens with a book in it — no book in the GUI, nothing happens`,
   '/copy [name]': 'Everything about the held item — the exact name with unicode intact (clean, and raw with colour codes), registry name, type, count, slot, enchants, lore and NBT — printed AND copied to the clipboard. /copy name copies just the name',
 '/cron': 'List scheduled jobs; /cron add <schedule> <cmd> | rm <id> | on|off <id> | run <id> — add jobs with /cron add <schedule> <command>, optionally prefixed with @BotName to target a single bot; jobs are saved to CRON_STATE_FILE and reloaded on restart. Schedules are 5-field cron or "@every <secs>"; env CRON_JOB_<N>="<schedule>|<command>"',
@@ -3661,18 +3433,13 @@ const COMMANDS = {
 '/switch <id>': 'Switch view to a different bot by name or number',
 '/uptime': 'Show uptime for all bots',
 '/proxy': 'Show the currently configured outbound proxy',
-'/tor-newnym': 'Ask every local Tor instance for fresh circuits (control port = the SOCKS port + 1, or TOR_CONTROL_PORTS) — reconnects leave through a new path; live connections keep theirs until they reconnect',
-'/spawner-drop ["term"] [duration=60s] [cooldown=10s] [mode=duration|once|until-stop] [scope=all|inventory|gui]': 'Open the nearest in-reach spawner without walking or public chat; drop matching whole stacks from its GUI and/or carried inventory, including existing items. Default bones, 60s, one stack per 10s. Stop with /spawner-drop stop. GUI drops may be rejected by server plugins; stop on failure rather than retry',
-'/evidence': 'Persistent per-bot observed connection events, last 3 dump runs with outcome messages, and recent death observations. Full JSON: /api/evidence?bot=<name>; no inferred ban cause',
-'/connection': 'Show configured Minecraft destination and port, verified destination IP when available, direct/proxy route and TCP peer separately; never equate proxy IP with server or public egress IP',
-'/coordinates': 'Alias of /pos: coordinates, facing and dimension; local output only',
-'/manual-interact [action] [args]': 'With no args toggle manual interact mode; forward/back/left/right/jump/sneak/sprint [duration] runs one bounded step (MANUAL_STEP_MS=500, max10s), foward is an alias; stop cancels movement. Other manual actions accept their usual args. Toggle manual interact mode for the active bot (3D view, movement pad, direct world actions); disabled while crate/shardshop routines run',
+'/manual-interact': 'Toggle manual interact mode for the active bot (3D view, movement pad, direct world actions); disabled while crate/shardshop routines run',
 '/manual-stop': 'Stop manual interact mode, release held controls, stop pathfinding, close viewer',
 '/drop [count]': 'Drop the held stack (all of it, or [count] items from it)',
 '/pickup [all]': 'Walk to the nearest dropped item and collect it; /pickup all sweeps everything within reach',
 '/gui <cmd>': 'Send a server command (e.g. /gui /shardshop) and treat the GUI it opens as manual — no auto scan/click or warp',
 '/gui-tui': 'Toggle the ASCII GUI overlay on the dashboard for the open window (click a slot to interact, right-click for right button)',
-'/walk <x|~dx> <y|~dy> <z|~dz> [range]': 'Pathfind near absolute or current-position-relative coordinates (range defaults to 1, capped at 16); /walk stop cancels',
+'/walk <x> <y> <z> [range]': 'Pathfind near coordinates (range defaults to 1, capped at 16); /walk stop cancels',
 '/look <yaw> <pitch>': 'Turn the bot using yaw/pitch in degrees',
 '/lookat <x> <y> <z>': 'Turn the bot toward world coordinates',
 '/hotbar <1-9>': 'Select a hotbar slot in manual mode',
@@ -3692,7 +3459,7 @@ const COMMANDS = {
 '/take-gui': 'Shift-click every item out of the open GUI into the inventory',
 '/dump-gui': 'Shift-click the whole inventory into the open GUI window',
 'anything else': 'Sent directly as a chat message/command from the active bot',
-'/dump [home|hidden|cancel] ["term" …] [shulker|chest] [shulker color]': 'Dump inventory: TPA to the configured main player (or /home stash, or the hidden fleet chain). Optional quoted terms filter WHAT is deposited (names + NBT, OR\'d, case-insensitive — "netherite" finds a renamed Fatal Chestplate); shulker/chest restrict WHICH containers are used and a shulker color (e.g. yellow) narrows shulker boxes. Examples: /dump "fatal" shulker yellow · /dump "fatal" "enchanted" shulker chest · /dump hidden "sword"',
+'/dump [home|hidden|cancel]': 'Dump inventory: TPA to the configured main player, use /home stash, run the hidden chain, or cancel',
 '/dump-spawners': 'Same as /dump, but only transfers SPAWNERS into the chests (everything else stays in the inventory)',
 '/ai-chat [start|stop|status|models|model-set] [bot]': 'AI chat for a bot — every 40-150 seconds the FreeLLM API answers the last 5 chat messages the bot saw, and only the message inside its double quotes is sent (verified first: cleaned up, word-limited, never starting with / or ., never an echo of a recent chat line, never a persona refusal). No prerecorded fallback — a turn that produces nothing verifiable is skipped and reported. \`models\` lists the API\'s models, \`model-set <model>\` picks one (AI_CHAT_MODEL, applies live). Requires FREE_LLM_API_KEY and FREE_LLM_BASE_URL'
 }
@@ -3749,46 +3516,6 @@ function isSpawnerItem (item) {
   return false
 }
 
-// ── /dump filters ───────────────────────────────────────────────────────────
-// A dump filter answers two independent questions: WHAT is deposited (terms —
-// matched against every name the item has plus its NBT text) and WHICH
-// containers are opened (types: chest/shulker families; colors: shulker colors).
-function normalizeDumpFilter (filter) {
-  const f = filter && typeof filter === 'object' ? filter : {}
-  return {
-    terms: Array.isArray(f.terms) ? f.terms.filter(Boolean).map(String) : [],
-    types: Array.isArray(f.types) ? f.types.filter(t => t === 'shulker' || t === 'chest') : [],
-    colors: Array.isArray(f.colors) ? f.colors.filter(Boolean).map(String) : []
-  }
-}
-
-function describeDumpFilter (filter) {
-  const parts = []
-  if (filter.terms.length) parts.push(`items matching ${filter.terms.map(t => `"${sanitize(t)}"`).join(' OR ')}`)
-  if (filter.colors.length) parts.push(`${filter.colors.join('/')} shulker box${filter.colors.length > 1 ? 'es' : ''}`)
-  else if (filter.types.length) parts.push(filter.types.join(' or ') + ' containers')
-  return parts.join('; ')
-}
-
-// Every name an item is known by — the same list /find searches.
-function itemSearchNames (item) {
-  const display = itemDisplayName(item)
-  return [display, itemAltName(item, display), itemCustomName(item), item && item.name].filter(Boolean)
-}
-
-// The item's NBT/components/lore as searchable text. Material tags for custom
-// items ("Fatal Chestplate" made of netherite) live here, which is what makes
-// /dump "netherite" find them.
-function itemNbtText (item) {
-  if (!item) return ''
-  const parts = []
-  try { if (item.customLore) parts.push(typeof item.customLore === 'string' ? item.customLore : JSON.stringify(item.customLore)) } catch (_) {}
-  try { if (item.componentMap && typeof item.componentMap.forEach === 'function') item.componentMap.forEach(c => { try { parts.push(JSON.stringify(c)) } catch (_) {} }) } catch (_) {}
-  try { if (Array.isArray(item.components)) parts.push(JSON.stringify(item.components)) } catch (_) {}
-  try { if (item.nbt) parts.push(JSON.stringify(item.nbt)) } catch (_) {}
-  return parts.join(' ')
-}
-
 /**
 * Sends a TPA command based on an .env variable, then finds the nearest chests
 * within a configured radius and dumps the bot's inventory into them.
@@ -3803,7 +3530,6 @@ async function tpaAndDump(bot, id, options = {}) {
 const spawnersOnly = Boolean(options.spawnersOnly)
 const useHome = Boolean(options.home)
 const skipWarp = Boolean(options.skipWarp)
-const filter = normalizeDumpFilter(options.filter)
 const label = spawnersOnly ? '/dump-spawners' : '/dump'
 if (bots[id]) bots[id].dumpCancelRequested = false
 if (bots[id]?.dumpOperationActive) {
@@ -3814,45 +3540,23 @@ if (bots[id]?.dumpOperationActive) {
 // and the delayed AFK warp) while dumping — /dump opens chests only to
 // deposit into them, and none of that automation may run on them.
 if (bots[id]) bots[id].inDumpRoutine = true
-try { evidenceStore.startDump(id, { command: label, mode: useHome ? 'home' : options.target ? 'target' : 'tpa', filter, position: botLocation(bot) }) } catch (err) { logFor(id, `{red-fg}✗ Evidence save failed: ${sanitize(err.message)}{/red-fg}`) }
 try {
 
 if (bots[id]) bots[id].dumpOperationActive = true
 
-if (bots[id]?.spawnerDropRunning) { logFor(id, `{yellow-fg}⚠ Stop /spawner-drop before dumping.{/yellow-fg}`); return }
 if (!hasInventoryItems(bot.inventory)) {
   logFor(id, `{yellow-fg}⚠ ${label}: inventory is empty — nothing to dump.{/yellow-fg}`)
   return
 }
 
-// The items this dump may touch. A filter that matches nothing stops HERE,
-// before any /tpa: teleporting to deposit nothing is exactly the surprise the
-// filter exists to prevent.
-const itemAllowed = item => spawnersOnly
-  ? isSpawnerItem(item)
-  : itemMatchesDumpTerms(itemSearchNames(item), itemNbtText(item), filter.terms)
-const dumpableItems = () => bot.inventory.items().filter(itemAllowed)
-
 if (spawnersOnly) {
-  const spawnerCount = dumpableItems().reduce((sum, it) => sum + (it.count || 1), 0)
+  const spawnerCount = bot.inventory.items().filter(isSpawnerItem).reduce((sum, it) => sum + (it.count || 1), 0)
   logFor(id, `{cyan-fg}› ${label}: transferring SPAWNERS only — ${spawnerCount} in inventory.{/cyan-fg}`)
   if (spawnerCount === 0) {
     logFor(id, `{yellow-fg}⚠ ${label}: no spawners in the inventory — nothing to transfer.{/yellow-fg}`)
     return
   }
-} else if (filter.terms.length) {
-  const matching = dumpableItems()
-  const termsText = filter.terms.map(t => `"${sanitize(t)}"`).join(' OR ')
-  if (matching.length === 0) {
-    logFor(id, `{yellow-fg}⚠ ${label}: no items match ${termsText} — nothing to dump.{/yellow-fg}`)
-    return
-  }
-  const leftBehind = bot.inventory.items().length - matching.length
-  logFor(id, `{cyan-fg}› ${label}: ${matching.length} stack(s) match ${termsText}${leftBehind ? ` — ${leftBehind} stack(s) stay behind` : ''}.{/cyan-fg}`)
 }
-
-const filterDesc = spawnersOnly ? '' : describeDumpFilter(filter)
-if (filterDesc) logFor(id, `{cyan-fg}› ${label}: ${filterDesc}.{/cyan-fg}`)
 
 const tpaTarget = options.target || TPA_MAIN_PLAYER
 const scanRadius = CHEST_SCAN_RADIUS
@@ -3892,31 +3596,24 @@ await new Promise(r => setTimeout(r, DUMP_SETTLE_MS))
 logFor(id, `{yellow-fg}⚠ ${err.message}. Looking for chests nearby anyway...{/yellow-fg}`)
 }
 
-if (!botOnline(bots[id]) || bots[id]?.dumpCancelRequested) {
+if (!bot.entity || bots[id]?.dumpCancelRequested) {
   logFor(id, `{yellow-fg}⚠ ${label}: dump stopped because the bot disconnected or was cancelled.{/yellow-fg}`)
   return
 }
 
-// Containers this dump may open: the allowed block families (chest / shulker),
-// narrowed to specific shulker colors when the filter names any.
-const containerNames = dumpContainerBlockNames(filter.types, filter.colors)
-const containerIds = containerNames
-  .map(name => bot.registry.blocksByName[name])
-  .filter(Boolean)
-  .map(block => block.id)
-if (containerIds.length === 0) {
-logFor(id, `{yellow-fg}⚠ ${label}: none of the allowed container types exist on this server (${containerNames.join(', ')}) — nothing to dump into.{/yellow-fg}`)
-return
-}
+const chestIds = [
+bot.registry.blocksByName.chest.id,
+bot.registry.blocksByName.trapped_chest.id
+]
 
 const chestBlocks = bot.findBlocks({
-matching: containerIds,
+matching: chestIds,
 maxDistance: scanRadius,
 count: CHEST_SCAN_COUNT
 })
 
 if (chestBlocks.length === 0) {
-logFor(id, `{yellow-fg}⚠ ${label}: No matching containers found within ${scanRadius} blocks.{/yellow-fg}`)
+logFor(id, `{yellow-fg}⚠ ${label}: No chests found within ${scanRadius} blocks.{/yellow-fg}`)
 } else {
 chestBlocks.sort((a, b) => {
 return bot.entity.position.distanceTo(a) - bot.entity.position.distanceTo(b)
@@ -3929,7 +3626,9 @@ if (bots[id]?.dumpCancelRequested) {
   logFor(id, `{yellow-fg}⚠ ${label}: cancelled — stopping before the next chest.{/yellow-fg}`)
   break
 }
-const itemsToDump = dumpableItems()
+const itemsToDump = spawnersOnly
+  ? bot.inventory.items().filter(isSpawnerItem)
+  : bot.inventory.items()
 if (itemsToDump.length === 0) {
   if (spawnersOnly) logFor(id, `{green-fg}✓ ${label}: no spawners left in the inventory — done.{/green-fg}`)
   break
@@ -3964,7 +3663,7 @@ const invEnd = chestContainer.inventoryEnd
 for (let s = invStart; s < invEnd; s++) {
   const item = chestContainer.slots[s]
   if (!item) continue
-  if (!itemAllowed(item)) continue
+  if (spawnersOnly && !isSpawnerItem(item)) continue
 
   const initialCount = item.count
   // The slot state only refreshes once the server's window update arrives.
@@ -4022,12 +3721,13 @@ try { await chestContainer.close() } catch (_) {}
 }
 }
 
-const remaining = dumpableItems()
-const leftBehind = bot.inventory.items().length - remaining.length
+const remaining = spawnersOnly
+  ? bot.inventory.items().filter(isSpawnerItem)
+  : bot.inventory.items()
 if (remaining.length === 0) {
-  logFor(id, `{green-fg}✓ ${label}: all ${spawnersOnly ? 'spawners' : 'items'} successfully dumped (${stacksMoved} stack(s) across ${chestsOpened} usable container(s))${leftBehind ? ` — ${leftBehind} filtered stack(s) left behind` : ''}.{/green-fg}`)
+  logFor(id, `{green-fg}✓ ${label}: all ${spawnersOnly ? 'spawners' : 'items'} successfully dumped into chests (${stacksMoved} stack(s) across ${chestsOpened} usable chest(s)).{/green-fg}`)
 } else {
-  logFor(id, `{yellow-fg}⚠ ${label}: ${remaining.length} stack(s) still in the inventory — ${chestsOpened} usable container(s) took ${stacksMoved} stack(s).${filter.terms.length && !spawnersOnly ? ' Filtered items stay behind on purpose.' : ''}{/yellow-fg}`)
+  logFor(id, `{yellow-fg}⚠ ${label}: ${remaining.length} stack(s) still in the inventory — ${chestsOpened} usable chest(s) took ${stacksMoved} stack(s).{/yellow-fg}`)
 }
 }
 
@@ -4038,12 +3738,7 @@ if (!skipWarp) {
   try { bot.chat(WARP_AFK) } catch (_) {}
 }
 
-} catch (err) {
-  logFor(id, `{red-fg}✗ ${label}: failed: ${sanitize(err.message)}{/red-fg}`)
-  try { evidenceStore.finishDump(id, 'failed') } catch (saveErr) { logFor(id, `{red-fg}✗ Evidence save failed: ${sanitize(saveErr.message)}{/red-fg}`) }
-  throw err
 } finally {
-  try { evidenceStore.finishDump(id, bots[id]?.dumpCancelRequested ? 'cancelled' : 'finished; see recorded outcome') } catch (err) { logFor(id, `{red-fg}✗ Evidence save failed: ${sanitize(err.message)}{/red-fg}`) }
 if (bots[id]) {
   bots[id].inDumpRoutine = false
   bots[id].dumpOperationActive = false
@@ -4063,67 +3758,61 @@ function cancelDumpForBot (id, reason = 'cancelled') {
 
 function cancelHiddenDump () {
   if (!hiddenDumpRun) return false
-  const run = hiddenDumpRun
-  hiddenDumpRun = null
-  run.cancelled = true
-  if (run.scheduler) run.scheduler.cancel()
+  hiddenDumpRun.cancelled = true
+  hiddenDumpRun.timers.splice(0).forEach(clearTimeout)
   Object.keys(bots).forEach(id => cancelDumpForBot(id, 'cancelled'))
-  logFor(SYSTEM_ID, `{yellow-fg}⚠ Hidden dump cancelled after ${run.finished}/${run.total} bot(s) completed.{/yellow-fg}`)
+  logFor(SYSTEM_ID, `{yellow-fg}⚠ Hidden dump cancelled.{/yellow-fg}`)
+  hiddenDumpRun = null
   return true
 }
 
-// The hidden dump: a shuffled queue drained through a slot scheduler. At most
-// DUMP_HIDDEN_CONCURRENT bots are "at the spot" at any moment — each one /tpa's
-// to TPA_MAIN_PLAYER, deposits, then resets with the AFK warp, and its slot is
-// released only when that whole sequence is done. Completion-driven: a slow
-// dump delays the next bot instead of overlapping it. Starts are spaced a
-// random gap apart so a 70-bot roster never arrives as a visible wave.
-function startHiddenDump (options = {}) {
-  const filter = normalizeDumpFilter(options.filter)
+function startHiddenDump () {
   if (hiddenDumpRun) {
-    logFor(SYSTEM_ID, `{yellow-fg}⚠ A hidden dump is already running (${hiddenDumpRun.started}/${hiddenDumpRun.total} started). Use /dump cancel first.{/yellow-fg}`)
+    logFor(SYSTEM_ID, `{yellow-fg}⚠ A hidden dump is already running.{/yellow-fg}`)
     return true
   }
   if (!TPA_MAIN_PLAYER) {
     logFor(SYSTEM_ID, '{yellow-fg}⚠ Hidden dump requires TPA_MAIN_PLAYER in .env.{/yellow-fg}')
     return true
   }
-  const names = buildHiddenDumpQueue(Object.keys(bots).filter(id => id !== TPA_MAIN_PLAYER))
-  if (!names.length) {
-    logFor(SYSTEM_ID, '{yellow-fg}⚠ Hidden dump: no bots to send.{/yellow-fg}')
-    return true
-  }
-  const run = { cancelled: false, scheduler: null, started: 0, finished: 0, total: names.length, filter }
-  hiddenDumpRun = run
-  const gapRange = DUMP_HIDDEN_MAX_GAP_MS - DUMP_HIDDEN_MIN_GAP_MS
-  run.scheduler = createDumpSlotScheduler({
-    maxConcurrent: DUMP_HIDDEN_CONCURRENT,
-    gapMs: () => DUMP_HIDDEN_MIN_GAP_MS + Math.floor(Math.random() * (gapRange + 1)),
-    start: (name, done) => {
-      const entry = bots[name]
+  const duration = randomInt(DUMP_HIDDEN_MIN_MS, DUMP_HIDDEN_MAX_MS)
+  const allBots = Object.keys(bots).filter(id => id !== TPA_MAIN_PLAYER)
+  const plan = buildHiddenDumpPlan(allBots, TPA_MAIN_PLAYER)
+  const maxActions = Math.min(plan.length, Math.max(1, Math.floor(duration / DUMP_MIN_TPA_GAP_MS) + 1))
+  const selected = plan.slice(0, maxActions)
+  hiddenDumpRun = { duration, timers: [], cancelled: false }
+  logFor(SYSTEM_ID, `{cyan-fg}› Hidden dump started: ${selected.length}/${plan.length} TPA actions over ${(duration / 60000).toFixed(1)} minutes; minimum gap ${(DUMP_MIN_TPA_GAP_MS / 60000).toFixed(1)} minutes.{/cyan-fg}`)
+  if (selected.length < plan.length) logFor(SYSTEM_ID, `{yellow-fg}⚠ Hidden dump limited by the 3-minute TPA gap; ${plan.length - selected.length} bot(s) were skipped this run.{/yellow-fg}`)
+
+  // Delays are computed up front so the finish timer can be scheduled after the
+  // LAST action. Finishing at `duration` used to silently swallow any action
+  // whose gap×index + jitter landed later — when duration is a multiple of the
+  // gap, the final action never ran at all.
+  const delays = selected.map((_, index) => (index === 0 ? 0 : index * DUMP_MIN_TPA_GAP_MS + Math.floor(Math.random() * 15000)))
+  selected.forEach((step, index) => {
+    const delay = delays[index]
+    const timer = setTimeout(() => {
+      if (!hiddenDumpRun || hiddenDumpRun.cancelled) return
+      const entry = bots[step.bot]
       if (!entry?.bot?.entity) {
-        logFor(name, `{yellow-fg}⚠ Hidden dump skipped: bot is disconnected.{/yellow-fg}`)
-        done()
+        logFor(step.bot, `{yellow-fg}⚠ Hidden dump skipped: bot is disconnected.{/yellow-fg}`)
         return
       }
       entry.dumpCancelRequested = false
-      run.started++
-      logFor(name, `{cyan-fg}› Hidden dump action ${run.started}/${run.total}: TPA to ${TPA_MAIN_PLAYER}, deposit, then ${WARP_AFK}.{/cyan-fg}`)
-      tpaAndDump(entry.bot, name, { target: TPA_MAIN_PLAYER, filter })
-        .then(() => { run.finished++ })
-        .catch(err => logFor(name, `{red-fg}✗ Hidden dump failed: ${sanitize(err.message)}{/red-fg}`))
-        .finally(done)
-    },
-    onIdle: () => {
-      if (hiddenDumpRun !== run) return
-      hiddenDumpRun = null
-      logFor(SYSTEM_ID, `{green-fg}✓ Hidden dump finished: ${run.finished}/${run.total} bot(s) dumped, at most ${DUMP_HIDDEN_CONCURRENT} at the spot at a time.{/green-fg}`)
-    }
+      logFor(step.bot, `{cyan-fg}› Hidden dump action ${index + 1}/${selected.length}: TPA to ${step.target}.{/cyan-fg}`)
+      tpaAndDump(entry.bot, step.bot, { skipWarp: true, target: step.target }).catch(err => logFor(step.bot, `{red-fg}✗ Hidden dump failed: ${sanitize(err.message)}{/red-fg}`))
+    }, delay)
+    hiddenDumpRun.timers.push(timer)
+    const entry = bots[step.bot]
+    if (entry) entry.dumpTimers.push(timer)
   })
-  logFor(SYSTEM_ID, `{cyan-fg}› Hidden dump started: ${names.length} bot(s), at most ${DUMP_HIDDEN_CONCURRENT} at the spot at a time, starts ${(DUMP_HIDDEN_MIN_GAP_MS / 1000).toFixed(0)}–${(DUMP_HIDDEN_MAX_GAP_MS / 1000).toFixed(0)}s apart. Each bot /tpa ${TPA_MAIN_PLAYER}, deposits, then ${WARP_AFK}. /dump cancel stops it.{/cyan-fg}`)
-  const filterDesc = describeDumpFilter(filter)
-  if (filterDesc) logFor(SYSTEM_ID, `{cyan-fg}› Hidden dump filter: ${filterDesc}.{/cyan-fg}`)
-  run.scheduler.enqueue(names)
+  const finishDelay = Math.max(duration, ...delays, 0) + 1000
+  const finishTimer = setTimeout(() => {
+    if (!hiddenDumpRun || hiddenDumpRun.cancelled) return
+    logFor(SYSTEM_ID, `{green-fg}✓ Hidden dump finished after ${(finishDelay / 60000).toFixed(1)} minutes.{/green-fg}`)
+    hiddenDumpRun = null
+  }, finishDelay)
+  hiddenDumpRun.timers.push(finishTimer)
   return true
 }
 
@@ -4146,28 +3835,8 @@ case '/tpauto': {
   logFor(id, `{green-fg}✓ TPA auto ${entry.tpautoEnabled ? 'enabled' : 'disabled'}; trusted names only.{/green-fg}`)
   return true
 }
-case '/connection': {
-  const info = connectionDetails(id, entry)
-  logFor(id, `{cyan-fg}› Connection: ${sanitize(JSON.stringify(info))}{/cyan-fg}`)
-  return true
-}
-case '/evidence': {
-  const audit = evidenceStore.get(id)
-  logFor(id, `{cyan-fg}› Evidence audit for ${id}: ${sanitize(audit.caveat)}{/cyan-fg}`)
-  for (const event of audit.connections.slice(-5)) logFor(id, ` Connection ${new Date(event.t).toISOString()}: ${sanitize(event.state)} ${sanitize(event.reason || '')}`)
-  for (const death of audit.deaths) logFor(id, ` Death observation ${new Date(death.t).toISOString()} (${sanitize(death.source)}): ${sanitize(death.reason)} at ${sanitize(JSON.stringify(death.position || null))}`)
-  for (const dump of audit.dumps) {
-    logFor(id, ` Dump ${new Date(dump.t).toISOString()}: ${sanitize(dump.command)} mode=${sanitize(dump.mode)} — ${sanitize(dump.status)}; filter=${sanitize(JSON.stringify(dump.filter || {}))}`)
-    for (const message of dump.messages || []) logFor(id, `   ${sanitize(message)}`)
-  }
-  logFor(id, '{gray-fg}Full untruncated audit: /api/evidence?bot=<name>. Death packets and health transitions are separate observations, not a deduplicated death count.{/gray-fg}')
-  return true
-}
-case '/spawner-drop': return spawnerDrop.route(id, String(cmd).slice('/spawner-drop'.length))
 case '/status': {
-logFor(id, `{cyan-fg}› State: ${botOnline(entry) ? 'online' : dataState.bots[id]?.banned ? 'banned' : entry.connectionState || 'disconnected'}${entry.lastDisconnectReason ? ' — ' + sanitize(entry.lastDisconnectReason) : ''}{/cyan-fg}`)
-logFor(id, ` Connection: ${sanitize(JSON.stringify(connectionDetails(id, entry)))}`)
-if (!botOnline(entry)) return true
+if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
 const pos = bot.entity.position
 const uptimeSec = entry.spawnTime ? Math.floor((Date.now() - entry.spawnTime) / 1000) : 0
 logFor(id, `{cyan-fg}› Status for ${id}:{/cyan-fg}`)
@@ -4209,15 +3878,13 @@ if (alt) logFor(id, `    ↳ ${sanitize(alt)}`)
 return true
 }
 case '/dump': {
-// Full grammar: /dump [home|hidden|cancel] ["term" …] [shulker|chest] [color]
-const parsed = parseDumpArgs(String(cmd || '').trim().slice('/dump'.length))
-if (parsed.unknown.length) logFor(id, `{yellow-fg}⚠ Unknown /dump option "${sanitize(parsed.unknown[0])}" — ignored. Keywords: home, hidden, cancel, shulker, chest, all, or a shulker color; "quoted words" filter item names.{/yellow-fg}`)
-const filter = { terms: parsed.terms, types: parsed.types, colors: parsed.colors }
-if (parsed.mode === 'cancel') { cancelHiddenDump(); cancelDumpForBot(id); return true }
-if (parsed.mode === 'hidden') return startHiddenDump({ filter })
+const { mode, unknown: unknownMode } = parseDumpMode(parts[1])
+if (unknownMode) logFor(id, `{yellow-fg}⚠ Unknown /dump option "${sanitize(unknownMode)}" — running the default TPA dump instead. Options: home, hidden, cancel.{/yellow-fg}`)
+if (mode === 'cancel') { cancelHiddenDump(); cancelDumpForBot(id); return true }
+if (mode === 'hidden') return startHiddenDump()
 if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
-if (parsed.mode === 'home') return tpaAndDump(bot, id, { home: true, filter })
-return tpaAndDump(bot, id, { filter })
+if (mode === 'home') return tpaAndDump(bot, id, { home: true })
+return tpaAndDump(bot, id)
 }
 case '/dump-spawners': {
 if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
@@ -4283,25 +3950,6 @@ return true
 case '/crates': {
 if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
 return runCrateRoutine(id)
-}
-
-case '/enchanted-golden-apple-extract':
-case '/ege': {
-return runAppleExtractRoutine(id)
-}
-
-case '/scripts': {
-const names = listBotScripts(SCRIPTS_DIR)
-if (!names.length) { logFor(id, `{yellow-fg}⚠ No scripts in ${sanitize(SCRIPTS_DIR)} — add <name>.txt there.{/yellow-fg}`); return true }
-logFor(id, `{cyan-fg}› Scripts in ${sanitize(SCRIPTS_DIR)}:{/cyan-fg} ${names.map(sanitize).join(', ')}`)
-logFor(id, `{gray-fg}Run one with /run-script <name>. Line syntax: "*<fragment> <cmd>" targets matching bots, "* <cmd>" all bots, a bare line the invoking bot.{/gray-fg}`)
-return true
-}
-
-case '/run-script': {
-const name = parts[1]
-if (!name) { logFor(id, `{yellow-fg}⚠ Usage: /run-script <name> — scripts live in ${sanitize(SCRIPTS_DIR)} as <name>.txt.{/yellow-fg}`); return true }
-return runBotScript(name, id)
 }
 
 case '/crates-loop': {
@@ -4457,7 +4105,6 @@ clickOnce()
 // windowOpen handler so the shulker box GUI doesn't trigger Fatal Crate logic.
 async function runCrateRoutine(id, blockNameOverride) {
 const entry = bots[id]
-if (entry?.spawnerDropRunning) { logFor(id, '{yellow-fg}⚠ Stop /spawner-drop before /crates.{/yellow-fg}'); return false }
 if (entry?.manualMode) { logFor(id, `{yellow-fg}⚠ Stop manual interact (/manual-stop) before starting /crates.{/yellow-fg}`); return false }
 // A GUI session armed by /chat or /gui must not swallow this routine's window
 if (entry.suppressNextWindowClick) entry.suppressNextWindowClick = false
@@ -4543,118 +4190,6 @@ bots[id].inCrateRoutine = false
 }
 }
 
-// ── /enchanted-golden-apple-extract (/ege) ─────────────────────────────────
-// One pass per EAPPLE_REWARD_SLOTS entry: /kits → left-click the kit slot →
-// left-click the reward slot → /dispose → move ONLY the EAPPLE_DISPOSE_ITEMS
-// junk in → close. The enchanted golden apples stay in the inventory: the
-// "golden_apple" glob is exact, so enchanted_golden_apple is never matched.
-// All clicks are left-clicks; every wait is EAPPLE_STEP_DELAY_MS.
-async function moveItemsToDispose (bot, id, win, globs) {
-const invStart = win.inventoryStart
-const invEnd = win.inventoryEnd
-let moved = 0, kept = 0
-for (let s = invStart; s < invEnd; s++) {
-const item = win.slots[s]
-if (!item) continue
-const shown = itemDisplayName(item) || item.name || 'item'
-if (!itemMatchesGlobs({ name: item.name, displayName: shown }, globs)) { kept++; continue }
-const initialCount = item.count
-// Same "did it really move?" confirm dance as /dump: the slot state only
-// refreshes when the server's window update arrives, so judging the click
-// immediately reads stale state. Click, wait for the count to change, retry once.
-let after = null, ok = false
-for (let attempt = 0; attempt < 2 && !ok; attempt++) {
-try {
-// Mode 1, button 0 = shift-click: straight into the dispose GUI.
-await bot.clickWindow(s, 0, 1)
-} catch (err) {
-logFor(id, `{yellow-fg}⚠ /ege: shift-click failed on slot ${s}: ${sanitize(err.message || String(err))}{/yellow-fg}`)
-return { moved, kept, failed: true }
-}
-const deadline = Date.now() + DUMP_CLICK_CONFIRM_MS
-after = win.slots[s]
-while (after && after.count === initialCount && Date.now() < deadline) {
-await new Promise(r => setTimeout(r, DUMP_CLICK_DELAY_MS))
-after = win.slots[s]
-}
-ok = !(after && after.count === initialCount)
-}
-if (!ok) { logFor(id, `{yellow-fg}⚠ /ege: ${sanitize(shown)} did not move — leaving it.{/yellow-fg}`); kept++; continue }
-moved++
-await new Promise(r => setTimeout(r, DUMP_CLICK_DELAY_MS))
-}
-return { moved, kept, failed: false }
-}
-
-async function runAppleExtractRoutine (id) {
-const entry = bots[id]
-if (entry?.spawnerDropRunning) { logFor(id, '{yellow-fg}⚠ Stop /spawner-drop before /ege.{/yellow-fg}'); return false }
-if (!entry) return false
-if (entry.manualMode) { logFor(id, `{yellow-fg}⚠ Stop manual interact (/manual-stop) before starting /ege.{/yellow-fg}`); return false }
-if (!entry.bot?.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return false }
-if (entry.inAppleRoutine || entry.appleRoutineRunning) { logFor(id, `{yellow-fg}⚠ /ege is already running for ${id}.{/yellow-fg}`); return false }
-// A GUI session armed by /chat or /gui must not swallow this routine's windows
-if (entry.suppressNextWindowClick) entry.suppressNextWindowClick = false
-if (entry.suppressWindowTimer) { clearTimeout(entry.suppressWindowTimer); entry.suppressWindowTimer = null }
-if (entry.manualWindow) entry.manualWindow = null
-if (entry.manualSession) entry.manualSession = false
-if (entry.guiSessionTimer) { clearTimeout(entry.guiSessionTimer); entry.guiSessionTimer = null }
-
-const kitSlot = settings.get('EAPPLE_KIT_SLOT')
-const rewardSlots = parseRewardSlots(settings.get('EAPPLE_REWARD_SLOTS'))
-const globs = parseItemGlobs(settings.get('EAPPLE_DISPOSE_ITEMS'))
-const stepMs = settings.get('EAPPLE_STEP_DELAY_MS')
-if (!rewardSlots.length) { logFor(id, `{red-fg}✗ EAPPLE_REWARD_SLOTS has no valid slots — nothing to do.{/red-fg}`); return false }
-
-entry.appleRoutineRunning = true
-entry.inAppleRoutine = true
-const { bot } = entry
-const pause = () => new Promise(r => setTimeout(r, stepMs))
-const closeWindow = () => { if (bot.currentWindow) { try { bot.closeWindow(bot.currentWindow) } catch (_) {} } }
-const clickLeft = async (win, slot, label) => {
-if (!win) return false
-if (slot >= win.slots.length) { logFor(id, `{yellow-fg}⚠ /ege: ${label} slot ${slot} out of bounds — the window has ${win.slots.length} slots.{/yellow-fg}`); return false }
-try { await bot.clickWindow(slot, 0, 0); logFor(id, `{cyan-fg}› /ege: clicked ${label} slot ${slot}.{/cyan-fg}`); return true }
-catch (err) { logFor(id, `{red-fg}✗ /ege: click on ${label} slot ${slot} failed: ${sanitize(err.message || String(err))}{/red-fg}`); return false }
-}
-
-try {
-for (let pass = 0; pass < rewardSlots.length; pass++) {
-const rewardSlot = rewardSlots[pass]
-if (!bot.entity) { logFor(id, `{red-fg}✗ ${id} despawned — /ege stopped after ${pass} pass(es).{/red-fg}`); return false }
-logFor(id, `{cyan-fg}› /ege pass ${pass + 1}/${rewardSlots.length}: /kits → slot ${kitSlot} → slot ${rewardSlot} → /dispose.{/cyan-fg}`)
-closeWindow()
-bot.chat('/kits')
-const kitWin = await waitForWindowOpen(bot)
-if (!kitWin) { logFor(id, `{red-fg}✗ /ege: no GUI opened after /kits — stopping.{/red-fg}`); return false }
-await pause()
-if (!(await clickLeft(kitWin, kitSlot, 'kit'))) return false
-await pause()
-// The reward click targets whatever window is current after the wait: the kit
-// click may update the GUI in place or swap in a new window.
-const rewardWin = bot.currentWindow || await waitForWindowOpen(bot)
-if (!rewardWin) { logFor(id, `{red-fg}✗ /ege: no reward window after the kit click — stopping.{/red-fg}`); return false }
-if (!(await clickLeft(rewardWin, rewardSlot, 'reward'))) return false
-await pause()
-closeWindow()
-
-bot.chat('/dispose')
-const disposeWin = await waitForWindowOpen(bot)
-if (!disposeWin) { logFor(id, `{yellow-fg}⚠ /ege: no GUI opened after /dispose — skipping the dispose step.{/yellow-fg}`); continue }
-await pause()
-const { moved, kept, failed } = await moveItemsToDispose(bot, id, disposeWin, globs)
-logFor(id, `{green-fg}✓ /ege pass ${pass + 1}: moved ${moved} junk stack(s) into /dispose, kept ${kept}.{/green-fg}`)
-closeWindow()
-if (failed) { logFor(id, `{yellow-fg}⚠ /ege: a click failed — stopping.{/yellow-fg}`); return false }
-await pause()
-}
-logFor(id, `{green-fg}✓ /ege done — ${rewardSlots.length} pass(es) complete. The enchanted golden apples are still in the inventory.{/green-fg}`)
-return true
-} finally {
-if (bots[id]) { bots[id].inAppleRoutine = false; bots[id].appleRoutineRunning = false }
-}
-}
-
 // ── /spawners: click every spawner already within reach (no movement) ──────
 // Resolves with the window the bot just opened, or null if none appeared in time.
 function waitForWindowOpen (bot, timeoutMs = SPAWNER_WINDOW_WAIT_MS) {
@@ -4729,7 +4264,6 @@ return { ok, balanceBefore, balanceAfter }
 async function runSpawnerRoutine (id) {
 const entry = bots[id]
 if (!entry) return false
-if (entry.spawnerDropRunning) { logFor(id, '{yellow-fg}⚠ Stop /spawner-drop before /spawners.{/yellow-fg}'); return false }
 if (entry.manualMode) { logFor(id, `{yellow-fg}⚠ Stop manual interact (/manual-stop) before starting /spawners.{/yellow-fg}`); return false }
 if (!entry.bot?.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return false }
 if (entry.spawnerRoutineRunning) { logFor(id, `{yellow-fg}⚠ /spawners is already running for ${id}.{/yellow-fg}`); return false }
@@ -4958,7 +4492,6 @@ sendOnce()
 }
 
 async function shardshopLoopCommand(id, customSlot = null) {
-if (bots[id]?.spawnerDropRunning) { logFor(id, '{yellow-fg}⚠ Stop /spawner-drop before /shardshop-loop.{/yellow-fg}'); return false }
 const result = await runShardshopLoop(id, customSlot)
 if (!result) return
 const { runs, stopReason } = result
@@ -4994,11 +4527,7 @@ let afkWarp = flags.afkWarp == null ? CRATES_ALL_AFK_WARP : flags.afkWarp
 // warp would undo exactly that — so hidden turns it off unless this run asked
 // for one explicitly (afk=now / afk=30).
 if (dump === 'hidden' && flags.afkWarp !== true) afkWarp = false
-const plan = { dump, target, afkWarp, afkDelayMs }
-// Only present when this run actually carries dump filters, so a plain plan
-// keeps exactly the shape it has always had.
-if (flags.filter) plan.filter = normalizeDumpFilter(flags.filter)
-return plan
+return { dump, target, afkWarp, afkDelayMs }
 }
 
 function describeCratesAllPlan(plan) {
@@ -5009,8 +4538,7 @@ const dump = plan.dump === 'off' ? 'no dump'
 const afk = !plan.afkWarp ? 'stay put afterwards'
 : plan.afkDelayMs === 0 ? `immediate ${WARP_AFK}`
 : `${WARP_AFK} after ${(plan.afkDelayMs / 1000).toFixed(0)}s`
-const filterDesc = plan.filter ? describeDumpFilter(plan.filter) : ''
-return `${dump}, ${afk}${filterDesc ? `; ${filterDesc}` : ''}`
+return `${dump}, ${afk}`
 }
 
 async function runCratesAllSequenceForBot(id, blockNameOverride, plan = cratesAllPlan()) {
@@ -5053,11 +4581,11 @@ logFor(id, `{cyan-fg}› Hidden dump is already armed — this bot's inventory i
 } else {
 logFor(id, `{cyan-fg}› Arming the hidden dump chain for the whole roster (dump=hidden).{/cyan-fg}`)
 cratesAllHiddenStarted = true
-startHiddenDump({ filter: plan.filter })
+startHiddenDump()
 }
 } else {
 try {
-await tpaAndDump(bot, id, plan.dump === 'home' ? { home: true, filter: plan.filter } : { target: plan.target, filter: plan.filter })
+await tpaAndDump(bot, id, plan.dump === 'home' ? { home: true } : { target: plan.target })
 logFor(id, `{green-fg}✓ /crates-all: sequence complete for ${id}.{/green-fg}`)
 } catch (err) {
 logFor(id, `{red-fg}✗ Dump step failed: ${sanitize(err.message)}{/red-fg}`)
@@ -5274,13 +4802,11 @@ function feedCoinflipLine (id, message) {
   try { coinflipObserverFor(id).feed(message) } catch (_) {}
 }
 
-// ── Chat games (guess the number & equations) ───────────────────────────────
+// ── Chat games (guess the number) ───────────────────────────────────────────
 // The server announces a timed round ("A chat event has started! … Hint: 1-15
 // | Reward: $2,500"); the fleet covers the range as fast as it can: every tick
 // a random connected bot says one number that has not been guessed yet, in
-// random order. Equation rounds ("Solve: 3x+5=20") instead get exactly one
-// answer — computed, never guessed — from exactly one random bot. See
-// createChatGameManager for the round lifecycle.
+// random order. See createChatGameManager for the round lifecycle.
 const chatGame = createChatGameManager({
   submit: (botId, value) => {
     const entry = bots[botId]
@@ -5291,9 +4817,6 @@ const chatGame = createChatGameManager({
   onEvent: (ev) => {
     if (ev.kind === 'start') {
       logFor(SYSTEM_ID, `{magenta-fg}🎮 chat game ${ev.min}-${ev.max}: ${ev.guesses} numbers from ${ev.bots} bot(s) at ${Math.round(1000 / ev.intervalMs)}/s{/magenta-fg}`)
-    } else if (ev.kind === 'equation') {
-      if (ev.bot) logFor(SYSTEM_ID, `{magenta-fg}🧮 chat game equation ${ev.equation} → ${ev.variable} = ${ev.answer} (${ev.bot}){/magenta-fg}`)
-      else logFor(SYSTEM_ID, `{magenta-fg}🧮 chat game equation ${ev.equation} → ${ev.variable} = ${ev.answer}, but no bot could speak{/magenta-fg}`)
     } else if (ev.kind === 'stop') {
       logFor(SYSTEM_ID, `{magenta-fg}🎮 chat game over (${ev.reason}) — guessed ${ev.guessed.length ? ev.guessed.join(', ') : 'nothing'}{/magenta-fg}`)
     }
@@ -5568,7 +5091,6 @@ async function stopCoinflipAll () {
 // Samples are taken on an interval, on demand, and after the routines that
 // already queried the server (so a shard count is never asked for twice).
 const lastSampleByBot = new Map()
-const runtimeStartedAt = Date.now() - process.uptime() * 1000
 let timeseriesSampling = false
 
 function recordTimeseriesSample (id, sample, source) {
@@ -5580,35 +5102,24 @@ function recordTimeseriesSample (id, sample, source) {
     // makes "banned bots over time" a chart instead of a guess.
     banned: Boolean(dataState.bots[id]?.banned),
     bannedKind: dataState.bots[id]?.banKind || null,
-    source, runStartedAt: runtimeStartedAt
+    source
   }, Date.now())
   timeseriesStore.append(row)
-  const previous = lastSampleByBot.get(id)
-  const merged = { ...(previous || {}), ...row, bot: id, metricAt: { ...(previous?.metricAt || {}) } }
-  for (const key of timeseries.METRICS) if (sample[key] !== undefined) merged.metricAt[key] = row.t
-  lastSampleByBot.set(id, merged)
+  lastSampleByBot.set(id, { ...row, bot: id })
   return row
 }
 
 function recordFleetSample (source) {
   if (!settings.get('TIMESERIES_ENABLED')) return null
   if (!lastSampleByBot.size) return null
-  const now = Date.now()
-  const maxAge = Math.max(60000, settings.get('TIMESERIES_INTERVAL_MS') * 2)
-  const samples = [...lastSampleByBot.values()].filter(sample => botOnline(bots[sample.bot])).map(sample => {
-    const fresh = { ...sample }
-    for (const key of timeseries.METRICS) if (!sample.metricAt?.[key] || now - sample.metricAt[key] > maxAge) delete fresh[key]
-    return fresh
-  })
-  const row = timeseries.fleetSample(samples, now, source, runtimeStartedAt)
-  row.banned = Object.values(dataState.bots).filter(bot => bot.banned).length
+  const row = timeseries.fleetSample([...lastSampleByBot.values()], Date.now(), source)
   timeseriesStore.append(row)
   return row
 }
 
 function persistTimeseriesSnapshot () {
   try {
-    const snapshot = timeseriesStore.snapshot({ bucketMs: settings.get('ANALYTICS_BUCKET_MS'), warmupMs: settings.get('ANALYTICS_WARMUP_MS') })
+    const snapshot = timeseriesStore.snapshot({ bucketMs: settings.get('ANALYTICS_BUCKET_MS') })
     fs.mkdirSync(path.dirname(TIMESERIES_SUMMARY_FILE), { recursive: true })
     fs.writeFileSync(TIMESERIES_SUMMARY_FILE, JSON.stringify(snapshot, null, 2))
   } catch (err) {
@@ -5624,7 +5135,7 @@ async function sampleTimeseriesNow (opts = {}) {
   if (timeseriesSampling) { logFor(SYSTEM_ID, '{yellow-fg}⚠ A time-series sample is already running.{/yellow-fg}'); return 0 }
   timeseriesSampling = true
   try {
-    const names = (opts.ids || Object.keys(bots)).filter(id => botOnline(bots[id]))
+    const names = (opts.ids || Object.keys(bots)).filter(id => bots[id]?.bot?.entity)
     if (!names.length) { logFor(SYSTEM_ID, '{yellow-fg}⚠ No spawned bots to sample.{/yellow-fg}'); return 0 }
     logFor(SYSTEM_ID, `{cyan-fg}› Sampling ${names.length} bot(s) for the time series (${source})…{/cyan-fg}`)
     let sampled = 0
@@ -5710,7 +5221,7 @@ function buildAnalyticsReport (opts = {}) {
     minSample: settings.get('COINFLIP_MIN_SAMPLE'),
     suspicionP: settings.get('COINFLIP_SUSPICION_P')
   })
-  const tsSnapshot = timeseriesStore.snapshot({ bucketMs: settings.get('ANALYTICS_BUCKET_MS'), warmupMs: settings.get('ANALYTICS_WARMUP_MS'), bot: opts.bot || null })
+  const tsSnapshot = timeseriesStore.snapshot({ bucketMs: settings.get('ANALYTICS_BUCKET_MS'), bot: opts.bot || null })
   // buildReport renders the deep and timeseries tabs to HTML for the client to
   // fetch on demand, so the first page paint only carries the coinflip tab.
   return analytics.buildReport({
@@ -5795,17 +5306,13 @@ function handleAnalyticsRequest (req, res, url) {
     const bot = url.searchParams.get('bot') || null
     const bucketMs = analytics.parseBucket(url.searchParams.get('bucket'), settings.get('ANALYTICS_BUCKET_MS'))
     const since = Number(url.searchParams.get('since')) || 0
-    // ?raw=1 turns the warm-up skip off for this request, for whoever wants to
-    // see the ramp the charts leave out.
-    const warmupMs = url.searchParams.get('raw') != null ? 0 : settings.get('ANALYTICS_WARMUP_MS')
     sendJson(res, {
       metric,
       bot,
       bucketMs,
       since,
-      warmupMs,
-      points: timeseriesStore.bucket(metric, { bucketMs, since, bot, kind: bot ? 'bot' : 'fleet', warmupMs }),
-      summary: timeseriesStore.summarize(metric, { bot, kind: bot ? 'bot' : 'fleet', since, warmupMs })
+      points: timeseriesStore.bucket(metric, { bucketMs, since, bot, kind: bot ? 'bot' : 'fleet' }),
+      summary: timeseriesStore.summarize(metric, { bot, since })
     })
     return
   }
@@ -6191,8 +5698,8 @@ function guardBroadcastText (text, commandName) {
 const BOOK_AUTO_COOLDOWN_MS = 3000 // one auto-run per window-open burst
 
 function bookRoutineBusy (entry) {
-  return !!(entry && (entry.inCrateRoutine || entry.inDumpRoutine || entry.inSpawnerRoutine || entry.inAppleRoutine ||
-    entry.crateRoutineRunning || entry.crateLoopRunning || entry.shardshopLoopRunning || entry.bookRoutineRunning || entry.appleRoutineRunning))
+  return !!(entry && (entry.inCrateRoutine || entry.inDumpRoutine || entry.inSpawnerRoutine ||
+    entry.crateRoutineRunning || entry.crateLoopRunning || entry.shardshopLoopRunning || entry.bookRoutineRunning))
 }
 
 // First slot in the window (or inventory) whose display, custom or registry
@@ -6321,36 +5828,6 @@ function copyTextToClipboard (text, done) {
   } catch (err) {
     done(false, err)
   }
-}
-
-// ── bot-scripts: /run-script <name> ───────────────────────────────────────
-// Scripts live in bot-scripts/*.txt (BOT_SCRIPTS_DIR overrides the folder). One
-// command per line; each line finishes before the next starts, so a line that
-// opens a routine waits for that routine. Target selectors: "*<fragment> …"
-// runs on every bot whose name contains the fragment, "* …" runs on every bot,
-// and a bare line runs on the invoking bot. The chain syntax (&&, ;, sleep)
-// works inside a line exactly as typed.
-const SCRIPTS_DIR = (process.env.BOT_SCRIPTS_DIR || '').trim() || path.join(__dirname, 'bot-scripts')
-
-async function runBotScript (name, invokerId) {
-const log = (msg) => logFor(invokerId || SYSTEM_ID, msg)
-const loaded = loadBotScript(SCRIPTS_DIR, name)
-if (!loaded.ok) { logFor(invokerId || SYSTEM_ID, `{yellow-fg}⚠ ${sanitize(loaded.error)}{/yellow-fg}`); return false }
-log(`{cyan-fg}› Running script ${sanitize(loaded.name)}.txt — ${loaded.steps.length} step(s).{/cyan-fg}`)
-for (const step of loaded.steps) {
-const targets = step.target.kind === 'self'
-? (invokerId ? [invokerId] : [])
-: step.target.kind === 'all'
-? Object.keys(bots)
-: selectScriptBots(step.target.pattern, Object.keys(bots))
-if (!targets.length) { log(`{yellow-fg}⚠ no bot matches "${sanitize(step.target.pattern || '*')}" — skipped: ${sanitize(step.command)}{/yellow-fg}`); continue }
-await Promise.all(targets.map(botId => {
-const out = handleCommand(step.command, { selectedId: botId })
-return out && typeof out.then === 'function' ? out.catch(() => {}) : Promise.resolve()
-}))
-}
-log(`{green-fg}✓ Script ${sanitize(loaded.name)} finished.{/green-fg}`)
-return true
 }
 
 function handleCommand(raw, ctx) {
@@ -6562,8 +6039,8 @@ return
 const findMatch = trimmed.match(/^\/find(?:\s+([\s\S]*))?$/)
 if (findMatch) {
   const term = (findMatch[1] || '').trim()
-  if (!term) { logWarn('Usage: /find <name> ["name" ...] — search every bot\'s inventory and open window by display, custom, registry name, or NBT text (multiple quoted terms are OR\'d)'); return }
-  const findTerms = tokenizeDumpArgs(term).map(t => t.text).filter(Boolean)
+  if (!term) { logWarn('Usage: /find <name> — search every bot\'s inventory and open window by display, custom, or registry name'); return }
+  const needle = term.toLowerCase()
   let foundTotal = 0
   let scanned = 0
   const botNames = Object.keys(bots)
@@ -6578,7 +6055,9 @@ if (findMatch) {
       if (!item) return
       const display = itemDisplayName(item)
       const alt = itemAltName(item, display)
-      if (!itemMatchesDumpTerms(itemSearchNames(item), itemNbtText(item), findTerms)) return
+      const custom = itemCustomName(item)
+      const candidates = [display, alt, custom, item.name].filter(Boolean)
+      if (!candidates.some(n => n.toLowerCase().includes(needle))) return
       const sig = `${item.type || item.name}:${item.slot}`
       if (seen.has(sig)) return
       seen.add(sig)
@@ -6603,20 +6082,8 @@ if (findMatch) {
       log(`  ${h.count}x ${sanitize(shown)}${altLine} — ${h.where} slot ${h.slot}`)
     })
   }
-  if (foundTotal === 0) logInfo(`No bot has an item matching "${sanitize(findTerms.join(' | '))}" (${scanned} scanned, ${botNames.length - scanned} offline).`)
+  if (foundTotal === 0) logInfo(`No bot has an item matching "${sanitize(term)}" (${scanned} scanned, ${botNames.length - scanned} offline).`)
   else logSuccess(`Found ${foundTotal} matching item(s) across ${botNames.length} bot(s).`)
-  return
-}
-
-// ── /doc [topic] — built-in documentation ────────────────────────
-// The same docs the web GUI shows in its 📚 docs panel; here in the log.
-if (trimmed === '/doc' || trimmed.startsWith('/doc ')) {
-  const topic = trimmed.slice(4).trim()
-  const docLines = topic ? docsSectionText(topic) : docsIndexText()
-  if (!docLines.length) { logWarn(`No docs topic matches "${sanitize(topic)}" — try /doc for the index.`); return }
-  logInfo(`{bold}${topic ? 'Docs — ' + sanitize(topic) : 'Docs index'}{/bold}`)
-  docLines.forEach(line => { if (line) log(` ${sanitize(line)}`) })
-  if (!topic) log(' {gray-fg}The web GUI has the same docs, searchable, in the 📚 docs panel.{/gray-fg}')
   return
 }
 
@@ -6777,16 +6244,9 @@ if (cancelSlowMatch) {
 const broadcastMatch = trimmed.match(/^\/(all|all-slow)(?:\s+([\s\S]*))?$/)
 if (broadcastMatch) {
 const command = '/' + broadcastMatch[1]
-const roster = Object.keys(bots)
-const selection = parseBroadcastTargets(broadcastMatch[2], roster)
-if (selection.error) { logWarn(selection.error); return }
-const msg = selection.body
-const ids = selection.ids
-if (!msg) {
-  if (selection.selected) logInfo(`Selected ${ids.length} bot(s): ${ids.map(id => `[${roster.indexOf(id) + 1}] ${id}`).join(', ')} — preview only; add a command to run it.`)
-  else logWarn(`Usage: ${command} [first-last] ${command === '/all-slow' ? '[delay] ' : ''}<command or message>`)
-  return
-}
+const msg = (broadcastMatch[2] || '').trim()
+if (!msg) { logWarn(`Usage: ${command} <command or message>`); return }
+const ids = Object.keys(bots)
 if (command === '/all-slow') {
 // An optional leading delay overrides ALL_SLOW_DELAY_MS for this run:
 //   /all-slow 30 /spawners    → 30s apart
@@ -6814,7 +6274,7 @@ const slowDispatch = id => dispatchCommandToBot(guard.body, id)
 const taskId = slowBroadcast.start(ids, delayMs, slowDispatch, {
 command: guard.body,
 onError: (err, id) => logWarn(`[Task #${taskId}] ${id}: ${sanitize(err.message)}`),
-onDone: ({ taskId: doneId, sent, skipped }) => logSuccess(`[Task #${doneId}] Slow broadcast finished: ${sent} dispatched, ${skipped} skipped/failed.`)
+onDone: ({ sent, skipped }) => logSuccess(`[Task #${taskId}] Slow broadcast finished: ${sent} dispatched, ${skipped} skipped/failed.`)
 })
 const apart = delayMs % 1000 === 0 ? `${delayMs / 1000}s` : `${(delayMs / 1000).toFixed(1)}s`
 logInfo(`[Task #${taskId}] Slow broadcast to ${ids.length} bot(s), ${apart} apart: ${sanitize(guard.body)}`)
@@ -6938,38 +6398,13 @@ notifyBotsChanged()
 return
 }
 
-// ── /unban-all ──────────────────────────────
-if (trimmed === '/unban-all') {
-const entries = (removedBots.bots || []).slice()
-if (!entries.length) { logInfo('Nothing on the removed list — there is nobody to bring back.'); return }
-removedBots = removedBotsStore.emptyList()
-persistRemovedBots()
-// Same as /unban: clear the data-file report flag too, or /list and the
-// dashboard would keep calling them banned while they walk back in.
-entries.forEach(entry => dataStore.upsertBot(dataState, { bot: entry.bot, banned: false, bannedAt: null, banKind: null, banReason: null, banExpiresAt: 0 }))
-persistData()
-const staggerMs = settings.get('UNBAN_ALL_STAGGER_MS')
-logSuccess(`Removed ${entries.length} bot(s) from the removed list — reconnecting ${staggerMs ? `${staggerMs / 1000}s apart` : 'immediately'} so they don't all hit the server at once. Put any name back in BOT_NAMES if you had removed it from there.`)
-entries.forEach((entry, index) => {
-setTimeout(() => {
-const name = entry.bot
-const { host, port, version } = bots[name] || { host: HOST, port: PORT, version: VERSION }
-logFor(SYSTEM_ID, `{green-fg}↻ ${sanitize(name)} is off the removed list — reconnecting.{/green-fg}`)
-try { bots[name]?.disconnectManually() } catch (_) {}
-setTimeout(() => createBotInstance(name, host, port, version), 1000)
-}, index * staggerMs)
-})
-notifyBotsChanged()
-return
-}
-
 // ── /list ───────────────────────────────────
 if (trimmed === '/list') {
 const names = Object.keys(bots)
 logInfo(`{bold}── Bots (${names.length}) ──{/bold}`)
 names.forEach((name, idx) => {
 const b = bots[name]
-if (botOnline(b)) {
+if (b?.bot?.entity) {
 const up = formatUptime(b.spawnTime ? Date.now() - b.spawnTime : 0)
 log(` [${idx + 1}] {cyan-fg}${name}{/cyan-fg} {green-fg}● Online{/green-fg} (${up})`)
 } else {
@@ -7024,17 +6459,6 @@ logInfo('No outbound proxy configured — bots connect directly. Set PROXY_HOST 
 return
 }
 
-// ── /tor-newnym ─────────────────────────────
-if (trimmed === '/tor-newnym') {
-return requestTorCircuits().then(result => {
-if (!result.results.length) return result
-const okCount = result.results.filter(r => r.ok).length
-if (result.ok) logSuccess(`New Tor circuits requested on all ${result.results.length} instance(s) — reconnects leave through a new path.`)
-else logWarn(`New circuits on ${okCount} of ${result.results.length} Tor instance(s) — the system log says which one failed.`)
-return result
-})
-}
-
 // ── /stats (added) ──────────────────────────
 if (trimmed === '/stats') {
 const s = globalStats()
@@ -7048,7 +6472,7 @@ return
 if (trimmed === '/reconnect-all') {
 let count = 0
 Object.entries(bots).forEach(([id, entry]) => {
-if (!botOnline(entry)) {
+if (!entry.bot?.entity) {
 const { host, port, version } = entry
 try { entry.disconnectManually() } catch (_) {}
 setTimeout(() => createBotInstance(id, host, port, version), 1000 + count * 2000)
@@ -7178,95 +6602,58 @@ if (!entry?.bot?.entity) { logWarn(`${activeId} is not currently spawned.`); ret
 return shardshopLoopCommand(activeId, slot)
 }
 
-// Splits a /crates-all|/crates-solo argument list into positional args, flags,
-// and a dump filter. Quote-aware: quoted strings and bare shulker/chest/all or
-// shulker-color words are DUMP filters (e.g. /crates-solo B "fatal" shulker
-// dump=hidden). On these commands the first bare colour BEFORE any filter token
-// keeps its old meaning — the crate [color] positional — so quote your terms.
-function parseCratesArgs (tokens) {
-  const out = { blockName: undefined, badColor: null, flags: [], filter: { terms: [], types: [], colors: [] }, unknown: [] }
-  let sawFilter = false
-  const addUnique = (arr, v) => { if (!arr.includes(v)) arr.push(v) }
-  for (const token of tokens) {
-    if (!token.quoted && token.text.includes('=')) { out.flags.push(token.text); continue }
-    if (token.quoted) { addUnique(out.filter.terms, token.text); sawFilter = true; continue }
-    const cls = parseDumpArgs(token.text)
-    const keywordOnly = !cls.terms.length && cls.mode === 'tpa'
-    if (keywordOnly && cls.colors.length) {
-      // A bare colour is a dump filter once anything filter-ish came before it,
-      // or once the crate colour is already set — otherwise it IS the crate colour.
-      if (sawFilter || out.blockName !== undefined) {
-        cls.colors.forEach(c => addUnique(out.filter.colors, c))
-        sawFilter = true
-      } else {
-        out.blockName = resolveCrateBlockName(token.text) || null
-        if (!out.blockName) out.badColor = token.text
-      }
-      continue
-    }
-    if (keywordOnly && cls.types.length) { cls.types.forEach(t => addUnique(out.filter.types, t)); sawFilter = true; continue }
-    // A bare mode word on a crates command is not a thing — the dump step is
-    // chosen with dump=, so report it instead of treating it as a color.
-    if (cls.mode !== 'tpa' && !cls.terms.length) { out.unknown.push(token.text); continue }
-    if (!sawFilter && out.blockName === undefined && !out.badColor) {
-      out.blockName = resolveCrateBlockName(token.text) || null
-      if (!out.blockName) out.badColor = token.text
-      continue
-    }
-    out.unknown.push(token.text)
-  }
-  if (out.filter.colors.length && !out.filter.types.includes('shulker')) out.filter.types.push('shulker')
-  const f = out.filter
-  out.filter = (f.terms.length || f.types.length || f.colors.length) ? f : null
-  return out
-}
-
-// ── /crates-all [n] [color] [dump=…] [afk=…] ["term" …] [shulker|chest] [color] ───
+// ── /crates-all [n] [color] [dump=…] [afk=…] ───
 if (trimmed === '/crates-all' || trimmed.startsWith('/crates-all ')) {
-const tokens = tokenizeDumpArgs(trimmed.slice('/crates-all'.length))
+const parts = trimmed.slice('/crates-all'.length).trim().split(/\s+/).filter(Boolean)
 let maxBots = Infinity
-if (tokens.length && !tokens[0].quoted && /^\d+$/.test(tokens[0].text)) maxBots = parseInt(tokens.shift().text, 10)
+if (parts.length && /^\d+$/.test(parts[0])) maxBots = parseInt(parts.shift(), 10)
 if (maxBots <= 0) { logWarn(`Usage: ${CRATES_ALL_USAGE} — n must be a positive number`); return }
-const parsedArgs = parseCratesArgs(tokens)
-if (parsedArgs.badColor) { logWarn(`Unknown crate color. Try one of: ${SHULKER_COLORS.join(', ')} — or a full block name like "purple_shulker_box".`); return }
-const flags = parseCratesAllFlags(parsedArgs.flags)
-const unknown = [...flags.unknown, ...parsedArgs.unknown]
-if (unknown.length) { logWarn(`Unknown option "${sanitize(unknown[0])}". Usage: ${CRATES_ALL_USAGE}`); return }
-return runCratesAll(maxBots, parsedArgs.blockName, cratesAllPlan({ ...flags, filter: parsedArgs.filter }))
+let blockName
+// Only a token without `=` can be the colour, so `/crates-all afk=now` works
+// without a position for it.
+if (parts.length && !parts[0].includes('=')) {
+blockName = resolveCrateBlockName(parts.shift())
+if (!blockName) { logWarn(`Unknown crate color. Try one of: ${SHULKER_COLORS.join(', ')} — or a full block name like "purple_shulker_box".`); return }
+}
+const flags = parseCratesAllFlags(parts)
+if (flags.unknown.length) { logWarn(`Unknown option "${sanitize(flags.unknown[0])}". Usage: ${CRATES_ALL_USAGE}`); return }
+return runCratesAll(maxBots, blockName, cratesAllPlan(flags))
 }
 
 // ── /crates-solo [bot] [color] — same shardshop → crates → dump chain as /crates-all,
 // but for exactly ONE bot (default: the active one) instead of the whole roster ──
 if (trimmed === '/crates-solo' || trimmed.startsWith('/crates-solo ')) {
-const tokens = tokenizeDumpArgs(trimmed.slice('/crates-solo'.length))
+const parts = trimmed.slice('/crates-solo'.length).trim().split(/\s+/).filter(Boolean)
 let targetId = activeId
 
 // First token: a bot ref (number or exact existing bot name) if it matches one,
-// otherwise it stays in the argument list (crate color / dump filter / flags).
-if (tokens.length && !tokens[0].quoted) {
-if (/^\d+$/.test(tokens[0].text)) {
+// otherwise it's treated as the color and targetId falls back to the active bot.
+if (parts.length) {
+if (/^\d+$/.test(parts[0])) {
 const names = Object.keys(bots)
-const idx = parseInt(tokens[0].text, 10) - 1
+const idx = parseInt(parts[0], 10) - 1
 targetId = names[idx]
-if (!targetId) { logWarn(`No bot at index [${tokens[0].text}]. Valid: 1–${names.length}`); return }
-tokens.shift()
-} else if (bots[tokens[0].text]) {
-targetId = tokens.shift().text
+if (!targetId) { logWarn(`No bot at index [${parts[0]}]. Valid: 1–${names.length}`); return }
+parts.shift()
+} else if (bots[parts[0]]) {
+targetId = parts.shift()
 }
 }
 
-const parsedArgs = parseCratesArgs(tokens)
-if (parsedArgs.badColor) { logWarn(`Unknown crate color. Try one of: ${SHULKER_COLORS.join(', ')} — or a full block name like "purple_shulker_box".`); return }
-const flags = parseCratesAllFlags(parsedArgs.flags)
-const unknown = [...flags.unknown, ...parsedArgs.unknown]
-if (unknown.length) { logWarn(`Unknown option "${sanitize(unknown[0])}". Usage: ${CRATES_ALL_SOLO_USAGE}`); return }
+let blockName
+if (parts.length && !parts[0].includes('=')) {
+blockName = resolveCrateBlockName(parts.shift())
+if (!blockName) { logWarn(`Unknown crate color. Try one of: ${SHULKER_COLORS.join(', ')} — or a full block name like "purple_shulker_box".`); return }
+}
+const flags = parseCratesAllFlags(parts)
+if (flags.unknown.length) { logWarn(`Unknown option "${sanitize(flags.unknown[0])}". Usage: ${CRATES_ALL_SOLO_USAGE}`); return }
 
 if (!targetId) { logWarn(`No active bot. Usage: ${CRATES_ALL_SOLO_USAGE}`); return }
 if (!bots[targetId]) { logWarn(`No bot named "${sanitize(targetId)}".`); return }
 
-const plan = cratesAllPlan({ ...flags, filter: parsedArgs.filter })
-logInfo(`Starting /crates-solo (shardshop → crates → dump) for ${targetId}${parsedArgs.blockName ? ` targeting ${parsedArgs.blockName.replace(/_/g, ' ')}` : ''} — ${describeCratesAllPlan(plan)}…`)
-return runCratesAllSequenceForBot(targetId, parsedArgs.blockName, plan)
+const plan = cratesAllPlan(flags)
+logInfo(`Starting /crates-solo (shardshop → crates → dump) for ${targetId}${blockName ? ` targeting ${blockName.replace(/_/g, ' ')}` : ''} — ${describeCratesAllPlan(plan)}…`)
+return runCratesAllSequenceForBot(targetId, blockName, plan)
 }
 
 // ── /bot-coinflip-all: concurrency-pooled fleet engine ─────────────────────
@@ -7803,7 +7190,7 @@ if (CHAT_WATCHDOG_ENABLED) {
     const now = Date.now()
     for (const id of Object.keys(bots)) {
       const e = bots[id]
-      if (!botOnline(e) || e.spawnerDropRunning) continue // not spawned or explicitly operating a spawner GUI — nothing to keep alive
+      if (!e?.bot?.entity) continue // not spawned — nothing to keep alive
       const idle = now - (e.lastPlayerChatAt || now)
       if (idle >= CHAT_WATCHDOG_TIMEOUT_MS) {
         e.lastPlayerChatAt = now // reset so it does not re-fire every check tick
