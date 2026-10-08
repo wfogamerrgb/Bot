@@ -45,6 +45,7 @@ function createTerminal(options = {}) {
   const terminal = {
     connect() {
       return new Promise((resolve, reject) => {
+        if (closed) { reject(new Error('SSH terminal is closed')); return }
         if (!config.enabled) {
           reject(new Error('SSH terminal is disabled'))
           return
@@ -59,25 +60,24 @@ function createTerminal(options = {}) {
         }
 
         const onReady = () => {
+          if (closed) { client.end(); reject(new Error('SSH terminal closed during connection')); return }
           client.shell({ term: 'xterm-256color', rows: 40, cols: 120 }, (err, shell) => {
             if (err) {
               client.end()
               reject(err)
               return
             }
+            if (closed) { shell.destroy(); client.end(); reject(new Error('SSH terminal closed during connection')); return }
             stream = shell
-            
-  stream.setEncoding('utf8')
-            stream.once('close',()=>{
-notifyClose()
-              try {client.end() } catch (_) {}
+            stream.setEncoding('utf8')
+            stream.once('close', () => {
+              notifyClose()
+              try { client.end() } catch (_) {}
             })
-dataHandlers.forEach(handler =>{
-stream.on('data',handler)
-stream.stderr?.on('data',handler)
-  
-})
-            
+            dataHandlers.forEach(handler => {
+              stream.on('data', handler)
+              stream.stderr?.on('data', handler)
+            })
             resolve(terminal)
           })
         }
@@ -109,6 +109,7 @@ stream.stderr?.on('data',handler)
         // bot runs directly on the host, fall back to loopback so the SSH
         // terminal keeps working outside Docker without an .env change.
         dns.lookup(config.host, (err, address) => {
+          if (closed) { reject(new Error('SSH terminal closed during connection')); return }
           if (err) {
             if (config.host !== 'host.docker.internal') {
               reject(new Error(`SSH host could not be resolved: ${config.host}`))
@@ -144,7 +145,8 @@ stream.stderr?.on('data',handler)
     close() {
       if (closed) return
       closed = true
-      try { stream?.end('exit\n') } catch (_) {}
+      // Close only this channel; injecting 'exit' could terminate a nested bot TUI.
+      try { stream?.end() } catch (_) {}
       try { client.end() } catch (_) {}
       stream = null
     }

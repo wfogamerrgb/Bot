@@ -11,6 +11,129 @@ entry point, `bot.js`, provides both a browser dashboard and an optional
 terminal UI. `bot-rtp.js` is the exploration-oriented variant with RTP,
 base detection, survival helpers, and Discord alerts.
 
+## Text-file admission, live configuration, and integrated roaming
+
+These features run in the main `bot.js`; neither `/start-login` nor `/start-rtp`
+starts automatically. Do not run the standalone `bot-rtp.js` for the same accounts.
+
+- Create **`robot.txt` in the deployment root** with one Minecraft username per
+  line. Blank lines and `#` comments are ignored. `/start-login` immediately
+  shuffles eligible names, independently of boot `.env` attempts or online bots.
+  Actual attempts are 5 seconds apart (`ROBOT_CONNECT_DELAY_MS=5000`), cycling
+  **direct → valid proxy group 1 → … → N → direct**. Empty `_BOTS` lists and
+  sparse group indexes are supported for both admission routes and roster groups.
+  Case-insensitive `.env`/live duplicates, blocked names and invalid usernames
+  consume neither a route slot nor a cooldown.
+- Only new text-file accounts try distinct `LOGIN_PASSWORD`, `LOGIN_PASSWORD_1`,
+  `LOGIN_PASSWORD_2` candidates, advancing **only on rejection**, 1.5 seconds
+  apart (`ROBOT_PASSWORD_DELAY_MS=1500`). Success cancels queued passwords;
+  throttling stops immediately. Existing `.env` accounts keep credential priority.
+- Any admission failure closes the new account and appends `username # timestamp
+  reason` to **`removed.txt`**, without passwords. Admission lasts through chat
+  authentication and normal server/AFK setup, with a 180-second timeout
+  (`ROBOT_ADMISSION_TIMEOUT_MS`). Afterwards, normal reconnect resumes using the
+  successful candidate. Remove its line manually or explicitly run
+  `/start-login --retry AccountName` to retry. `/stop-login` stops the pending
+  attempt queue, not in-flight logins. Existing `removed-bots.json` ban handling
+  remains separate. File-write failures stay blocked in memory until explicit retry.
+- `.env` is polled every second (including atomic editor replacements), and
+  reread before `/env` and settings API operations. Changed file keys replace
+  same-key temporary overrides; unrelated overrides survive. Reset returns the
+  latest file value. Passwords/proxy routes apply to future authentication or
+  connections; routine defaults/timing refresh live. **Boot roster, ports,
+  existing sockets, storage paths and boot interval wiring still need restart.**
+- `/start-rtp` selects `BOT_RTP_BOTS`; explicit names, ranges and `all` work too.
+  Missing/disconnected accounts connect with a five-second stagger, wait for
+  login/server setup, then roam. Existing/in-flight connections are reused.
+  `/stop-rtp` also cancels starts queued before connection/setup. Full roam includes
+  periodic RTP, loaded-terrain base scans/pause, food/totems and nearby players.
+  Successful initial and periodic arrivals append timestamp, account, dimension
+  and coordinates to **`rtp-locations.txt`**; unchanged/unconfirmed positions are
+  not recorded as successful RTP. All discoveries remain local, never Discord.
+  `/stop-rtp` stops all sessions, or accepts targets. Disconnect/kick/death stops
+  roaming; restart it explicitly. Busy routines cannot start roaming, and roaming
+  must be stopped before another routine on that bot.
+- Discord defaults to **only a mention + offline/total summary when strictly
+  more than 40% offline**. Pending admissions/removed accounts are excluded;
+  startup grace is `DISCORD_STARTUP_GRACE_MS=120000`. One ping per outage, with
+  `DISCORD_OFFLINE_REMINDER_MS=1800000` (0 disables reminders).
+  `DISCORD_VERBOSE_ALERTS=false` keeps individual events local.
+- `/all-slow 1-10 5s /crates-solo dump=off afk=off` runs one local sequence on
+  each target. `/crates-all delay=30s` sets start staggering;
+  `/crates-solo AccountName delay=30s` postpones that one start. `delay=` accepts
+  `ms`, `s`, `m`, `min`, `h` or bare seconds, independently of `afk=`.
+  Fleet-wide commands cannot be nested inside per-bot broadcasts.
+- **Hide offline bots** now hides all non-online cards, including banned,
+  connecting, removed and selected offline accounts. The preference survives
+  browser reloads. `/overview` queries/reports online accounts only and preserves
+  roster numbers (so `/switch` and range selections remain consistent).
+- **`/server-commands [filter] [--refresh]`** lists the permission-filtered
+  command tree Minecraft advertises to the selected account, including argument
+  hints. Trees update after backend transfers; `--refresh` uses tab completion,
+  never executes `/help` or another server command. The dashboard **server cmds**
+  browser has account selection, search, refresh and click-to-prepare (not send).
+  Server commands also enter autocomplete; local names win collisions, and
+  `/chat /command` bypasses the local router. Servers may hide commands, so this
+  is everything advertised to that account, not an administrative command list.
+- **`/new-gen [count] [group=auto|direct|N]`** generates 1–100 unique Minecraft
+  usernames (default 1), atomically saves `BOT_NAMES` and proxy `_BOTS` lists in
+  `.env`, then connects staggered. `auto` balances valid existing proxy groups;
+  without groups it uses the default route. `direct` explicitly bypasses a global
+  proxy; `N` selects an existing valid group. Unrelated secrets/comments remain
+  unchanged, `.env` is saved owner-only, and save failures create no connections.
+  Example: `/new-gen 5 group=2`. Names are locally unique; offline-mode server
+  registration is not a guarantee that a name is available on Mojang.
+- The TUI has a compact online/total header, bounded scrollback, corrected Tab
+  cycling, and **F2** for server commands. Ctrl-C uses the existing two-step
+  `/exit` confirmation rather than killing the fleet immediately.
+- Shared logs/history redact auth commands and known credentials, strip terminal
+  escape injection, and mask proxy usernames/passwords (including `_PASS` keys).
+  Web mutations/WebSockets reject cross-site origins, URL session tokens are not
+  accepted, and logout/session expiry revokes open WebSockets/terminal channels.
+  The origin guard accepts a browser's `Sec-Fetch-Site: same-origin`, a matching
+  `X-Forwarded-Host`, direct IP access, and SSH/loopback tunnels automatically,
+  so login keeps working behind port-forwards and reverse proxies that rewrite
+  `Host`. For an older browser behind a non-loopback tunnel/proxy, list the public
+  origin in `WEB_ALLOWED_ORIGINS=https://bot.example.com` (comma-separated full
+  origins or `host[:port]`). `Origin: null` and `Sec-Fetch-Site: cross-site` are
+  always refused, and a 403 names the mismatch plus that setting.
+  Closing the terminal clears its screen and closes only that SSH channel; it
+  never injects `exit` into a nested bot TUI. Bootstrap dashboard passwords print
+  only to local stderr, not shared logs. **The authenticated full SSH shell is
+  still privileged** and can read files; disable `WEB_TERMINAL_ENABLED` for
+  viewers who should not have shell access. These guards are not a sandbox.
+- The dashboard TERMINAL input accepts `/` normally; the global shortcut no
+  longer steals keys from terminal/settings/editable fields.
+
+Example new settings (add to your existing `.env`; do not replace credentials):
+
+```dotenv
+LOGIN_PASSWORD_1=
+LOGIN_PASSWORD_2=
+ROBOT_CONNECT_DELAY_MS=5000
+ROBOT_PASSWORD_DELAY_MS=1500
+ROBOT_ADMISSION_TIMEOUT_MS=180000
+BOT_RTP_BOTS=AccountA,AccountB
+RTP_COMMAND=/rtp world world
+RTP_INTERVAL_MS=34800
+BASE_SCAN_RADIUS=192
+BASE_SCAN_INTERVAL_MS=12000
+BASE_ALERT_THRESHOLD=4
+RTP_PAUSE_ON_BASE_MS=600000
+FOOD_CHECK_INTERVAL_MS=5000
+FOOD_EAT_THRESHOLD=18
+PLAYER_PROXIMITY_RADIUS=32
+PLAYER_PROXIMITY_INTERVAL_MS=5000
+PLAYER_PROXIMITY_COOLDOWN_MS=300000
+DISCORD_VERBOSE_ALERTS=false
+DISCORD_OFFLINE_REMINDER_MS=1800000
+DISCORD_STARTUP_GRACE_MS=120000
+```
+
+`robot.txt`, `removed.txt`, and `rtp-locations.txt` are private runtime files and
+are ignored by Git. Browser regression fixture: `node test/preview-dashboard.cjs`
+creates an offline dashboard with mocked transport, without Minecraft or SSH.
+
 ## What This Repository Does
 
 ### `bot.js`
@@ -796,7 +919,7 @@ item matches, the bot falls back to `GUI_SLOT`.
 | `PROXY_STALL_CHECK_MS` | `20000` | Watchdog polling interval |
 | `PROXY_STALL_RATIO` | `0.5` | Fraction of stalled bots that triggers proxy restart |
 | `PROXY_RESTART_CMD` | local Tor restart when applicable | Optional proxy restart command |
-| `PROXY_GROUP_<N>_BOTS` | unset | Comma-separated bot usernames dedicated to group `N` (starts at 1, no gaps) |
+| `PROXY_GROUP_<N>_BOTS` | unset | Comma-separated bot usernames dedicated to group `N` (positive indexes; gaps supported) |
 | `PROXY_GROUP_<N>_HOST` | unset | Proxy host for group `N`. Optional — without it the group is an account grouping and its bots use the fallback route |
 | `PROXY_GROUP_<N>_PORT` | `1080` | Proxy port for group `N` |
 | `PROXY_GROUP_<N>_TYPE` | `socks5` | `socks5` or `http` for group `N` |
@@ -808,20 +931,18 @@ Bots not listed in any `PROXY_GROUP_<N>_BOTS` fall back to the global `PROXY_HOS
 
 **A group is defined by its bot list, not by its host.** `PROXY_GROUP_<N>_BOTS` alone is enough, and a group without `PROXY_GROUP_<N>_HOST` is a legitimate *account* grouping: its `LOGIN_PASSWORD` applies and its bots use the default route. This used to be dropped in silence — the whole group, password included — so a group that only separated accounts appeared to work while every bot logged in with the wrong password.
 
-The scan starts at `PROXY_GROUP_1_BOTS` and **stops at the first missing number**, so one gap discards every later group (host, credentials, bot list, password). Startup now says so rather than applying nothing:
-
-```
-⚠ PROXY_GROUP_1 has no HOST — its 11 bot(s) use the default route, but its login password still applies.
-⚠ ignored, no group declares them: PROXY_GROUP_3_BOTS, PROXY_GROUP_3_LOGIN_PASSWORD
-  Groups start at PROXY_GROUP_1_BOTS and stop at the first missing number, so one gap drops every later group.
-```
+Groups are scanned by numeric index and **gaps are supported**: group 3 remains
+valid even if group 2 is absent. A valid host with an empty/missing `_BOTS` list
+can be used for text-file admissions and `/new-gen`; generation adds the list.
+Startup still names variables with no populated roster group, without printing
+credential values.
 
 `/proxy` prints the same facts on demand, naming the variables rather than the values:
 
 ```
 Dedicated proxy groups: 2 configured
   [1] 1evArchUsr2, HyprC0re7 → no dedicated proxy (uses the default connection) · login: PROXY_GROUP_1_LOGIN_PASSWORD
-  [2] DaelinFrostV47, … → SOCKS5 provider-two@5.6.7.8:1080 · proxy auth: PROXY_GROUP_2_USER/_PASS · login: PROXY_GROUP_2_LOGIN_PASSWORD
+  [2] DaelinFrostV47, … → SOCKS5 ***@5.6.7.8:1080 · proxy auth: PROXY_GROUP_2_USER/_PASS · login: PROXY_GROUP_2_LOGIN_PASSWORD
   (other bots) → direct connection
 ```
 

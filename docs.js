@@ -9,6 +9,19 @@
 
 const SECTIONS = [
   {
+    id: 'admission-roaming',
+    title: 'Text-file admission and managed roaming',
+    summary: 'New accounts without editing the boot roster; roaming without duplicate connections',
+    entries: [
+      { title: '/new-gen', desc: 'Generate 1–100 unique Minecraft usernames, atomically save BOT_NAMES and balanced proxy-group bot lists in .env before connecting staggered. group=auto balances valid existing groups, group=N selects one, group=direct bypasses even the global proxy. Save failures never connect bots. Unrelated secrets/comments are preserved.', examples: ['/new-gen', '/new-gen 5 group=auto', '/new-gen 3 group=2'] },
+      { title: '/server-commands', desc: 'Browse the Minecraft command tree advertised to the selected account, including argument hints. Dashboard server cmds offers account selection, filtering and click-to-prepare; F2 opens the list in the TUI. --refresh asks for tab completion without executing a server command. Only advertised, permitted commands can be known. /chat /command bypasses local-name collisions.', examples: ['/server-commands', '/server-commands warp', '/server-commands --refresh'] },
+      { title: '/start-login', desc: 'Reads robot.txt (one username per line, blank lines/# comments ignored), starts immediately independently of initial .env attempts, shuffles eligible names and spaces actual attempts by ROBOT_CONNECT_DELAY_MS (5000). Routes cycle direct → every valid proxy group in number order → direct. Case-insensitive duplicates in BOT_NAMES or the live roster and blocked/invalid names are skipped without delay or route consumption. No automatic admission at startup.', examples: ['/start-login', '/stop-login'] },
+      { title: 'Admission passwords and removed.txt', desc: 'Only text-file admissions try distinct LOGIN_PASSWORD, LOGIN_PASSWORD_1, LOGIN_PASSWORD_2 candidates; advance only after an explicit rejection, 1500ms apart by default. Success cancels fallback; throttling, exhausted passwords, duplicate rejection, connection errors or setup timeout close the new bot and append a redacted reason to removed.txt. Admission lasts through authentication and normal server/AFK setup. After success, normal reconnect uses the successful candidate. Remove the name from removed.txt or deliberately use --retry. Existing .env accounts keep their per-bot/group credential logic. The older removed-bots.json ban list remains separate.', examples: ['/start-login --retry AccountName'] },
+      { title: '/start-rtp', desc: 'Bare command selects BOT_RTP_BOTS; names, displayed ranges and all are supported. Missing/offline targets connect staggered, wait for login/server setup, then roam; existing connections are reused. /stop-rtp also cancels pending starts. Full roaming runs periodic RTP, loaded-terrain base scans with pause, food/totems and nearby-player detection. Every confirmed initial and periodic arrival appends timestamp, username, dimension and coordinates to rtp-locations.txt. Rejected/unconfirmed teleports are not logged as arrivals. Discoveries and coordinates stay local, never Discord. Busy bots are skipped; stop roaming before another routine. Disconnect, kick or death cancels roaming; resume explicitly.', examples: ['/start-rtp', '/start-rtp 1-5', '/start-rtp AccountA,AccountB', '/stop-rtp'] },
+      { title: 'Quiet alerts', desc: 'Default Discord behavior is only a mention and offline/total summary when strictly more than 40% of eligible bots are offline, after DISCORD_STARTUP_GRACE_MS (120000). Pending admissions and removed accounts are excluded. One ping per outage; DISCORD_OFFLINE_REMINDER_MS (1800000) optionally reminds, 0 disables reminders. Other alerts are local unless DISCORD_VERBOSE_ALERTS=true. RTP never uses Discord.', examples: ['/env set DISCORD_OFFLINE_REMINDER_MS 0'] }
+    ]
+  },
+  {
     id: 'getting-started',
     title: 'Getting started',
     summary: 'What this console is and how to drive it',
@@ -100,8 +113,8 @@ const SECTIONS = [
         examples: ['/crates-all 5 purple', '/crates-solo B', '/crates-solo 3 red']
       },
       {
-        title: 'dump= and afk= flags',
-        desc: 'dump=off|tpa|home|hidden|player:<name> chooses the dump step; afk=now|off|<seconds> chooses the AFK warp afterwards. They override CRATES_ALL_DUMP / CRATES_ALL_AFK_WARP / CRATES_ALL_AFK_DELAY_MS for that run. dump=hidden arms the hidden dump chain once for the whole roster — yes, /crates-solo supports it too.',
+        title: 'delay=, dump= and afk= flags',
+        desc: 'delay=30s changes /crates-all start staggering or postpones a /crates-solo start; units ms/s/m/min/h or bare seconds. It is independent of the final afk= wait. /all-slow /crates-solo invokes one targeted local sequence per bot; fleet commands such as /crates-all cannot be nested in /all-slow. dump=off|tpa|home|hidden|player:<name> chooses the dump step; afk=now|off|<seconds> chooses the AFK warp afterwards. They override CRATES_ALL_DUMP / CRATES_ALL_AFK_WARP / CRATES_ALL_AFK_DELAY_MS for that run. dump=hidden arms the hidden dump chain once for the whole roster — yes, /crates-solo supports it too.',
         examples: ['/crates-all 5 purple dump=off afk=now', '/crates-solo B dump=hidden', '/crates-solo B dump=player:Smith', '/crates-all dump=home afk=off']
       },
       {
@@ -150,7 +163,7 @@ const SECTIONS = [
       },
       {
         title: 'Temporary overrides',
-        desc: 'The .ENV tab (web GUI) and /env change settings for the RUNNING process only — nothing is written to .env and a restart forgets them. Keys marked startup-only were read once at boot; editing them needs a restart.',
+        desc: 'The .ENV tab and /env apply temporary overrides; neither writes .env. The file is polled each second and reread before /env/API settings operations. A changed/removed file key replaces its same-key override; unrelated overrides survive. Auth, future connection routes, and routine timing/defaults refresh live. Existing sockets, boot roster, storage paths, listener ports and boot interval wiring remain restart-only. Reset restores the latest file value.',
         examples: ['/env list DUMP', '/env set DUMP_HIDDEN_CONCURRENT 2', '/env reset DUMP_HIDDEN_CONCURRENT']
       }
     ]

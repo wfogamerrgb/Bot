@@ -52,6 +52,16 @@ function runtime(env = {}) {
     stdout: { isTTY: false, write() {} }, stderr: { write() {} },
     on() {}, exit() {}, memoryUsage: () => ({ rss: 0, heapUsed: 0 }), uptime: () => 1
   }
+  const settingsModule = { exports: {} }
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '..', 'settings.js'), 'utf8'), { require, module: settingsModule, process: processMock, __dirname: path.join(__dirname, '..') })
+  const fakeFiles = new Map()
+  if (env.TEST_ROBOT_TEXT != null) fakeFiles.set('robot.txt', env.TEST_ROBOT_TEXT)
+  const fakeFs = {
+    readFileSync(file) { const name = path.basename(file); if (fakeFiles.has(name)) return fakeFiles.get(name); if (['robot.txt', 'removed.txt'].includes(name)) throw Object.assign(new Error('missing'), { code: 'ENOENT' }); return '' },
+    writeFileSync(file, content) { fakeFiles.set(path.basename(file), content) },
+    appendFileSync(file, content) { const name = path.basename(file); fakeFiles.set(name, (fakeFiles.get(name) || '') + content) },
+    mkdirSync() {}, renameSync(from, to) { fakeFiles.set(path.basename(to), fakeFiles.get(path.basename(from))); fakeFiles.delete(path.basename(from)) }, unlinkSync(file) { fakeFiles.delete(path.basename(file)) }, existsSync: () => false
+  }
   const source = fs.readFileSync(path.join(__dirname, '..', 'bot.js'), 'utf8')
   const context = vm.createContext({
     Buffer, URL, URLSearchParams, console, process: processMock, __dirname: path.join(__dirname, '..'),
@@ -59,7 +69,8 @@ function runtime(env = {}) {
     setInterval: setTimer, clearInterval: clearTimer, setImmediate: fn => setTimer(fn, 0),
     require(name) {
       if (name === 'dotenv') return { config() {} }
-      if (name === 'fs') return { readFileSync: () => '', writeFileSync() {}, mkdirSync() {}, renameSync() {}, existsSync: () => false }
+      if (name === 'fs') return fakeFs
+      if (name === path.join(__dirname, '..', 'settings')) return settingsModule.exports
       if (name === 'http') {
         return {
           createServer(fn) {
@@ -100,7 +111,10 @@ function runtime(env = {}) {
       }
       // Resolved against this test file, not against bot.js, so it needs an entry.
       if (name === './removed-bots') return require('../removed-bots')
+      if (name === './server-commands') return require('../server-commands')
+      if (name === './generated-bots') return require('../generated-bots')
       if (name === './coinflip-dashboard-static') return require('../coinflip-dashboard-static')
+      if (name === './xterm-static') return require('../xterm-static')
       if (name === './ai-chat') return require('../ai-chat')
       if (name === './bot-manual') return () => ({ routeCommand: () => false, key() {}, onWindowOpen: () => false, onWindowClose() {}, stopManualMode() {}, snapshotFor: () => null })
       if (name === 'mineflayer') return { createBot() {
@@ -125,6 +139,7 @@ function runtime(env = {}) {
   const run = code => vm.runInContext(code, context)
   const initialOrder = Array.from(run('initialBotOrder'))
   timers.clear()
+  run('initialPending = 0')
   run(`
     for (const id of ['A', 'B', 'C']) bots[id] = {
       bot: { entity: {}, health: 20, food: 20, chat(msg) { chats.push([id, msg]) } },
@@ -136,11 +151,11 @@ function runtime(env = {}) {
   run('webHandle = startWebGUI()')
   // `port` selects the server to talk to: by default the dashboard, or the
   // analytics port for the analytics routes.
-  async function request(url, body = '', cookie = '', method = 'POST', port = null) {
+  async function request(url, body = '', cookie = '', method = 'POST', port = null, headers = {}, remote = '127.0.0.1') {
     const handler = port == null ? dashboardHandler : handlers.get(String(port))
     if (!handler) throw new Error(`No test HTTP handler listening on ${port}`)
     const req = new EventEmitter()
-    Object.assign(req, { url, method, headers: { cookie }, socket: { remoteAddress: '127.0.0.1' } })
+    Object.assign(req, { url, method, headers: { host: 'localhost', cookie, ...headers }, socket: { remoteAddress: remote } })
     const response = { status: 0, headers: {}, body: '', writeHead(s, h = {}) { this.status = s; this.headers = h }, end(b = '') { this.body = b } }
     const done = handler(req, response)
     if (body) req.emit('data', Buffer.from(body))
@@ -153,15 +168,231 @@ function runtime(env = {}) {
     assert.equal(res.status, 303)
     return res.headers['Set-Cookie'].split(';')[0]
   }
-  function socket(cookie) {
+  function socket(cookie, headers = {}, remote = '127.0.0.1') {
     const ws = new EventEmitter()
-    Object.assign(ws, { readyState: 1, messages: [], send(text) { this.messages.push(JSON.parse(text)) }, ping() {}, destroy() {} })
-    server.emit('upgrade', { url: '/ws', headers: { cookie }, socket: { remoteAddress: '127.0.0.1' } }, ws, Buffer.alloc(0))
+    Object.assign(ws, { readyState: 1, messages: [], send(text) { this.messages.push(JSON.parse(text)) }, ping() {}, write() {}, destroy() { this.destroyed = true }, close(code) { this.closeCode = code; this.readyState = 3; this.emit('close', code) } })
+    server.emit('upgrade', { url: '/ws', headers: { host: 'localhost', cookie, ...headers }, socket: { remoteAddress: remote } }, ws, Buffer.alloc(0))
     ws.command = msg => ws.emit('message', JSON.stringify(msg))
     return ws
   }
-  return { context, run, timers, initialOrder, request, login, socket, authAlerts, createdBots }
+  return { context, run, timers, initialOrder, request, login, socket, authAlerts, createdBots, fakeFiles }
 }
+
+test('dashboard commands admit robot.txt names without touching the .env roster; admission errors close without reconnect', async () => {
+  const r = runtime({ TEST_CREATE_BOTS: true, TEST_ROBOT_TEXT: 'A\na\nD\n', LOGIN_PASSWORD: 'pw', CLICK_COMPASS: 'false' })
+  const ws = r.socket(await r.login())
+  ws.command({ t: 'cmd', text: '/start-login', selectedId: 'A' })
+  assert.equal(r.createdBots.length, 1)
+  assert.equal(r.run('Object.keys(bots).join(",")'), 'A,B,C,D')
+  const bot = r.createdBots[0]
+  const sent = []; bot.chat = cmd => sent.push(cmd)
+  bot.emit('spawn')
+  const startup = [...r.timers.keys()].find(t => t.delay >= 3000 && t.delay <= 5000)
+  startup.fn()
+  assert.deepEqual(sent, [], 'no setup commands before authentication')
+  bot.emit('messagestr', 'Please /login password')
+  const auth = [...r.timers.keys()].find(t => t.delay === 250); auth.fn()
+  assert.deepEqual(sent, ['/login pw'])
+  bot.emit('messagestr', 'Successfully logged in!')
+  assert.equal(sent[1], '/server lifesteal')
+  bot.emit('error', Error('admission failure'))
+  assert.equal(r.run('Boolean(bots.D)'), false)
+  assert.match(r.fakeFiles.get('removed.txt'), /^D\t# /)
+  ws.command({ t: 'cmd', text: '/start-login', selectedId: 'A' })
+  assert.equal(r.createdBots.length, 1)
+})
+test('robot success waits through normal AFK setup, cancels fallback and keeps the successful candidate on reconnect', () => {
+  const r = runtime({ TEST_CREATE_BOTS: true, TEST_ROBOT_TEXT: 'D', LOGIN_PASSWORD: 'wrong', LOGIN_PASSWORD_1: 'right', CLICK_COMPASS: 'false' })
+  r.run(`handleCommand('/start-login')`)
+  const bot = r.createdBots[0], sent = []
+  bot.chat = cmd => sent.push(cmd)
+  bot.emit('spawn')
+  // Fire the stable-backoff timer first; both it and AFK use 60 seconds.
+  const stable = [...r.timers.keys()].find(t => t.delay === r.run("settings.get('RECONNECT_STABLE_MS')")); r.timers.delete(stable); stable.fn()
+  bot.emit('messagestr', 'Please /login password')
+  const auth = [...r.timers.keys()].find(t => t.delay === 250); r.timers.delete(auth); auth.fn()
+  bot.emit('messagestr', 'Wrong password')
+  const fallback = [...r.timers.keys()].find(t => t.delay === 1500); r.timers.delete(fallback); fallback.fn()
+  bot.emit('messagestr', 'Successfully logged in')
+  assert.deepEqual(sent.slice(0, 3), ['/login wrong', '/login right', '/server lifesteal'])
+  assert.equal(r.run(`robotLogin.isAdmitting('D')`), true)
+  const afk = [...r.timers.keys()].find(t => t.delay === 60000 && String(t.fn).includes('timeouts.indexOf')); r.timers.delete(afk); afk.fn()
+  assert.equal(sent.at(-1), '/warp afk')
+  // Fire setup timers on the harness clock; both selector readiness and AFK
+  // admission grace use five seconds.
+  for (const t of [...r.timers.keys()].filter(t => t.delay === 5000 && String(t.fn).includes('timeouts.indexOf'))) { r.timers.delete(t); t.fn() }
+  assert.equal(r.run(`robotLogin.isAdmitting('D')`), false)
+  bot.emit('end', 'later network error')
+  assert.equal(r.fakeFiles.has('removed.txt'), false)
+  assert.ok(r.run(`bots.D.reconnectTimer`))
+  assert.equal(r.run(`planAuthAction('D', 'Please /login password', 1000).command`), '/login right')
+})
+
+test('dashboard RTP commands reuse existing connections, accept ranges and stop cleanly', async () => {
+  const r = runtime({ BOT_RTP_BOTS: 'A,Missing' })
+  r.run(`bots.A.bot.entity.position = { x: 0, y: 64, z: 0 }; bots.A.bot.on = () => {}; bots.A.bot.removeListener = () => {}`)
+  const ws = r.socket(await r.login())
+  ws.command({ t: 'cmd', text: '/start-rtp', selectedId: 'A' })
+  assert.equal(r.createdBots.length, 0)
+  assert.deepEqual(plain(r.context.chats), [['A', '/rtp world world']])
+  assert.match(channelLogs(r, 'A'), /Missing: queued connection/)
+  assert.equal(r.run(`pendingRtp.has('Missing')`), true)
+  ws.command({ t: 'cmd', text: '/stop-rtp 1-1', selectedId: 'A' })
+  assert.equal(r.run('bots.A.rtpRunning'), false)
+})
+test('login starts while .env attempts remain pending', () => {
+  const r = runtime({ TEST_CREATE_BOTS: true, TEST_ROBOT_TEXT: 'D', LOGIN_PASSWORD: 'pw' })
+  r.run(`initialPending = 74; handleCommand('/start-login')`)
+  assert.equal(r.createdBots.length, 1)
+  assert.equal(r.run('initialPending'), 74)
+})
+test('RTP connects missing accounts once and waits for setup; stopping cancels pending starts', () => {
+  const r = runtime({ TEST_CREATE_BOTS: true, BOT_RTP_BOTS: 'D', CLICK_COMPASS: 'false' })
+  r.run(`handleCommand('/start-rtp'); handleCommand('/start-rtp')`)
+  const queued = r.run(`pendingRtp.get('D').timer`)
+  r.timers.delete(queued); queued.fn()
+  assert.equal(r.createdBots.length, 1)
+  const bot = r.createdBots[0], sent = []; bot.chat = cmd => sent.push(cmd)
+  bot.emit('spawn')
+  const waiting = r.run(`pendingRtp.get('D').timer`); r.timers.delete(waiting); waiting.fn()
+  assert.equal(sent.length, 0, 'must not RTP at the login/selector spawn')
+  r.run(`bots.D.normalStartupReady = true`)
+  const ready = r.run(`pendingRtp.get('D').timer`); r.timers.delete(ready); ready.fn()
+  assert.deepEqual(sent, ['/rtp world world'])
+  assert.equal(r.run('bots.D.rtpRunning'), true)
+  r.run(`handleCommand('/stop-rtp'); handleCommand('/start-rtp E'); handleCommand('/stop-rtp')`)
+  assert.equal(r.run('pendingRtp.size'), 0)
+  assert.equal(r.createdBots.length, 1)
+})
+test('overview never queries or reports disconnected bots with stale avatars', async () => {
+  const r = runtime()
+  r.run(`bots.B.connectionState = 'disconnected'; queryBalance = async (id) => { chats.push([id, 'probe']); return 1 }; queryRank = async () => 'Member'; handleCommand('/overview')`)
+  for (let n = 0; n < 8; n++) await Promise.resolve()
+  assert.equal(r.context.chats.some(([id]) => id === 'B'), false)
+  assert.doesNotMatch(channelLogs(r, 'A'), /Offline \/ Connecting|\[2\].*B/)
+  assert.match(channelLogs(r, 'A'), /\[3\].*C/)
+})
+test('server command packets reach authenticated command browser and TUI without executing chat', async () => {
+  const r = runtime({ TEST_CREATE_BOTS: true })
+  r.run(`createBotInstance('D')`)
+  r.createdBots[0]._client.emit('declare_commands', { nodes: [{ children: [1] }, { flags: { command_node_type: 1 }, extraNodeData: { name: 'warp' }, children: [] }], rootIndex: 0 })
+  const cookie = await r.login()
+  const res = await r.request('/api/server-commands?bot=D', '', cookie, 'GET')
+  assert.equal(res.status, 200)
+  assert.deepEqual(JSON.parse(res.body).commands, [{ command: '/warp', usages: ['/warp'] }])
+  assert.equal(JSON.parse(res.body).source, 'tree')
+  r.run(`handleCommand('/server-commands', { selectedId: 'D' })`)
+  assert.match(channelLogs(r, 'D'), /\/warp/)
+  assert.deepEqual(plain(r.context.chats), [])
+  assert.equal(r.run(`commandTableFor('D')['/warp'].startsWith('Server command')`), true)
+  const anonymous = await r.request('/api/server-commands?bot=D', '', '', 'GET')
+  assert.equal(anonymous.status, 303)
+})
+test('shared TUI logs, history and settings never expose auth or proxy credentials or terminal escapes', async () => {
+  const r = runtime({ LOGIN_PASSWORD: 'login-secret', PROXY_PASS: 'proxy-secret', PROXY_USER: 'proxy-user', PROXY_GROUP_2_PASS: 'group-secret' })
+  const cookie = await r.login()
+  for (const command of ['/chat /login login-secret', '/env set PROXY_PASS next-secret', '/env set PROXY_GROUP_2_PASS next-group-secret', '/chat /register abc abc']) { r.context.text = command; r.run('recordHistory(text); handleCommand(text)') }
+  r.run(`logFor('A', 'server echo login-secret next-secret next-group-secret proxy-user \\x1b[2Jmalicious'); recordHistory('/login short')`)
+  const res = await r.request('/api/state', '', cookie, 'GET')
+  assert.doesNotMatch(res.body, /login-secret|next-secret|next-group-secret|proxy-user|\\u001b|\/login short|\/register abc/)
+  assert.match(res.body, /redacted/)
+  const settings = await r.request('/api/settings', '', cookie, 'GET')
+  assert.doesNotMatch(settings.body, /next-secret|next-group-secret|proxy-user/)
+})
+test('origin guard allows tunnels and proxies but keeps blocking CSRF', async () => {
+  const r = runtime({ WEB_ALLOWED_ORIGINS: 'https://allowed.example' }), cookie = await r.login()
+  const run = (headers, remote = '127.0.0.1') => r.request('/api/command', '{}', cookie, 'POST', null, headers, remote)
+  const connect = (headers, remote = '127.0.0.1') => r.socket(cookie, headers, remote)
+  // The cases a rewritten-Host tunnel/proxy produces; every one must get past
+  // the guard and reach normal authentication.
+  for (const headers of [
+    { host: 'localhost', origin: 'http://127.0.0.1:80' },
+    { host: 'localhost:80', origin: 'https://bot.tunnel.example', 'sec-fetch-site': 'same-origin' },
+    { host: 'localhost:80', origin: 'https://bot.tunnel.example', 'x-forwarded-host': 'bot.tunnel.example' },
+    { host: 'localhost:80', origin: 'https://allowed.example' },
+    { host: '52.237.167.218', origin: 'http://52.237.167.218' }
+  ]) {
+    assert.notEqual((await run(headers)).status, 403, JSON.stringify(headers))
+    assert.equal(connect(headers).destroyed, undefined, JSON.stringify(headers))
+  }
+  // Cross-site CSRF, opaque origins and a cross-site flag stay blocked.
+  for (const headers of [
+    { host: 'localhost', origin: 'https://evil.example' },
+    { host: 'localhost', origin: 'null' },
+    { host: 'localhost:80', origin: 'https://bot.tunnel.example', 'sec-fetch-site': 'cross-site' }
+  ]) {
+    assert.equal((await run(headers)).status, 403, JSON.stringify(headers))
+    assert.equal(connect(headers).destroyed, true, JSON.stringify(headers))
+  }
+  // A loopback-looking Origin arriving from a remote peer is not a tunnel.
+  const spoof = { host: 'evil.example', origin: 'http://127.0.0.1:81' }
+  assert.equal((await run(spoof, '203.0.113.9')).status, 403)
+  assert.equal(connect(spoof, '203.0.113.9').destroyed, true)
+})
+test('foreign-origin mutations and websocket upgrades are rejected; logout revokes existing sockets', async () => {
+  const r = runtime(), cookie = await r.login()
+  const foreign = await r.request('/api/command', JSON.stringify({ text: 'attack' }), cookie, 'POST', null, { origin: 'https://evil.example' })
+  assert.equal(foreign.status, 403)
+  const bad = r.socket(cookie, { origin: 'https://evil.example' })
+  assert.equal(bad.destroyed, true)
+  const good = r.socket(cookie, { origin: 'http://localhost' })
+  good.command({ t: 'cmd', text: 'safe' })
+  assert.deepEqual(plain(r.context.chats), [['A', 'safe']])
+  await r.request('/logout', '', cookie)
+  assert.equal(good.closeCode, 1008)
+  good.command({ t: 'cmd', text: 'after logout' })
+  assert.equal(r.context.chats.length, 1)
+  const urlToken = await r.request('/api/state?token=' + cookie.slice(4), '', '', 'GET')
+  assert.equal(urlToken.status, 303, 'URL tokens must not leak through access logs/referrers')
+})
+test('new-gen saves generated roster and proxy groups before staggered connections', async () => {
+  const r = runtime({ TEST_CREATE_BOTS: true, LOGIN_PASSWORD: 'pw', PROXY_GROUP_2_HOST: 'proxy' })
+  const cookie = await r.login()
+  const res = await r.request('/api/command', JSON.stringify({ text: '/new-gen 3' }), cookie)
+  assert.equal(res.status, 202)
+  const saved = require('dotenv').parse(r.fakeFiles.get('.env'))
+  const names = saved.PROXY_GROUP_2_BOTS.split(',')
+  assert.equal(names.length, 3)
+  assert.equal(r.createdBots.length, 0, 'saving precedes every connection')
+  assert.ok(names.every(name => saved.BOT_NAMES.includes(name) && /^[A-Za-z0-9_]{3,16}$/.test(name)))
+  const timer = [...r.timers.keys()].find(t => t.delay === 0 && String(t.fn).includes('createBotInstance(name)'))
+  timer.fn()
+  assert.equal(r.createdBots.length, 1)
+  assert.equal(r.run('PROXY_GROUPS[0].index'), 2)
+})
+test('all-slow dispatches crates-solo once per target and refuses nested fleet commands', async () => {
+  const r = runtime()
+  r.run(`globalThis.sequences = []; runCratesAllSequenceForBot = async (id, block, plan) => sequences.push({ id, plan }); handleCommand('/all-slow 1-3 500ms /crates-solo dump=off afk=off')`)
+  for (let n = 0; n < 5; n++) {
+    const timer = [...r.timers.keys()].find(t => t.delay === 500)
+    if (!timer) break
+    r.timers.delete(timer); timer.fn(); await Promise.resolve()
+  }
+  assert.deepEqual(plain(r.run('sequences.map(s => s.id)')), ['A', 'B', 'C'])
+  assert.deepEqual(plain(r.context.chats), [])
+  r.run(`handleCommand('/all /crates-all delay=30s')`)
+  assert.equal(r.run('sequences.length'), 3)
+  assert.match(channelLogs(r, 'A'), /Fleet-wide command cannot be nested/)
+})
+test('crates delay schedules solo start and fleet stagger independently of afk delay; env commands change live defaults without leaking credentials', async () => {
+  const r = runtime()
+  r.timers.clear()
+  r.run(`globalThis.sequences = []; runCratesAllSequenceForBot = async (id, block, plan) => sequences.push({ id, plan }); handleCommand('/crates-solo B delay=30s afk=10 dump=off')`)
+  assert.equal(r.run('sequences.length'), 0)
+  const timer = [...r.timers.keys()].find(t => t.delay === 30000); timer.fn(); await Promise.resolve()
+  assert.equal(r.run('sequences[0].id'), 'B')
+  assert.equal(r.run('sequences[0].plan.afkDelayMs'), 10000)
+  r.timers.clear()
+  r.run(`handleCommand('/crates-all 3 delay=2s dump=off afk=off')`)
+  assert.deepEqual([...r.timers.keys()].map(t => t.delay).sort((a, b) => a - b), [0, 2000, 4000])
+  r.run(`handleCommand('/env set CRATES_ALL_DUMP home'); handleCommand('/env set WARP_COMMAND /warp new'); handleCommand('/env set LOGIN_PASSWORD_1 super-secret-value')`)
+  assert.equal(r.run('cratesAllPlan().dump'), 'home')
+  assert.equal(r.run('WARP_AFK'), '/warp new')
+  assert.doesNotMatch(channelLogs(r, 'A'), /super-secret-value/)
+  assert.doesNotMatch(r.run('commandHistory.join("\\n")'), /super-secret-value/)
+  r.run(`handleCommand('/env set SHARDSHOP_LOOP_DELAY_MS 1.5s'); handleCommand('/env get SHARDSHOP_LOOP_DELAY_MS')`)
+  assert.equal(r.run('SHARDSHOP_LOOP_DELAY_MS'), 1500)
+})
 
 test('real bot lifecycle events mark stale avatars offline and persist death evidence', () => {
   const r = runtime({ TEST_CREATE_BOTS: true })
@@ -603,24 +834,71 @@ test('chat games stay disabled and preserve the user-configured server pace', ()
 })
 
 // The dashboard's "⟳ tor" button: per-port results, failures never throw.
+// --no-reconnect / "reconnect": false keep the sweep reporting-only here —
+// the reconnect half of a rotation has its own test below.
 test('/api/tor/newnym and /tor-newnym report every control port', async () => {
   const r = runtime({ TOR_CONTROL_PORTS: '59997' })
   const cookie = await r.login()
-  const res = await r.request('/api/tor/newnym', '', cookie, 'POST')
+  const res = await r.request('/api/tor/newnym', JSON.stringify({ reconnect: false }), cookie, 'POST')
   assert.equal(res.status, 200)
   const body = JSON.parse(res.body)
   assert.equal(body.ok, false, 'a dead control port is a reported failure, not a crash')
   assert.equal(body.results[0].port, 59997)
   assert.ok(body.results[0].error, 'and it says why')
+  assert.equal(body.reconnected, 0, 'reporting-only never touches a connection')
 
-  const result = await r.run(`handleCommand('/tor-newnym')`)
+  r.timers.clear()
+  const result = await r.run(`handleCommand('/tor-newnym --no-reconnect')`)
   assert.equal(result.ok, false)
   assert.equal(result.results.length, 1, 'the console command runs the same sweep')
+  assert.equal(r.timers.size, 0, 'and --no-reconnect schedules nothing')
 
   const empty = runtime()
   const bare = await empty.run(`handleCommand('/tor-newnym')`)
   assert.equal(bare.ok, false)
   assert.equal(bare.results.length, 0, 'with no local Tor there is nothing to signal — reported, not guessed at')
+})
+
+// A rotation only takes effect if the scoped bots actually reconnect — SIGNAL
+// NEWNYM alone leaves every live connection on its old circuit and exit IP.
+// The scope is a proxy group number, a bot name (its group), 'default' for the
+// ungrouped remainder, or 'all'; an unknown scope is an error, never a silent
+// rotate-everything.
+test('/tor-newnym rotates one proxy group and reconnects only its bots after a successful signal', async () => {
+  const r = runtime({
+    TOR_CONTROL_PORTS: '59997',
+    TOR_ROTATE_DELAY_MS: '1000',
+    PROXY_GROUP_1_BOTS: 'A,B',
+    PROXY_GROUP_1_HOST: 'localhost',
+    PROXY_GROUP_1_PORT: '9150',
+    PROXY_GROUP_2_BOTS: 'C',
+    PROXY_GROUP_2_HOST: 'localhost',
+    PROXY_GROUP_2_PORT: '9050'
+  })
+  r.timers.clear()
+
+  // Deterministic successful control response: a dead port must NOT churn bots.
+  r.run(`requestTorCircuits = async () => ({ ok: true, results: [{ port: 59997, ok: true }] })`)
+  const two = await r.run(`handleCommand('/tor-newnym 2')`)
+  assert.equal(two.scope, 2)
+  assert.equal(two.label, 'proxy group 2')
+  assert.equal(two.reconnected, 1, 'only group 2\'s bot is reconnected')
+  assert.equal(r.timers.size, 1, 'one staggered reconnect is scheduled')
+
+  r.timers.clear()
+  const named = await r.run(`handleCommand('/tor-newnym A')`)
+  assert.equal(named.scope, 1, 'a bot name resolves to its group')
+  assert.equal(named.reconnected, 2, 'the whole group rotates, not just the named bot')
+
+  r.timers.clear()
+  const def = await r.run(`handleCommand('/tor-newnym default')`)
+  assert.equal(def.scope, 'default')
+  assert.equal(def.reconnected, 0, 'no ungrouped bots exist in this runtime')
+
+  const bad = await r.run(`handleCommand('/tor-newnym 9')`)
+  assert.equal(bad.ok, false)
+  assert.match(bad.error, /no proxy group 9/)
+  assert.equal(r.timers.size, 0, 'a bad scope schedules nothing')
 })
 
 // The sweep only tidies reporting flags — it must never yank a connection
@@ -1264,13 +1542,14 @@ test('/proxy lists each group with its own auth source, without ever printing a 
   const out = r.context.__lines.join('\n')
 
   // Each group's credentials are named by variable, so the fix for a 407 is visible here.
-  assert.match(out, /\[1\] A → SOCKS5 alice@1\.2\.3\.4:1080 · proxy auth: PROXY_GROUP_1_USER\/_PASS/)
+  assert.match(out, /\[1\] A → SOCKS5 \*\*\*@1\.2\.3\.4:1080 · proxy auth: PROXY_GROUP_1_USER\/_PASS/)
   // Group 2 has none, and must say so rather than implying it borrows the global pair.
   assert.match(out, /\[2\] B → HTTP 5\.6\.7\.8:1080 · proxy auth: none/)
-  assert.match(out, /SOCKS5 globaluser@9\.9\.9\.9:1080 \(authenticated\)/)
+  assert.match(out, /SOCKS5 \*\*\*@9\.9\.9\.9:1080 \(authenticated\)/)
   assert.ok(out.includes('never shared with a group'))
   assert.ok(!out.includes('group-one-secret'), 'group password leaked into /proxy output')
   assert.ok(!out.includes('global-secret'), 'global password leaked into /proxy output')
+  assert.doesNotMatch(out, /alice|globaluser/)
 })
 
 test('/status reports which variable supplies the login password, per bot', () => {
@@ -1337,12 +1616,12 @@ test('the registry calls a value live only when it is read where it is used', ()
     return out
   })()`))
 
-  // Read once while bot.js loads, so the tab has to ask for a restart.
-  for (const key of ['CRATES_ALL_DUMP', 'CRATES_ALL_AFK_WARP', 'CRATES_ALL_AFK_DELAY_MS', 'DUMP_HOME_COMMAND', 'TPA_MAIN_PLAYER', 'WARP_COMMAND', 'BOT_NAMES', 'ANALYTICS_PORT']) {
+  // Roster and listener wiring remain restart-only.
+  for (const key of ['BOT_NAMES', 'ANALYTICS_PORT']) {
     assert.equal(live[key], false, key + ' is captured at boot, so the tab must not call it live')
   }
   // Read where they are used, so an override applies immediately.
-  for (const key of ['LOGIN_PASSWORD', 'ALL_SLOW_DELAY_MS', 'AUTH_RETRY_MS']) {
+  for (const key of ['CRATES_ALL_DUMP', 'CRATES_ALL_AFK_WARP', 'CRATES_ALL_AFK_DELAY_MS', 'DUMP_HOME_COMMAND', 'TPA_MAIN_PLAYER', 'WARP_COMMAND', 'LOGIN_PASSWORD', 'ALL_SLOW_DELAY_MS', 'AUTH_RETRY_MS']) {
     assert.equal(live[key], true, key + ' is read at the point of use, so the tab may call it live')
   }
 
@@ -1515,16 +1794,17 @@ test('/proxy names the login-password source, and reports a group with no proxy'
   assert.ok(!out.includes('pw-one') && !out.includes('pw-two'))
 })
 
-test('startup names a group variable that no group actually declares', () => {
+test('startup supports sparse group indexes without leaking credentials', () => {
   const r = runtime({
     PROXY_GROUP_1_BOTS: 'A', PROXY_GROUP_1_HOST: '1.2.3.4',
-    // No PROXY_GROUP_2_*, so group 3 is never reached by the scan.
+    // No PROXY_GROUP_2_*, but group 3 is valid.
     PROXY_GROUP_3_BOTS: 'B', PROXY_GROUP_3_LOGIN_PASSWORD: 'orphaned-pw'
   })
   r.timers.clear()
   const out = r.run('systemLogs.map(l => l.text).join("\\n")')
-  assert.match(out, /ignored, no group declares them: PROXY_GROUP_3_BOTS, PROXY_GROUP_3_LOGIN_PASSWORD/)
-  assert.match(out, /Groups start at PROXY_GROUP_1_BOTS/)
+  assert.match(out, /PROXY_GROUP_3 has no HOST/)
+  assert.equal(r.run(`resolveLoginPassword('B', PROXY_GROUPS, process.env).password`), 'orphaned-pw')
+  assert.doesNotMatch(out, /ignored, no group declares them/)
   assert.ok(!out.includes('orphaned-pw'), 'the value is never printed')
 })
 

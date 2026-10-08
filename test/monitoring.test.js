@@ -152,13 +152,13 @@ test('BAN_MESSAGE_REGEX adds a server-specific ban phrase', () => {
 // ── Discord alerting ────────────────────────────────────────────────────────
 // createMonitoring reads its config at construction and posts through global
 // fetch, so both are stubbed here and restored afterwards.
-const ENV_KEYS = ['DISCORD_WEBHOOK_URL', 'DISCORD_USER_ID', 'DISCORD_NOTIFICATIONS', 'DISCORD_BAN_COOLDOWN_MS', 'DISCORD_AUTH_COOLDOWN_MS', 'MEMORY_WATCHDOG', 'DISCORD_MENTION_CRITICAL_ONLY']
+const ENV_KEYS = ['DISCORD_WEBHOOK_URL', 'DISCORD_USER_ID', 'DISCORD_NOTIFICATIONS', 'DISCORD_BAN_COOLDOWN_MS', 'DISCORD_AUTH_COOLDOWN_MS', 'MEMORY_WATCHDOG', 'DISCORD_MENTION_CRITICAL_ONLY', 'DISCORD_VERBOSE_ALERTS', 'DISCORD_OFFLINE_REMINDER_MS']
 
 async function withMonitoring (env, fn) {
   const { createMonitoring } = require('../monitoring')
   const saved = {}
   ENV_KEYS.forEach(key => { saved[key] = process.env[key] })
-  Object.assign(process.env, { MEMORY_WATCHDOG: 'false', DISCORD_WEBHOOK_URL: 'https://discord.test/webhook' }, env)
+  Object.assign(process.env, { MEMORY_WATCHDOG: 'false', DISCORD_WEBHOOK_URL: 'https://discord.test/webhook', DISCORD_VERBOSE_ALERTS: 'true' }, env)
   const sent = []
   const lines = []
   const originalFetch = globalThis.fetch
@@ -166,15 +166,34 @@ async function withMonitoring (env, fn) {
     sent.push(JSON.parse(options.body))
     return { ok: true, status: 204, headers: { get: () => null } }
   }
-  const monitoring = createMonitoring({ logFor: (id, line) => lines.push(line), systemId: 'sys', sanitize: value => String(value) })
+  const health = { ready: true, total: 10, online: 10 }
+  const monitoring = createMonitoring({ logFor: (id, line) => lines.push(line), systemId: 'sys', sanitize: value => String(value), getFleetHealth: () => health })
   try {
-    await fn({ monitoring, sent, lines })
+    await fn({ monitoring, sent, lines, health })
   } finally {
     monitoring.stop()
     globalThis.fetch = originalFetch
     ENV_KEYS.forEach(key => { if (saved[key] === undefined) delete process.env[key]; else process.env[key] = saved[key] })
   }
 }
+
+test('quiet default only pings strictly over forty percent offline, waits startup and deduplicates outages', async () => {
+  await withMonitoring({ DISCORD_VERBOSE_ALERTS: 'false', DISCORD_USER_ID: '12345', DISCORD_OFFLINE_REMINDER_MS: '0' }, async ({ monitoring, sent, health }) => {
+    await monitoring.onKick('A', 'You are banned!')
+    await monitoring.onAuthFailure('A', { kind: 'bad-password', reason: 'wrong' })
+    assert.equal(sent.length, 0)
+    health.online = 6; await monitoring.checkFleet(); assert.equal(sent.length, 0, 'exactly 2/5 does not ping')
+    health.online = 5; health.ready = false; await monitoring.checkFleet(); assert.equal(sent.length, 0)
+    health.ready = true; await monitoring.checkFleet(); assert.equal(sent.length, 1)
+    assert.deepEqual(sent[0], { content: '<@12345> 5/10 bots offline', allowed_mentions: { parse: [], users: ['12345'] } })
+    await monitoring.checkFleet(); assert.equal(sent.length, 1)
+    health.online = 6; await monitoring.checkFleet()
+    health.online = 5; await monitoring.checkFleet(); assert.equal(sent.length, 2, 'new outage pings again')
+    process.env.DISCORD_NOTIFICATIONS = 'false'
+    health.online = 10; await monitoring.checkFleet(); health.online = 0; await monitoring.checkFleet()
+    assert.equal(sent.length, 2, 'live notification switch is honored')
+  })
+})
 
 test('a ban kick posts a ban alert instead of a plain kick', async () => {
   await withMonitoring({ DISCORD_USER_ID: '12345', DISCORD_MENTION_CRITICAL_ONLY: 'true' }, async ({ monitoring, sent, lines }) => {

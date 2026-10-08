@@ -6,7 +6,9 @@ const path = require('path')
 // Node timers clamp invalid/overflowing delays to 1ms; fall back instead.
 function readDelayMs(value, fallback = 15000) {
   if (value == null || String(value).trim() === '') return fallback
-  const ms = Number(value)
+  const duration = String(value).trim().match(/^(\d+(?:\.\d+)?)(ms|s|m|min|h)$/i)
+  const scale = !duration || duration[2].toLowerCase() === 'ms' ? 1 : duration[2].toLowerCase() === 's' ? 1000 : duration[2].toLowerCase() === 'h' ? 3600000 : 60000
+  const ms = duration ? Number(duration[1]) * scale : Number(value)
   return Number.isSafeInteger(ms) && ms >= 1 && ms <= 2147483647 ? ms : fallback
 }
 
@@ -252,6 +254,12 @@ function parseCratesAllFlags(tokens) {
       if (parsed.unknown) { out.unknown.push(token); continue }
       out.dump = parsed.dump
       if (parsed.target) out.dumpTarget = parsed.target
+    } else if (key === 'delay') {
+      const match = value.match(/^(\d+(?:\.\d+)?)(ms|s|m|min|h)?$/i)
+      const scale = !match || !match[2] || match[2].toLowerCase() === 's' ? 1000 : match[2].toLowerCase() === 'ms' ? 1 : match[2].toLowerCase() === 'h' ? 3600000 : 60000
+      const delay = match ? Number(match[1]) * scale : NaN
+      if (!Number.isSafeInteger(delay) || delay < 0 || delay > 2147483647) { out.unknown.push(token); continue }
+      out.delayMs = delay
     } else if (key === 'afk') {
       const parsed = parseCratesAllAfk(value)
       if (parsed.unknown) { out.unknown.push(token); continue }
@@ -629,8 +637,8 @@ async function executeCommandChain(chain, ctx, { executeSingle = () => {}, sleep
 // Unassigned bots fall back to the caller-provided default (global PROXY_* or direct).
 function parseProxyGroups(env = process.env) {
   const groups = []
-  let n = 1
-  while (env[`PROXY_GROUP_${n}_BOTS`] !== undefined) {
+  const indexes = [...new Set(Object.keys(env).map(key => key.match(/^PROXY_GROUP_(\d+)_BOTS$/)?.[1]).filter(Boolean))].map(Number).sort((a, b) => a - b)
+  for (const n of indexes) {
     const botsRaw = env[`PROXY_GROUP_${n}_BOTS`] || ''
     const bots = botsRaw.split(',').map(s => s.trim()).filter(Boolean)
     const host = (env[`PROXY_GROUP_${n}_HOST`] || '').trim()
@@ -660,16 +668,12 @@ function parseProxyGroups(env = process.env) {
     // proxy": the group exists, its login password applies, and its bots use the
     // default connection.
     if (bots.length) groups.push({ index: n, bots, host, port, type, user, pass, loginPassword, fallbackPassword })
-    n++
   }
   return groups
 }
 
-// Any PROXY_GROUP_<N>_* variable whose index has no group is ignored. The loop
-// stops at the first missing PROXY_GROUP_<N>_BOTS, so one typo there silently
-// discards the host, credentials, bot list and login password of every group
-// after it. Returns the offending keys so startup can name them instead of
-// pretending they were applied.
+// Variables belonging to an empty or missing bot group are not roster routes.
+// Sparse indexes are valid, including routes used only for admission/generation.
 function findIgnoredProxyGroupVars(env = process.env, groups = []) {
   const known = new Set((groups || []).map(g => g.index))
   const ignored = []
@@ -686,7 +690,7 @@ function findIgnoredProxyGroupVars(env = process.env, groups = []) {
 function resolveBotProxy(username, groups, fallback = null) {
   if (Array.isArray(groups)) {
     for (const group of groups) {
-      if (group.bots.includes(username)) {
+      if (group.bots.some(name => name.toLowerCase() === String(username).toLowerCase())) {
         // A group with no host is a bot grouping, not a proxy route: use the
         // default connection rather than a made-up host:port.
         if (!group.host) return fallback
@@ -884,12 +888,12 @@ function buildHttpConnectRequest(targetHost, targetPort, proxy = {}) {
 // One-line proxy target for logs, `/proxy`, and error messages. The password is
 // never included: these strings reach the TUI, the browser console panel, the
 // Discord notifier, and scrollback — a credential in a log line is a leaked
-// credential. The username is shown, because "which login is this bot using?"
-// is exactly the question those lines exist to answer.
+// credential. Both username and password are masked; callers name the source
+// environment variables when the operator needs to identify the credential.
 function describeProxy(proxy) {
   if (!proxy) return 'direct (no proxy)'
   const type = String(proxy.type || 'socks5').toUpperCase()
-  const creds = proxy.user ? `${proxy.user}@` : (hasProxyAuth(proxy) ? '***@' : '')
+  const creds = hasProxyAuth(proxy) ? '***@' : ''
   return `${type} ${creds}${proxy.host}:${proxy.port}`
 }
 
@@ -1420,6 +1424,62 @@ function deriveTorControlPorts (groups, defaultProxy, offset = 1) {
   return out
 }
 
+// Same derivation, but each control port keeps WHICH routing keys it serves so
+// a rotation can be scoped: /tor-newnym 2 signals only group 2's Tor instance
+// and reconnects only group 2's bots. A group with no dedicated host rides the
+// default proxy (resolveBotProxy falls back), so its key lands on the default
+// instance's control port; ungrouped bots are the 'default' key.
+function deriveTorControlTargets (groups, defaultProxy, offset = 1) {
+  const out = []
+  const byPort = new Map()
+  const add = (host, port, key) => {
+    const h = String(host || '').trim().toLowerCase()
+    if (!LOCAL_TOR_HOSTS.includes(h)) return
+    const socks = Number(port)
+    if (!Number.isInteger(socks) || socks <= 0 || socks > 65535) return
+    const ctrl = socks + offset
+    if (ctrl > 65535) return
+    let entry = byPort.get(ctrl)
+    if (!entry) { entry = { port: ctrl, keys: [] }; byPort.set(ctrl, entry); out.push(entry) }
+    if (!entry.keys.includes(key)) entry.keys.push(key)
+  }
+  for (const g of groups || []) {
+    if (g.host) add(g.host, g.port, g.index)
+    else if (defaultProxy) add(defaultProxy.host, defaultProxy.port, g.index)
+  }
+  if (defaultProxy) add(defaultProxy.host, defaultProxy.port, 'default')
+  return out
+}
+
+// Turns a /tor-newnym argument into a rotation scope: which bots to reconnect
+// and which Tor control ports to signal. Accepts 'all' (the default), a proxy
+// group number, 'default' (bots with no dedicated group), or a bot name (its
+// group is used). An unknown value is an error — never a silent fallback to
+// rotating everything.
+function resolveTorScope (arg, groups, knownIds) {
+  const ids = Array.isArray(knownIds) ? knownIds : []
+  const list = groups || []
+  const botsOf = g => ids.filter(id => g.bots.includes(id))
+  const grouped = new Set(list.flatMap(g => g.bots))
+  const ungrouped = ids.filter(id => !grouped.has(id))
+  const raw = String(arg == null ? '' : arg).trim()
+  if (!raw || /^all$/i.test(raw)) return { ok: true, scope: 'all', label: 'every proxy', botIds: ids.slice() }
+  if (/^default$/i.test(raw)) return { ok: true, scope: 'default', label: 'ungrouped bots', botIds: ungrouped }
+  if (/^\d+$/.test(raw)) {
+    const n = Number(raw)
+    const g = list.find(x => x.index === n)
+    if (!g) {
+      const known = list.map(x => x.index).join(', ')
+      return { ok: false, error: `no proxy group ${n}${known ? ` — configured groups: ${known}` : ' (no proxy groups configured)'}` }
+    }
+    return { ok: true, scope: g.index, label: `proxy group ${g.index}`, botIds: botsOf(g) }
+  }
+  const g = list.find(x => x.bots.includes(raw))
+  if (g) return { ok: true, scope: g.index, label: `proxy group ${g.index} (${raw})`, botIds: botsOf(g) }
+  if (ids.includes(raw)) return { ok: true, scope: 'default', label: `ungrouped bots (${raw})`, botIds: [raw] }
+  return { ok: false, error: `unknown proxy group or bot "${raw}"` }
+}
+
 // One control-port conversation: AUTHENTICATE → SIGNAL <name> → QUIT. Never
 // rejects — a dead port is a result ({ ok: false, error }), because the caller
 // reports per-port outcomes rather than aborting the whole request.
@@ -1471,7 +1531,74 @@ function commandSuggestions (value, commands, limit = 8) {
     .map(k => ({ key: k, desc: String(table[k] ?? '') }))
 }
 
+// A balance is not an earnings counter: purchases hide gains between probes.
+// Keep positive observed changes, never count the initial balance as production.
+function createShardTracker ({ windowMs = 60000, maxGapMs = 120000 } = {}) {
+  const rows = new Map()
+  function observe (id, balance, now = Date.now()) {
+    if (!Number.isFinite(balance) || balance < 0) return false
+    const row = rows.get(id) || { balance: null, at: null, baseline: false, produced: 0, intervals: [] }
+    // One server reply can be seen by both the passive chat listener and the
+    // query caller. Do not turn that duplicate into a near-zero-time sample.
+    if (row.baseline && balance === row.balance && now - row.at < 1000) return true
+    if (row.baseline && now > row.at && now - row.at <= maxGapMs) {
+      const gain = Math.max(0, balance - row.balance)
+      row.produced += gain
+      row.intervals.push({ start: row.at, end: now, gain })
+    }
+    row.balance = balance; row.at = now; row.baseline = true
+    row.intervals = row.intervals.filter(x => x.end > now - windowMs)
+    rows.set(id, row)
+    return true
+  }
+  function invalidate (id) {
+    const row = rows.get(id)
+    if (row) { row.baseline = false; row.intervals = [] }
+  }
+  function snapshot (id, now = Date.now()) {
+    const row = rows.get(id)
+    if (!row) return { shards: null, shardsPerMinute: null, shardsProduced: 0, shardsSampledAt: null, shardsRateEstimated: true }
+    row.intervals = row.intervals.filter(x => x.end > now - windowMs)
+    let gain = 0, elapsed = 0
+    for (const x of row.intervals) {
+      const overlap = Math.max(0, Math.min(now, x.end) - Math.max(now - windowMs, x.start))
+      gain += x.gain * overlap / (x.end - x.start)
+      elapsed += overlap
+    }
+    const fresh = row.baseline && now - row.at <= maxGapMs
+    return { shards: row.balance, shardsPerMinute: fresh && elapsed > 0 ? gain * 60000 / elapsed : null,
+      shardsProduced: row.produced, shardsSampledAt: row.at, shardsRateEstimated: true }
+  }
+  return { observe, invalidate, snapshot }
+}
+
+function parseShardBalance (message) {
+  const text = String(message || '').replace(/§[0-9a-fk-or]/gi, '')
+  const match = text.match(/^\s*shards\b.{0,20}?(?:balance:?|balance\s+is)\s*([\d,]+(?:\.\d+)?)\s*([kmbt])?\b/i)
+  if (!match) return null
+  const scale = match[2] ? { k: 1e3, m: 1e6, b: 1e9, t: 1e12 }[match[2].toLowerCase()] : 1
+  return Number(match[1].replace(/,/g, '')) * scale
+}
+
+function reconnectDelay (attempt, baseMs = 10400, maxMs = 300000, random = Math.random) {
+  // Both transport and protocol failures back off; jitter avoids a fleet-wide
+  // retry stampede. The cap applies to the final delay, including jitter.
+  return Math.min(maxMs, Math.round(baseMs * Math.pow(1.5, Math.min(30, Math.max(0, attempt))) * (1 + random() * 0.25)))
+}
+
+function commandCooldownMs (message, fallbackMs = 6000) {
+  const text = String(message || '').replace(/§[0-9a-fk-or]/gi, '')
+  if (!/cool\s*down|(?:wait|try again).{0,25}\d+(?:\.\d+)?\s*(?:seconds?|secs?|s)\b/i.test(text)) return 0
+  const match = text.match(/(\d+(?:\.\d+)?)\s*(seconds?|secs?|s|minutes?|mins?)\b/i)
+  if (!match) return fallbackMs
+  return Math.min(300000, Math.max(fallbackMs, Number(match[1]) * (/^m/i.test(match[2]) ? 60000 : 1000) + 500))
+}
+
 module.exports = {
+  createShardTracker,
+  parseShardBalance,
+  reconnectDelay,
+  commandCooldownMs,
   readDelayMs,
   readInt,
   readNumber,
@@ -1526,6 +1653,8 @@ module.exports = {
   loadBotScript,
   parseTorControlPorts,
   deriveTorControlPorts,
+  deriveTorControlTargets,
+  resolveTorScope,
   sendTorSignal,
   commandSuggestions
 }

@@ -23,13 +23,60 @@
  */
 
 // Anything matching this is treated as a credential: settable, never displayed.
-const SECRET_RE = /(PASSWORD|PASSWD|TOKEN|SECRET|API_?KEY|WEBHOOK|CREDENTIAL|_KEY$|^SSH_|PRIVATE)/i
+const SECRET_RE = /(PASSWORD|PASSWD|TOKEN|SECRET|API_?KEY|WEBHOOK|CREDENTIAL|_KEY$|_PASS$|^PROXY(?:_GROUP_\d+)?_USER$|^SSH_|PRIVATE)/i
 
 // process.env is mostly the host's, not the project's. These prefixes/names are
 // the container's own plumbing and listing them would bury the real settings.
 const NOISE_RE = /^(PATH|HOME|PWD|OLDPWD|SHELL|SHLVL|_|TERM|TERM_PROGRAM|COLORTERM|LS_COLORS|LANG|LANGUAGE|LC_.*|HOSTNAME|USER|LOGNAME|MAIL|TMPDIR|XDG_.*|NODE_.*|npm_.*|NPM_.*|DAYTONA.*|FREEBUFF.*|VSCODE.*|CODESPACE.*|DEBIAN.*|STAGE_.*|CAAS_.*|GIT_.*|GITHUB_.*|HOST_|PAPERTRAIL.*|KUBERNETES.*|MEMORY_LIMIT|SERVICE_.*|DOTENV_.*)$/
 
 const TYPES = new Set(['string', 'int', 'number', 'ms', 'bool', 'list'])
+
+const fs = require('fs')
+const path = require('path')
+const dotenv = require('dotenv')
+const environment = process.env
+let envFile = null
+let fileValues = null
+let fileWatcher = null
+const reloadListeners = new Set()
+
+// File edits supersede only changed keys; unrelated temporary overrides survive.
+function reload () {
+  if (!envFile) return { ok: true, changed: [] }
+  let next
+  try { next = dotenv.parse(fs.readFileSync(envFile, 'utf8')) } catch (err) {
+    return { ok: false, error: `Cannot reload .env (${err.code || 'parse error'})` }
+  }
+  const changed = []
+  const previous = fileValues || {}
+  for (const key of new Set([...Object.keys(previous), ...Object.keys(next)])) {
+    if (fileValues && previous[key] === next[key]) continue
+    changed.push(key)
+    overrides.delete(key)
+    originals.delete(key)
+    if (next[key] === undefined) delete environment[key]
+    else environment[key] = next[key]
+  }
+  fileValues = next
+  for (const listener of reloadListeners) listener(changed)
+  return { ok: true, changed }
+}
+function watch (file = path.join(__dirname, '.env')) {
+  stopWatching()
+  envFile = file
+  fileValues = null
+  const result = reload()
+  // Poll the path, not the inode: editors often replace .env atomically.
+  fileWatcher = setInterval(reload, 1000)
+  fileWatcher.unref?.()
+  return result
+}
+function stopWatching () {
+  if (fileWatcher) clearInterval(fileWatcher)
+  fileWatcher = null
+}
+function onChange (listener) { reloadListeners.add(listener); return () => reloadListeners.delete(listener) }
+function changed () { for (const listener of reloadListeners) listener([]) }
 
 const registry = new Map()
 
@@ -100,9 +147,9 @@ function canonicalKey (name) {
   for (const key of registry.keys()) {
     if (key.toUpperCase() === upper) return key
   }
-  if (Object.prototype.hasOwnProperty.call(process.env, trimmed)) return trimmed
-  if (Object.prototype.hasOwnProperty.call(process.env, upper)) return upper
-  for (const key of Object.keys(process.env)) {
+  if (Object.prototype.hasOwnProperty.call(environment, trimmed)) return trimmed
+  if (Object.prototype.hasOwnProperty.call(environment, upper)) return upper
+  for (const key of Object.keys(environment)) {
     if (key.toUpperCase() === upper) return key
   }
   return trimmed
@@ -112,7 +159,7 @@ function canonicalKey (name) {
 function isKnownKey (name) {
   const key = canonicalKey(name)
   if (registry.has(key)) return true
-  return Object.prototype.hasOwnProperty.call(process.env, key)
+  return Object.prototype.hasOwnProperty.call(environment, key)
 }
 
 function levenshtein (a, b) {
@@ -137,7 +184,7 @@ function suggestKeys (name, limit = 3) {
   if (!needle) return []
   const maxDistance = Math.max(2, Math.floor(needle.length / 3))
   const seen = new Set()
-  return [...registry.keys(), ...Object.keys(process.env)]
+  return [...registry.keys(), ...Object.keys(environment)]
     .filter(key => !seen.has(key) && seen.add(key))
     .filter(key => /^[A-Z][A-Z0-9_]*$/.test(key) && !NOISE_RE.test(key))
     .map(key => ({ key, distance: levenshtein(needle, key.toLowerCase()) }))
@@ -153,13 +200,14 @@ const overrides = new Map()
 const originals = new Map()
 
 function specFor (key) {
+  const futureConnection = /^(PROXY_GROUP_\d+_(BOTS|HOST|PORT|TYPE|USER|PASS|PASSWORD|LOGIN_PASSWORD|FALLBACK_LOGIN_PASSWORD)|PROXY_(HOST|PORT|TYPE|USER|PASS|PASSWORD)|BOT_PASSWORD_\w+)$/.test(key)
   return registry.get(key) || {
     key,
     type: 'string',
     def: undefined,
-    group: 'Other (.env)',
-    desc: 'Read from the environment; not registered as tunable, so only code that re-reads it will see a change.',
-    live: false,
+    group: futureConnection ? 'Future connections' : 'Other (.env)',
+    desc: futureConnection ? 'Live for future connections/authentication; existing sockets are unchanged.' : 'Not registered as tunable; only code which rereads it sees changes. Boot wiring needs restart.',
+    live: futureConnection,
     unknown: true
   }
 }
@@ -169,7 +217,7 @@ function get (key) {
   key = canonicalKey(key)
   const spec = specFor(key)
   const raw = overrides.has(key) ? overrides.get(key)
-    : process.env[key] !== undefined && process.env[key] !== '' ? process.env[key]
+    : environment[key] !== undefined && environment[key] !== '' ? environment[key]
       : spec.def
   const value = coerce(spec.type, raw)
   if (value === null && spec.def !== undefined) return coerce(spec.type, spec.def)
@@ -180,14 +228,14 @@ function getRaw (key) {
   key = canonicalKey(key)
   const spec = specFor(key)
   if (overrides.has(key)) return overrides.get(key)
-  if (process.env[key] !== undefined && process.env[key] !== '') return process.env[key]
+  if (environment[key] !== undefined && environment[key] !== '') return environment[key]
   return spec.def
 }
 
 function source (key) {
   key = canonicalKey(key)
   if (overrides.has(key)) return 'override'
-  if (process.env[key] !== undefined && process.env[key] !== '') return 'env'
+  if (environment[key] !== undefined && environment[key] !== '') return 'env'
   return 'default'
 }
 
@@ -219,10 +267,13 @@ function set (key, raw) {
 
   if (!overrides.has(name)) {
     // Remember whether it was set at all, so reset can unset rather than blank it.
-    originals.set(name, process.env[name] !== undefined ? process.env[name] : null)
+    originals.set(name, environment[name] !== undefined ? environment[name] : null)
   }
   overrides.set(name, text)
-  process.env[name] = text // in memory only — never written to .env
+  // Legacy readers accept numeric milliseconds, while overrides retain the
+  // user's spelling for display/reset. This makes /env set X_MS 5s work there.
+  environment[name] = spec.type === 'ms' ? String(value) : text // memory only
+  changed()
   return {
     ok: true,
     key: name,
@@ -239,8 +290,9 @@ function reset (key) {
   const original = originals.get(name)
   overrides.delete(name)
   originals.delete(name)
-  if (original == null) delete process.env[name]
-  else process.env[name] = original
+  if (original == null) delete environment[name]
+  else environment[name] = original
+  changed()
   const spec = specFor(name)
   const raw = getRaw(name)
   return { ok: true, key: name, live: spec.live, value: isSecret(name) ? null : coerce(spec.type, raw), source: source(name) }
@@ -282,7 +334,7 @@ function list ({ includeUnknown = true } = {}) {
   for (const spec of registry.values()) push(spec.key, spec)
   if (includeUnknown) {
     const known = new Set(rows.map(row => row.key))
-    for (const key of Object.keys(process.env).sort()) {
+    for (const key of Object.keys(environment).sort()) {
       if (known.has(key)) continue
       if (NOISE_RE.test(key)) continue
       if (!/^[A-Z][A-Z0-9_]*$/.test(key)) continue
@@ -315,6 +367,10 @@ function registered () {
 }
 
 module.exports = {
+  reload,
+  watch,
+  stopWatching,
+  onChange,
   define,
   get,
   getRaw,

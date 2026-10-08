@@ -4,7 +4,7 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { readDelayMs, readInt, readNumber, parseDumpMode, parseDataArgs, parseCratesAllDump, parseCratesAllAfk, parseCratesAllFlags, shuffledCopy, createSlowBroadcast, createSlowBroadcastManager, parseChatGameRange, parseChatGameEquation, isChatGameEnd, createChatGameManager, parseProxyGroups, resolveBotProxy, hasProxyAuth, proxyAuthHeader, buildHttpConnectRequest, describeProxy, resolveLoginPassword, resolveFallbackPassword, parseBotPasswords, classifyAuthReply, nextAuthFailure, isAuthBlocked, findIgnoredProxyGroupVars, destructiveCommandEffect, createCommandConfirmation, parseItemGlobs, itemMatchesGlobs, parseRewardSlots, parseScript, parseScriptLine, selectScriptBots, listBotScripts, loadBotScript, parseTorControlPorts, deriveTorControlPorts, sendTorSignal, commandSuggestions } = require('../bot-controls')
+const { readDelayMs, readInt, readNumber, parseDumpMode, parseDataArgs, parseCratesAllDump, parseCratesAllAfk, parseCratesAllFlags, shuffledCopy, createSlowBroadcast, createSlowBroadcastManager, parseChatGameRange, parseChatGameEquation, isChatGameEnd, createChatGameManager, parseProxyGroups, resolveBotProxy, hasProxyAuth, proxyAuthHeader, buildHttpConnectRequest, describeProxy, resolveLoginPassword, resolveFallbackPassword, parseBotPasswords, classifyAuthReply, nextAuthFailure, isAuthBlocked, findIgnoredProxyGroupVars, destructiveCommandEffect, createCommandConfirmation, parseItemGlobs, itemMatchesGlobs, parseRewardSlots, parseScript, parseScriptLine, selectScriptBots, listBotScripts, loadBotScript, parseTorControlPorts, deriveTorControlPorts, deriveTorControlTargets, resolveTorScope, sendTorSignal, commandSuggestions } = require('../bot-controls')
 
 function clock() {
   let time = 0, sequence = 0
@@ -25,6 +25,16 @@ function clock() {
     }
   }
 }
+
+test('duration settings and crate scheduling accept strict units and reject timer overflow', () => {
+  assert.equal(readDelayMs('1.5s'), 1500)
+  assert.equal(readDelayMs('2m'), 120000)
+  assert.equal(readDelayMs('2s-junk', 100), 100)
+  for (const [value, expected] of [['0', 0], ['30', 30000], ['30s', 30000], ['1.5s', 1500], ['250ms', 250], ['2min', 120000], ['1h', 3600000]]) {
+    assert.equal(parseCratesAllFlags([`delay=${value}`]).delayMs, expected)
+  }
+  for (const value of ['-1', '30junk', 'Infinity', '2147483648ms', '1.5ms']) assert.deepEqual(parseCratesAllFlags([`delay=${value}`]).unknown, [`delay=${value}`])
+})
 
 test('readInt and readNumber fall back on missing, junk, or out-of-range values', () => {
   assert.equal(readInt(undefined, 50), 50)
@@ -189,6 +199,33 @@ test('parseTorControlPorts reads a messy list and deriveTorControlPorts keeps lo
   assert.deepEqual(deriveTorControlPorts([{ host: '10.0.0.5', port: 9050 }], null), [], 'a remote proxy is nobody we can signal')
   assert.deepEqual(deriveTorControlPorts([{ host: '127.0.0.1', port: 9050 }, { host: 'localhost', port: 9050 }], null, 2), [9052], 'the same instance is listed once')
   assert.deepEqual(deriveTorControlPorts([], { host: 'localhost', port: 65535 }), [], 'offsetting past 65535 is not a port')
+})
+
+test('deriveTorControlTargets keeps routing keys and resolveTorScope scopes a rotation', () => {
+  const groups = [
+    { index: 1, bots: ['a', 'b'], host: '', port: 9150 },
+    { index: 2, bots: ['c'], host: 'localhost', port: 9050 },
+    { index: 3, bots: ['d'], host: '10.0.0.9', port: 9250 }
+  ]
+  const def = { host: '127.0.0.1', port: 9150 }
+  assert.deepEqual(deriveTorControlTargets(groups, def), [
+    { port: 9151, keys: [1, 'default'] },
+    { port: 9051, keys: [2] }
+  ], 'a host-less group rides the default instance; a remote group is nobody we can signal')
+  assert.deepEqual(deriveTorControlTargets([], null), [], 'no proxies, no control ports')
+  assert.deepEqual(deriveTorControlTargets([{ index: 1, bots: ['a'], host: 'localhost', port: 65535 }], null), [], 'offsetting past 65535 is not a port')
+
+  const ids = ['a', 'b', 'c', 'd', 'e']
+  assert.deepEqual(resolveTorScope('', groups, ids).botIds, ids, 'no argument means everything')
+  assert.equal(resolveTorScope('all', groups, ids).scope, 'all')
+  assert.deepEqual(resolveTorScope('2', groups, ids), { ok: true, scope: 2, label: 'proxy group 2', botIds: ['c'] })
+  assert.deepEqual(resolveTorScope('default', groups, ids), { ok: true, scope: 'default', label: 'ungrouped bots', botIds: ['e'] })
+  assert.deepEqual(resolveTorScope('c', groups, ids), { ok: true, scope: 2, label: 'proxy group 2 (c)', botIds: ['c'] }, 'a bot name resolves to its group')
+  assert.deepEqual(resolveTorScope('e', groups, ids), { ok: true, scope: 'default', label: 'ungrouped bots (e)', botIds: ['e'] })
+  const bad = resolveTorScope('9', groups, ids)
+  assert.equal(bad.ok, false)
+  assert.match(bad.error, /configured groups: 1, 2, 3/)
+  assert.equal(resolveTorScope('zzz', groups, ids).ok, false, 'an unknown name is an error, never a rotate-everything fallback')
 })
 
 test('sendTorSignal authenticates and signals, and a dead or rude port is a result not a throw', async () => {
@@ -433,7 +470,7 @@ test('command suggestions follow the web GUI match rule', () => {
 })
 
 
-test('parseProxyGroups reads indexed PROXY_GROUP_N_* vars and stops at the first gap', () => {
+test('parseProxyGroups reads indexed PROXY_GROUP_N_* vars including sparse indexes', () => {
   const env = {
     PROXY_GROUP_1_BOTS: 'Alice, Bob',
     PROXY_GROUP_1_HOST: '1.2.3.4',
@@ -442,13 +479,14 @@ test('parseProxyGroups reads indexed PROXY_GROUP_N_* vars and stops at the first
     PROXY_GROUP_2_BOTS: 'Carol',
     PROXY_GROUP_2_HOST: '5.6.7.8',
     // no PORT/TYPE -> defaults
-    PROXY_GROUP_4_BOTS: 'Dave', // gap at 3 -> never reached
+    PROXY_GROUP_4_BOTS: 'Dave', // gap at 3 is valid
     PROXY_GROUP_4_HOST: '9.9.9.9'
   }
   const groups = parseProxyGroups(env)
   assert.deepEqual(groups, [
     { index: 1, bots: ['Alice', 'Bob'], host: '1.2.3.4', port: 1081, type: 'http', user: '', pass: '', loginPassword: '', fallbackPassword: '' },
-    { index: 2, bots: ['Carol'], host: '5.6.7.8', port: 1080, type: 'socks5', user: '', pass: '', loginPassword: '', fallbackPassword: '' }
+    { index: 2, bots: ['Carol'], host: '5.6.7.8', port: 1080, type: 'socks5', user: '', pass: '', loginPassword: '', fallbackPassword: '' },
+    { index: 4, bots: ['Dave'], host: '9.9.9.9', port: 1080, type: 'socks5', user: '', pass: '', loginPassword: '', fallbackPassword: '' }
   ])
 })
 
@@ -473,12 +511,12 @@ test('a group with bots but no HOST still exists, so its login password applies'
   assert.equal(resolveBotProxy('BotA', groups, null), null)
 })
 
-test('a group numbered above a gap is never reached, which is why it is reported', () => {
-  // The scan stops at the first missing PROXY_GROUP_<N>_BOTS: this config declares
-  // group 2 only, so nothing is parsed and its password is dead weight.
+test('a group numbered above a gap remains reachable with its account password', () => {
   const env = { PROXY_GROUP_2_BOTS: 'BotA', PROXY_GROUP_2_LOGIN_PASSWORD: 'group-pw' }
-  assert.deepEqual(parseProxyGroups(env), [])
-  assert.deepEqual(findIgnoredProxyGroupVars(env, []), ['PROXY_GROUP_2_BOTS', 'PROXY_GROUP_2_LOGIN_PASSWORD'])
+  const groups = parseProxyGroups(env)
+  assert.equal(groups[0].index, 2)
+  assert.equal(resolveLoginPassword('BotA', groups, env).password, 'group-pw')
+  assert.deepEqual(findIgnoredProxyGroupVars(env, groups), [])
   // Declaring group 1 as well is what makes group 2 reachable.
   const fixed = { PROXY_GROUP_1_BOTS: 'BotZ', PROXY_GROUP_1_HOST: 'h', ...env }
   assert.equal(parseProxyGroups(fixed).length, 2)
@@ -487,13 +525,14 @@ test('a group numbered above a gap is never reached, which is why it is reported
 test('findIgnoredProxyGroupVars names every group variable that belongs to no group', () => {
   const env = {
     PROXY_GROUP_1_BOTS: 'A', PROXY_GROUP_1_HOST: 'h',
-    // 2 is missing entirely, so 3 is never reached by the scan
+    // 2 is missing entirely, but 3 still works
     PROXY_GROUP_3_BOTS: 'B', PROXY_GROUP_3_HOST: 'h2', PROXY_GROUP_3_LOGIN_PASSWORD: 'pw',
     PROXY_HOST: 'not-a-group', PROXY_GROUPS: 'not-a-group-either'
   }
   const groups = parseProxyGroups(env)
-  assert.equal(groups.length, 1)
-  assert.deepEqual(findIgnoredProxyGroupVars(env, groups), ['PROXY_GROUP_3_BOTS', 'PROXY_GROUP_3_HOST', 'PROXY_GROUP_3_LOGIN_PASSWORD'])
+  assert.equal(groups.length, 2)
+  assert.deepEqual(findIgnoredProxyGroupVars(env, groups), [])
+  assert.deepEqual(findIgnoredProxyGroupVars({ PROXY_GROUP_9_HOST: 'admission-only' }, groups), ['PROXY_GROUP_9_HOST'])
   // A fully parsed set is reported as nothing ignored.
   assert.deepEqual(findIgnoredProxyGroupVars(env, [{ index: 1 }, { index: 3 }]), [])
   assert.deepEqual(findIgnoredProxyGroupVars({}, []), [])
@@ -575,14 +614,15 @@ test('buildHttpConnectRequest sends the auth header only when credentialed, and 
   assert.ok(authed.indexOf('Proxy-Authorization') < authed.indexOf('\r\n\r\n'))
 })
 
-test('describeProxy shows the target and username but never the password', () => {
+test('describeProxy shows the target but never proxy credentials', () => {
   assert.equal(describeProxy(null), 'direct (no proxy)')
   assert.equal(describeProxy({ host: '1.2.3.4', port: 1080, type: 'socks5' }), 'SOCKS5 1.2.3.4:1080')
-  assert.equal(describeProxy({ host: '1.2.3.4', port: 8080, type: 'http', user: 'alice', pass: 'hunter2' }), 'HTTP alice@1.2.3.4:8080')
+  assert.equal(describeProxy({ host: '1.2.3.4', port: 8080, type: 'http', user: 'alice', pass: 'hunter2' }), 'HTTP ***@1.2.3.4:8080')
   // Password-only: no username to show, but the URL must not silently look credential-free.
   assert.equal(describeProxy({ host: '1.2.3.4', port: 1080, type: 'socks5', pass: 'hunter2' }), 'SOCKS5 ***@1.2.3.4:1080')
   const rendered = describeProxy({ host: 'h', port: 1, type: 'http', user: 'alice', pass: 'hunter2' })
   assert.ok(!rendered.includes('hunter2'), 'the password must never appear in a log line')
+  assert.ok(!rendered.includes('alice'), 'the username must never appear in a log line')
 })
 
 test('hasProxyAuth is true for a username or a password, false otherwise', () => {

@@ -49,7 +49,13 @@ const {
   createCommandConfirmation,
   parseTorControlPorts,
   deriveTorControlPorts,
-  sendTorSignal
+  deriveTorControlTargets,
+  resolveTorScope,
+  sendTorSignal,
+  createShardTracker,
+  parseShardBalance,
+  reconnectDelay,
+  commandCooldownMs
 } = require('./bot-controls')
 const os = require('os')
 const { createMonitoring, classifyKick } = require('./monitoring')
@@ -59,6 +65,8 @@ const fs = require('fs')
 const path = require('path')
 const http = require('http')
 const crypto = require('crypto')
+const { decodeCommandTree, decodeCompletions } = require('./server-commands')
+const { persistGeneratedBots } = require('./generated-bots')
 const zlib = require('zlib')
 const { exec, execFile } = require('child_process')
 const { createTerminal, sshConfig } = require('./expose-terminal')
@@ -71,6 +79,7 @@ const analysis = require(path.join(__dirname, 'analysis'))
 const timeseries = require(path.join(__dirname, 'timeseries'))
 const analytics = require(path.join(__dirname, 'analytics'))
 const { handleChartJs, handleCoinflipDashboardJs } = require('./coinflip-dashboard-static')
+const { handleXtermAsset } = require('./xterm-static')
 const { callFreeLLMChat, getAvailableModels, autoAIChatLoop, AI_CHAT_CONTEXT_MESSAGES } = require('./ai-chat')
 const mineflayer = require('mineflayer')
 const armorManager = require('mineflayer-armor-manager')
@@ -79,14 +88,14 @@ let SocksClient
 try { ({ SocksClient } = require('socks')) } catch (_) { /* only needed if PROXY_HOST is set and PROXY_TYPE=socks5 — npm install socks */ }
 
 // ── .env config (original) ──────────────────────────────────────────────────
-const HOST = process.env.HOST || 'play.fatalmc.org'
-const PORT = readInt(process.env.PORT, 25565, 1, 65535)
-const VERSION = process.env.VERSION || '1.21.2'
+let HOST = process.env.HOST || 'play.fatalmc.org'
+let PORT = readInt(process.env.PORT, 25565, 1, 65535)
+let VERSION = process.env.VERSION || '1.21.2'
 // The /register + /login password is resolved PER BOT (resolveLoginPassword), so
 // each proxy group of accounts can use its own and a single bot can override
 // both; LOGIN_PASSWORD stays the fallback for every bot not covered. See
 // bot-controls.js for the precedence and the two BOT_PASSWORD spellings.
-const BOT_PASSWORDS = parseBotPasswords()
+let BOT_PASSWORDS = parseBotPasswords()
 
 // ── Login / register failure guard ───────────────────────────────────────────
 // A rejected /login is treated as a configuration mistake, not a network blip:
@@ -115,6 +124,7 @@ const authState = new Map()
 //   { skip }                      an auth prompt we refuse to answer
 //   { command, source, kind }     an auth prompt to answer
 function planAuthAction(id, message, now = Date.now()) {
+  refreshRuntimeConfig()
   const text = String(message || '').toLowerCase()
   const state = authState.get(id) || {}
   const failure = state.failure || null
@@ -144,7 +154,7 @@ function planAuthAction(id, message, now = Date.now()) {
         }
       }
       const next = nextAuthFailure(failure, verdict, now, {
-        throttleMs: AUTH_THROTTLE_MS, alreadyMs: AUTH_ALREADY_MS, maxThrottled: AUTH_MAX_THROTTLED
+        throttleMs: settings.get('AUTH_RETRY_MS'), alreadyMs: settings.get('AUTH_ALREADY_MS'), maxThrottled: settings.get('AUTH_MAX_THROTTLED_RETRIES')
       })
       // Clear sentAt so the same reply cannot be counted twice.
       authState.set(id, { ...state, failure: next, sentAt: 0 })
@@ -159,7 +169,8 @@ function planAuthAction(id, message, now = Date.now()) {
   // A throttled failure expires, so this lets it through once its wait is over.
   if (isAuthBlocked(failure, now)) return { skip: failure }
 
-  const auth = resolveLoginPassword(id, PROXY_GROUPS, process.env, BOT_PASSWORDS)
+  const remembered = robotLogin.rememberedPassword(id)
+  const auth = remembered ? { password: remembered, source: 'successful robot.txt candidate' } : resolveLoginPassword(id, PROXY_GROUPS, process.env, BOT_PASSWORDS)
   // Once the fallback has been sent it IS this bot's password until a restart:
   // a reconnect must not re-run the rejected primary and re-wait the delay.
   const used = state.usedFallback ? resolveFallbackPassword(id, PROXY_GROUPS, process.env) : null
@@ -178,15 +189,15 @@ const CONNECT_DELAY_MS = readDelayMs(process.env.CONNECT_DELAY_MS, 39500)
 const CONNECT_DELAY_RANDOM_MS = readDelayMs(process.env.CONNECT_DELAY_RANDOM_MS, 0)
 const ALL_SLOW_DELAY_MS = readDelayMs(process.env.ALL_SLOW_DELAY_MS, 15000)
 const RANDOMIZE_BOT_ORDER = !/^(0|false|no|off)$/i.test((process.env.RANDOMIZE_BOT_ORDER || '').trim())
-const MAX_RECONNECT = readInt(process.env.MAX_RECONNECT, 17, 1, 100)
-const GUI_SLOT = readInt(process.env.GUI_SLOT, 11, 1, 200)
-const WARP_AFK = process.env.WARP_COMMAND || '/warp afk'
-const WARP_BEFORE_CRATE = (process.env.WARP_BEFORE_CRATE ?? process.env.WARPORNOT ?? 'true').toLowerCase() !== 'false'
-const SERVER_COMMAND = (process.env.SERVER_COMMAND ?? '').trim()
-const TPA_MAIN_PLAYER = (process.env.TPA_MAIN_PLAYER || process.env.TPA_TARGET_PLAYER || '').trim()
-const TPA_TRUSTED_BOTS = parseNameList(process.env.TPA_TRUSTED_BOTS || BOT_NAMES.join(','))
+let MAX_RECONNECT = readInt(process.env.MAX_RECONNECT, 17, 1, 100)
+let GUI_SLOT = readInt(process.env.GUI_SLOT, 11, 1, 200)
+let WARP_AFK = process.env.WARP_COMMAND || '/warp afk'
+let WARP_BEFORE_CRATE = (process.env.WARP_BEFORE_CRATE ?? process.env.WARPORNOT ?? 'true').toLowerCase() !== 'false'
+let SERVER_COMMAND = (process.env.SERVER_COMMAND ?? '').trim()
+let TPA_MAIN_PLAYER = (process.env.TPA_MAIN_PLAYER || process.env.TPA_TARGET_PLAYER || '').trim()
+let TPA_TRUSTED_BOTS = parseNameList(process.env.TPA_TRUSTED_BOTS || BOT_NAMES.join(','))
 const TPA_AUTO_DEFAULT = /^(1|true|yes|on)$/i.test(process.env.TPA_AUTO_DEFAULT || 'false')
-const DUMP_HOME_COMMAND = (process.env.DUMP_HOME_COMMAND || '/home stash').trim()
+let DUMP_HOME_COMMAND = (process.env.DUMP_HOME_COMMAND || '/home stash').trim()
 // /dump hidden pacing: at most DUMP_HIDDEN_CONCURRENT bots at the spot at any
 // moment (hard ceiling 4 — a 70-bot pile-up is never "hidden"). Starts are
 // spaced a random gap apart so arrivals look organic; the run finishes when the
@@ -199,29 +210,29 @@ const DUMP_HIDDEN_MAX_GAP_MS = Math.max(DUMP_HIDDEN_MIN_GAP_MS, readDelayMs(proc
 // /dump + /dump-spawners tuning. Every value has the long-standing default, so
 // an existing .env needs no changes; invalid values fall back instead of
 // producing NaN timers.
-const DUMP_TPA_TIMEOUT_MS = readDelayMs(process.env.DUMP_TPA_TIMEOUT_MS, 45000)
+let DUMP_TPA_TIMEOUT_MS = readDelayMs(process.env.DUMP_TPA_TIMEOUT_MS, 45000)
 const DUMP_TPA_MIN_DISTANCE = readNumber(process.env.DUMP_TPA_MIN_DISTANCE, 10, 0.5, 1000)
-const DUMP_SETTLE_MS = readDelayMs(process.env.DUMP_SETTLE_MS, 2500)
-const DUMP_WARP_DELAY_MS = readDelayMs(process.env.DUMP_WARP_DELAY_MS, 2500)
-const DUMP_CLICK_DELAY_MS = readDelayMs(process.env.DUMP_CLICK_DELAY_MS, 120)
+let DUMP_SETTLE_MS = readDelayMs(process.env.DUMP_SETTLE_MS, 2500)
+let DUMP_WARP_DELAY_MS = readDelayMs(process.env.DUMP_WARP_DELAY_MS, 2500)
+let DUMP_CLICK_DELAY_MS = readDelayMs(process.env.DUMP_CLICK_DELAY_MS, 120)
 // How long to wait for the server to confirm a shift-click before deciding the
 // chest is full. Judging the click from stale slot state is what made /dump
 // stop after the first stack ("only dumps a little").
-const DUMP_CLICK_CONFIRM_MS = Math.max(250, readDelayMs(process.env.DUMP_CLICK_CONFIRM_MS, 1500))
-const DUMP_OPEN_TIMEOUT_MS = readDelayMs(process.env.DUMP_OPEN_TIMEOUT_MS, 15000)
-const CHEST_SCAN_RADIUS = readNumber(process.env.CHEST_SCAN_RADIUS, 30, 1, 256)
-const CHEST_SCAN_COUNT = readInt(process.env.CHEST_SCAN_COUNT, 50, 1, 500)
+let DUMP_CLICK_CONFIRM_MS = Math.max(250, readDelayMs(process.env.DUMP_CLICK_CONFIRM_MS, 1500))
+let DUMP_OPEN_TIMEOUT_MS = readDelayMs(process.env.DUMP_OPEN_TIMEOUT_MS, 15000)
+let CHEST_SCAN_RADIUS = readNumber(process.env.CHEST_SCAN_RADIUS, 30, 1, 256)
+let CHEST_SCAN_COUNT = readInt(process.env.CHEST_SCAN_COUNT, 50, 1, 500)
 let hiddenDumpRun = null
 
 // ── Persistent /data recorder ───────────────────────────────────────────────
 // JSON is the durable local source of truth. /data compiles it into one current
 // snapshot and optionally POSTs that snapshot to a Google Apps Script webhook.
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data', 'spawner-data.json')
-const DATA_WEBHOOK_URL = (process.env.DATA_WEBHOOK_URL || '').trim()
+let DATA_WEBHOOK_URL = (process.env.DATA_WEBHOOK_URL || '').trim()
 // Shared secret for the Apps Script endpoint (matched against its WEBHOOK_SECRET
 // script property, or "secret" in the POST body). Empty disables the check.
-const DATA_WEBHOOK_SECRET = (process.env.DATA_WEBHOOK_SECRET || '').trim()
-const DATA_WEBHOOK_TIMEOUT_MS = readDelayMs(process.env.DATA_WEBHOOK_TIMEOUT_MS, 15000)
+let DATA_WEBHOOK_SECRET = (process.env.DATA_WEBHOOK_SECRET || '').trim()
+let DATA_WEBHOOK_TIMEOUT_MS = readDelayMs(process.env.DATA_WEBHOOK_TIMEOUT_MS, 15000)
 const dataState = dataStore.loadState(DATA_FILE)
 const evidenceStore = require(path.join(__dirname, 'evidence')).createEvidenceStore({ file: process.env.EVIDENCE_FILE || path.join(__dirname, 'data', 'evidence.json') })
 function recordEvidence (id, kind, detail) {
@@ -229,7 +240,8 @@ function recordEvidence (id, kind, detail) {
 }
 function botOnline (entry) { return !!entry?.bot?.entity && (!entry.connectionState || entry.connectionState === 'online') }
 function connectionDetails (id, entry) {
-  const proxy = resolveBotProxy(id, PROXY_GROUPS, PROXY_DEFAULT)
+  const selectedRoute = robotLogin.route(id)
+const proxy = process.env[`BOT_DIRECT_${id}`] === 'true' ? null : selectedRoute === undefined ? resolveBotProxy(id, PROXY_GROUPS, PROXY_DEFAULT) : selectedRoute
   const socket = entry?.bot?._client?.socket
   const peer = socket?.remoteAddress || null
   return { target: entry?.host || HOST, port: entry?.port || PORT, route: proxy ? 'proxied' : 'direct', proxy: proxy ? `${proxy.type || 'socks5'} ${proxy.host}:${proxy.port}` : 'direct', tcpPeer: peer, tcpPeerPort: socket?.remotePort || null, serverIp: !proxy && botOnline(entry) ? peer : (net.isIP(entry?.host || HOST) ? entry?.host || HOST : null), note: proxy ? 'TCP peer is the proxy; destination IP behind proxy is unknown unless the target is an IP literal. Public egress IP is not checked.' : 'TCP peer is the directly connected server; a hostname alone is not proof of its IP.' }
@@ -311,10 +323,10 @@ function botLocation (bot) {
 // the right server. Chat lines can be prefixed with odd unicode just before the
 // "<name>: message" part — detectPlayerChat strips non-ASCII before matching.
 const CHAT_WATCHDOG_ENABLED = /^(1|true|yes|on)$/i.test(process.env.CHAT_WATCHDOG_ENABLED ?? 'true')
-const CHAT_WATCHDOG_TIMEOUT_MS = readDelayMs(process.env.CHAT_WATCHDOG_TIMEOUT_MS, 600000)
+let CHAT_WATCHDOG_TIMEOUT_MS = readDelayMs(process.env.CHAT_WATCHDOG_TIMEOUT_MS, 600000)
 const CHAT_WATCHDOG_CHECK_MS = readDelayMs(process.env.CHAT_WATCHDOG_CHECK_MS, 60000)
-const CHAT_WATCHDOG_COMMAND = (process.env.CHAT_WATCHDOG_COMMAND ?? '').trim()
-const CLICK_COMPASS_ENABLED = /^(1|true|yes|on)$/i.test(process.env.CLICK_COMPASS || '')
+let CHAT_WATCHDOG_COMMAND = (process.env.CHAT_WATCHDOG_COMMAND ?? '').trim()
+let CLICK_COMPASS_ENABLED = /^(1|true|yes|on)$/i.test(process.env.CLICK_COMPASS || '')
 
 // ── Interface config: TUI_GUI + WEB_GUI ──────────────────────────────────────
 // WEB_GUI=true serves the web dashboard; TUI_GUI=true runs the blessed terminal UI.
@@ -330,6 +342,10 @@ const WEB_PORT_MAX_ATTEMPTS = readInt(process.env.WEB_PORT_MAX_ATTEMPTS, 20, 1, 
 const WEB_PASSWORD = process.env.WEB_PASSWORD || null // null → random password generated + printed at startup
 const WEB_SESSION_HOURS = readNumber(process.env.WEB_SESSION_HOURS, 12, 0.1, 168)
 const WEB_LOGIN_MAX_FAILS = readInt(process.env.WEB_LOGIN_MAX_FAILS, 10, 1, 100)
+// Extra origins allowed to drive the dashboard behind a reverse proxy/tunnel
+// whose rewritten Host header cannot match the browser's Origin. Full origins
+// (https://bot.example.com) or bare host[:port] entries are accepted.
+const WEB_ALLOWED_ORIGINS = String(process.env.WEB_ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean)
 const WEB_TERMINAL_LOG = /^(1|true|yes|on)$/i.test(process.env.WEB_TERMINAL_LOG ?? 'true')
 const WEB_TERMINAL_ENABLED = /^(1|true|yes|on)$/i.test(process.env.WEB_TERMINAL_ENABLED || 'false')
 
@@ -394,9 +410,9 @@ const CONFIG_PACKET_LOG_LIMIT = readInt(process.env.CONFIG_PACKET_LOG_LIMIT, 120
 // within a group — an item matches when EVERY group has at least one alternative present
 // (case-insensitive substring match against its name/displayName).
 // e.g. "fatal|red;crate|key|candle" → (contains "fatal" OR "red") AND (contains "crate" OR "key" OR "candle")
-const GUI_ITEM_SEARCH_ENABLED = /^(1|true|yes|on)$/i.test(process.env.GUI_ITEM_SEARCH_ENABLED || 'false')
-const GUI_ITEM_SEARCH_TERMS = process.env.GUI_ITEM_SEARCH_TERMS || 'fatal|red;crate|key|candle'
-const GUI_ITEM_SEARCH_GROUPS = GUI_ITEM_SEARCH_TERMS
+let GUI_ITEM_SEARCH_ENABLED = /^(1|true|yes|on)$/i.test(process.env.GUI_ITEM_SEARCH_ENABLED || 'false')
+let GUI_ITEM_SEARCH_TERMS = process.env.GUI_ITEM_SEARCH_TERMS || 'fatal|red;crate|key|candle'
+let GUI_ITEM_SEARCH_GROUPS = GUI_ITEM_SEARCH_TERMS
 .split(';').map(g => g.trim()).filter(Boolean)
 .map(g => g.split('|').map(s => s.trim().toLowerCase()).filter(Boolean))
 .filter(g => g.length)
@@ -407,10 +423,10 @@ return GUI_ITEM_SEARCH_GROUPS.every(group => group.some(term => itemStr.includes
 }
 
 // ── /crates command config ─────────────────────────────────────────────────
-const WARP_CRATES = process.env.CRATE_COMMAND || '/warp crates'
-const CRATE_SHULKER_BLOCK = process.env.CRATE_SHULKER_BLOCK || 'red_shulker_box'
-const CRATE_SCAN_RADIUS = readInt(process.env.CRATE_SCAN_RADIUS, 20, 1, 256)
-const CRATE_REACH = readNumber(process.env.CRATE_REACH, 3.5, 0.5, 10)
+let WARP_CRATES = process.env.CRATE_COMMAND || '/warp crates'
+let CRATE_SHULKER_BLOCK = process.env.CRATE_SHULKER_BLOCK || 'red_shulker_box'
+let CRATE_SCAN_RADIUS = readInt(process.env.CRATE_SCAN_RADIUS, 20, 1, 256)
+let CRATE_REACH = readNumber(process.env.CRATE_REACH, 3.5, 0.5, 10)
 
 // ── /spawners config ───────────────────────────────────────────────────────
 // The bot never moves for this: it scans for spawner blocks already inside its
@@ -418,13 +434,13 @@ const CRATE_REACH = readNumber(process.env.CRATE_REACH, 3.5, 0.5, 10)
 // opens, waits, clicks SPAWNER_SLOT_SECOND (53), then moves on to the next
 // spawner until every reachable spawner has been handled.
 const SPAWNER_BLOCK = process.env.SPAWNER_BLOCK || 'spawner'
-const SPAWNER_REACH = readNumber(process.env.SPAWNER_REACH, 4.5, 0.5, 10)
-const SPAWNER_MAX_COUNT = readInt(process.env.SPAWNER_MAX_COUNT, 64, 1, 1000)
-const SPAWNER_SLOT_FIRST = readInt(process.env.SPAWNER_SLOT_FIRST, 13, 1, 200)
-const SPAWNER_SLOT_SECOND = readInt(process.env.SPAWNER_SLOT_SECOND, 53, 1, 200)
-const SPAWNER_WINDOW_WAIT_MS = readDelayMs(process.env.SPAWNER_WINDOW_WAIT_MS, 3000)
-const SPAWNER_SLOT_DELAY_MS = readDelayMs(process.env.SPAWNER_SLOT_DELAY_MS, 1500)
-const SPAWNER_NEXT_DELAY_MS = readDelayMs(process.env.SPAWNER_NEXT_DELAY_MS, 1500)
+let SPAWNER_REACH = readNumber(process.env.SPAWNER_REACH, 4.5, 0.5, 10)
+let SPAWNER_MAX_COUNT = readInt(process.env.SPAWNER_MAX_COUNT, 64, 1, 1000)
+let SPAWNER_SLOT_FIRST = readInt(process.env.SPAWNER_SLOT_FIRST, 13, 1, 200)
+let SPAWNER_SLOT_SECOND = readInt(process.env.SPAWNER_SLOT_SECOND, 53, 1, 200)
+let SPAWNER_WINDOW_WAIT_MS = readDelayMs(process.env.SPAWNER_WINDOW_WAIT_MS, 3000)
+let SPAWNER_SLOT_DELAY_MS = readDelayMs(process.env.SPAWNER_SLOT_DELAY_MS, 1500)
+let SPAWNER_NEXT_DELAY_MS = readDelayMs(process.env.SPAWNER_NEXT_DELAY_MS, 1500)
 
 // ── Crate color customization ──────────────────────────────────────────────
 const SHULKER_COLORS = [
@@ -462,9 +478,9 @@ const RANK_MEMBER_PATTERNS = [
   /\bno permission\b/i
 ]
 const RANK_COOLDOWN_PATTERN = /you are on cool ?down/i
-const CRATES_ALL_STAGGER_MS = readDelayMs(process.env.CRATES_ALL_STAGGER_MS, 30000)
+let CRATES_ALL_STAGGER_MS = readDelayMs(process.env.CRATES_ALL_STAGGER_MS, 30000)
 const CRATES_ALL_SHARDSHOP_WAIT_MS = readDelayMs(process.env.CRATES_ALL_SHARDSHOP_WAIT_MS, 4000)
-const CRATES_ALL_STEP_WAIT_MS = readDelayMs(process.env.CRATES_ALL_STEP_WAIT_MS, 3000)
+let CRATES_ALL_STEP_WAIT_MS = readDelayMs(process.env.CRATES_ALL_STEP_WAIT_MS, 3000)
 // What /crates-all does once the crates are done. Defaults reproduce the
 // original behaviour exactly (TPA to TPA_MAIN_PLAYER → dump into nearby chests
 // → /warp afk after 15s), so an existing .env keeps working unchanged:
@@ -472,25 +488,25 @@ const CRATES_ALL_STEP_WAIT_MS = readDelayMs(process.env.CRATES_ALL_STEP_WAIT_MS,
 //   CRATES_ALL_AFK_WARP     false leaves each bot wherever the sequence ended
 //   CRATES_ALL_AFK_DELAY_MS 0 warps to AFK the instant the routine finishes
 // The same two knobs are available per run as `dump=` / `afk=` flags.
-const CRATES_ALL_DUMP_ENV = parseCratesAllDump(process.env.CRATES_ALL_DUMP)
-const CRATES_ALL_AFK_WARP = /^(1|true|yes|on)$/i.test(process.env.CRATES_ALL_AFK_WARP ?? 'true')
-const CRATES_ALL_AFK_DELAY_MS = readInt(process.env.CRATES_ALL_AFK_DELAY_MS, 15000, 0, 2147483647)
-const CRATES_ALL_FLAGS_USAGE = '[dump=off|tpa|home|hidden|player:<name>] [afk=now|off|<seconds>]'
+let CRATES_ALL_DUMP_ENV = parseCratesAllDump(process.env.CRATES_ALL_DUMP)
+let CRATES_ALL_AFK_WARP = /^(1|true|yes|on)$/i.test(process.env.CRATES_ALL_AFK_WARP ?? 'true')
+let CRATES_ALL_AFK_DELAY_MS = readInt(process.env.CRATES_ALL_AFK_DELAY_MS, 15000, 0, 2147483647)
+const CRATES_ALL_FLAGS_USAGE = '[delay=30s] [dump=off|tpa|home|hidden|player:<name>] [afk=now|off|<seconds>]'
 const CRATES_DUMP_FILTER_USAGE = '["term" …] [shulker|chest] [shulker color]'
 const CRATES_ALL_USAGE = `/crates-all [n] [color] ${CRATES_ALL_FLAGS_USAGE} ${CRATES_DUMP_FILTER_USAGE}`
 const CRATES_ALL_SOLO_USAGE = `/crates-solo [bot name or number] [color] ${CRATES_ALL_FLAGS_USAGE} ${CRATES_DUMP_FILTER_USAGE}`
 
 // ── /shardshop-loop: keep running /shardshop until the server says there's nothing left ──
-const SHARDSHOP_STOP_PHRASES = (process.env.SHARDSHOP_STOP_PHRASES || 'insufficent fund,not enough,insufficient fund,no more shards,more shards')
+let SHARDSHOP_STOP_PHRASES = (process.env.SHARDSHOP_STOP_PHRASES || 'insufficent fund,not enough,insufficient fund,no more shards,more shards')
 .split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
-const SHARDSHOP_LOOP_DELAY_MS = readDelayMs(process.env.SHARDSHOP_LOOP_DELAY_MS, 4200)
-const SHARDSHOP_LOOP_TIMEOUT_MS = readDelayMs(process.env.SHARDSHOP_LOOP_TIMEOUT_MS, 60000)
-const SHARDSHOP_LOOP_MAX_RUNS = readInt(process.env.SHARDSHOP_LOOP_MAX_RUNS, 200, 1, 10000)
+let SHARDSHOP_LOOP_DELAY_MS = readDelayMs(process.env.SHARDSHOP_LOOP_DELAY_MS, 4200)
+let SHARDSHOP_LOOP_TIMEOUT_MS = readDelayMs(process.env.SHARDSHOP_LOOP_TIMEOUT_MS, 60000)
+let SHARDSHOP_LOOP_MAX_RUNS = readInt(process.env.SHARDSHOP_LOOP_MAX_RUNS, 200, 1, 10000)
 
 // ── Crate click loop (real tail) ────────────────────────────────────────────
 const CRATE_STOP_PHRASES = ['you do not have a', 'error']
-const CRATE_CLICK_DELAY_MS = readDelayMs(process.env.CRATE_CLICK_DELAY_MS, 900)
-const CRATE_CLICK_TIMEOUT_MS = readDelayMs(process.env.CRATE_CLICK_TIMEOUT_MS, 60000)
+let CRATE_CLICK_DELAY_MS = readDelayMs(process.env.CRATE_CLICK_DELAY_MS, 900)
+let CRATE_CLICK_TIMEOUT_MS = readDelayMs(process.env.CRATE_CLICK_TIMEOUT_MS, 180000)
 
 // ── Outbound proxy config (original) ────────────────────────────────────────
 const PROXY_HOST = process.env.PROXY_HOST || ''
@@ -504,11 +520,11 @@ const PROXY_USER = process.env.PROXY_USER || ''
 const PROXY_PASS = process.env.PROXY_PASS !== undefined
 ? process.env.PROXY_PASS
 : (process.env.PROXY_PASSWORD || '')
-const PROXY_DEFAULT = PROXY_ENABLED ? { host: PROXY_HOST, port: PROXY_PORT, type: PROXY_TYPE, user: PROXY_USER, pass: PROXY_PASS } : null
+let PROXY_DEFAULT = PROXY_ENABLED ? { host: PROXY_HOST, port: PROXY_PORT, type: PROXY_TYPE, user: PROXY_USER, pass: PROXY_PASS } : null
 // Dedicated per-bot proxy groups: PROXY_GROUP_<N>_BOTS/_HOST/_PORT/_TYPE (see .env.example).
 // Bots not listed in any group fall back to PROXY_DEFAULT (global proxy, or direct if unset).
-const PROXY_GROUPS = parseProxyGroups()
-const PROXY_GROUPS_ENABLED = PROXY_GROUPS.length > 0
+let PROXY_GROUPS = parseProxyGroups()
+let PROXY_GROUPS_ENABLED = PROXY_GROUPS.length > 0
 
 // ── Tor control ports ───────────────────────────────────────────────────────
 // scripts/restart-tor.sh gives each local Tor instance a control port at its
@@ -520,15 +536,38 @@ function torControlPorts () {
   return explicit.length ? explicit : deriveTorControlPorts(PROXY_GROUPS, PROXY_DEFAULT)
 }
 
-// SIGNAL NEWNYM on every local Tor instance: the NEXT connection (each bot's
-// next reconnect) leaves through a fresh circuit — a live connection keeps the
-// circuit it is already on. Shared by /tor-newnym and the dashboard button,
-// and reported per port: one dead instance must not hide the others' results.
-async function requestTorCircuits () {
-  const ports = torControlPorts()
+// Per-control-port routing keys (see bot-controls.deriveTorControlTargets).
+// TOR_CONTROL_PORTS overrides the list wholesale: an explicit list carries no
+// group mapping, so its ports are shared by every scope.
+function torTargets () {
+  const explicit = parseTorControlPorts(settings.get('TOR_CONTROL_PORTS'))
+  if (explicit.length) return explicit.map(port => ({ port, keys: ['*'] }))
+  return deriveTorControlTargets(PROXY_GROUPS, PROXY_DEFAULT)
+}
+
+// The dashboard's ⟳ tor group picker: one entry per dedicated proxy group plus
+// 'default' for the ungrouped remainder. Empty when no groups are configured.
+function torGroupsInfo () {
+  if (!PROXY_GROUPS.length) return []
+  return [
+    ...PROXY_GROUPS.map(g => ({ id: String(g.index), label: `group ${g.index} (${g.bots.length} bots)` })),
+    { id: 'default', label: 'ungrouped bots' }
+  ]
+}
+
+// SIGNAL NEWNYM on the Tor instances serving `scope` ('all', 'default', or a
+// proxy group number): the NEXT connection leaves through a fresh circuit.
+// Reported per port: one dead instance must not hide the others' results.
+async function requestTorCircuits (scope = 'all', label = 'every proxy') {
+  const targets = torTargets()
+  const picked = scope === 'all' ? targets : targets.filter(t => t.keys.includes('*') || t.keys.includes(scope))
+  const ports = picked.map(t => t.port)
   if (!ports.length) {
-    logFor(SYSTEM_ID, '{yellow-fg}⚠ No Tor control ports known — set TOR_CONTROL_PORTS (or point PROXY_* / PROXY_GROUP_* at a local Tor).{/yellow-fg}')
-    return { ok: false, results: [], error: 'no Tor control ports configured' }
+    const hint = scope === 'all'
+      ? 'set TOR_CONTROL_PORTS (or point PROXY_* / PROXY_GROUP_* at a local Tor)'
+      : `${label} has no local Tor instance to signal (set its _HOST/_PORT to a local Tor)`
+    logFor(SYSTEM_ID, `{yellow-fg}⚠ No Tor control ports known — ${sanitize(hint)}.{/yellow-fg}`)
+    return { ok: false, results: [], error: `no Tor control ports for ${label}` }
   }
   const results = []
   for (const port of ports) {
@@ -538,6 +577,52 @@ async function requestTorCircuits () {
     else logFor(SYSTEM_ID, `{red-fg}✗ Tor control :${port} — ${sanitize(r.error)}{/red-fg}`)
   }
   return { ok: results.every(r => r.ok), results }
+}
+
+// Reconnects the given bots one at a time. This is what makes a rotation
+// actually take effect: SIGNAL NEWNYM alone changes nothing a user can see,
+// because every live connection keeps its old circuit and exit IP until it
+// reconnects. Accounts on the removed list are skipped (like /reconnect).
+function reconnectBotsScoped (ids) {
+  const delayMs = readDelayMs(settings.get('TOR_ROTATE_DELAY_MS'), 5000)
+  let count = 0
+  for (const id of ids) {
+    const entry = bots[id]
+    if (!entry) continue
+    const blocked = connectBlockReason(id)
+    if (blocked) {
+      logFor(id, `{yellow-fg}⚠ ${sanitize(id)} is ${sanitize(blocked)} — skipped during Tor rotation.{/yellow-fg}`)
+      continue
+    }
+    const { host, port, version } = entry
+    setTimeout(() => {
+      logInfo(`{yellow-fg}⚠ Tor rotation: reconnecting ${sanitize(id)}…{/yellow-fg}`)
+      try { entry.disconnectManually() } catch (_) {}
+      setTimeout(() => createBotInstance(id, host, port, version), 1000)
+    }, count * delayMs)
+    count++
+  }
+  return count
+}
+
+// The one code path behind /tor-newnym and the dashboard's ⟳ tor button:
+// resolve the scope, signal its Tor instances, then reconnect its bots so the
+// fresh circuits are the ones actually in use.
+async function torRotate (scopeArg, { reconnect = true } = {}) {
+  const scope = resolveTorScope(scopeArg, PROXY_GROUPS, Object.keys(bots))
+  if (!scope.ok) return { ok: false, error: scope.error }
+  const result = await requestTorCircuits(scope.scope, scope.label)
+  // Reconnecting is what makes the rotation take effect — but only when there
+  // are fresh circuits to take effect: with nothing signaled (no local Tor for
+  // this scope) a reconnect would churn every bot for the same exit path.
+  const successfulPorts = new Set(result.results.filter(r => r.ok).map(r => r.port))
+  const successfulKeys = new Set(torTargets().filter(t => successfulPorts.has(t.port)).flatMap(t => t.keys))
+  const readyIds = scope.botIds.filter(id => {
+    const group = PROXY_GROUPS.find(g => g.bots.some(name => name.toLowerCase() === id.toLowerCase()))
+    return successfulKeys.has('*') || successfulKeys.has(group ? group.index : 'default')
+  })
+  const reconnected = reconnect && readyIds.length ? reconnectBotsScoped(readyIds) : 0
+  return { ...result, scope: scope.scope, label: scope.label, reconnected }
 }
 
 // ── Proxy stall watchdog ────────────────────────────────────────────────────
@@ -567,7 +652,7 @@ const PROXY_CRASH_PATTERNS = [
 /unexpected end/i,
 /Invalid VarInt/i,
 /socket hang up/i,
-/ECONNRESET/i,
+/ECONNRESET|EPIPE|ETIMEDOUT|keepAliveError|client timed out/i,
 /read ECONNRESET/i,
 /This socket has been ended/i,
 /write after end/i,
@@ -580,14 +665,10 @@ const PROXY_CRASH_PATTERNS = [
 /Parse error/i,
 /Invalid tag/i
 ]
-const FAST_RECONNECT_MS = 10400
 const RECONNECT_BASE_MS = 10400
 const RECONNECT_MAX_MS = 5 * 60_000
 
-if (BOT_NAMES.length === 0) {
-process.stderr.write('No BOT_NAMES defined in .env — nothing to connect.\n')
-process.exit(1)
-}
+// An empty .env roster is valid: /start-login can admit robot.txt accounts.
 
 // ── Outbound proxy tunnelling (original, unchanged) ──────────────────────────
 function makeSocksConnect(targetHost, targetPort, onLog, proxy) {
@@ -674,7 +755,8 @@ client.emit('end', errMsg)
 }
 
 function makeProxyConnect(targetHost, targetPort, onLog, username) {
-const proxy = resolveBotProxy(username, PROXY_GROUPS, PROXY_DEFAULT)
+const admissionRoute = robotLogin.route(username)
+const proxy = process.env[`BOT_DIRECT_${username}`] === 'true' ? null : admissionRoute === undefined ? resolveBotProxy(username, PROXY_GROUPS, PROXY_DEFAULT) : admissionRoute
 if (!proxy) return undefined
 return proxy.type === 'http'
 ? makeHttpConnect(targetHost, targetPort, onLog, proxy)
@@ -691,7 +773,7 @@ if (typeof str !== 'string') str = String(str ?? '')
 if (str.length > MAX_SANITIZED_LENGTH) {
 str = str.slice(0, MAX_SANITIZED_LENGTH) + ` …[truncated, ${str.length - MAX_SANITIZED_LENGTH} more chars]`
 }
-return str
+return safeDisplayText(str)
 }
 function escBlessed(str) {
 const tags = []
@@ -793,7 +875,9 @@ return null
 // subscribes and renders it in its own format. No interface owns the log pipeline.
 const SYSTEM_ID = '__system__'
 const systemLogs = [] // mirrors a bots[id].logs array, for messages with no associated bot
-const bots = {} // username → { bot, spawnTime, logs[], host, port, version, reconnectAttempts, … }
+const bots = Object.create(null) // username → { bot, spawnTime, logs[], host, port, version, reconnectAttempts, … }
+const shardTracker = createShardTracker()
+const proxyReconnectSlots = new Map() // pace retries sharing the same outbound proxy
 let activeId = null
 function currentActiveId() { return activeId } // read the global from inside handleCommand's shadowed scope
 let tui = null // set by startTUI()
@@ -802,6 +886,78 @@ let markBotsDirtyFn = null
 let webClearFn = null
 const slowBroadcast = createSlowBroadcastManager()
 const slowBroadcastManager = slowBroadcast
+const robotLogin = require(path.join(__dirname, 'robot-login')).createRobotLogin({
+  env: () => process.env, directory: __dirname, io: fs, setTimer: setTimeout, clearTimer: clearTimeout,
+  roster: () => [...BOT_NAMES, ...parseNameList(process.env.BOT_NAMES)],
+  existing: () => Object.keys(bots), blocked: id => Boolean(connectBlockReason(id)),
+  connect: id => createBotInstance(id), close: id => dropFromRoster(id),
+  send: (id, command) => bots[id].bot.chat(command),
+  isPlayerChat: message => Boolean(detectPlayerChat(message)),
+  onAuthenticated: id => bots[id]?.onAdmissionAuthenticated?.(),
+  log: message => logFor(SYSTEM_ID, `{cyan-fg}[login] ${sanitize(message)}{/cyan-fg}`)
+})
+function roamBusy(entry) {
+  if (!entry) return true
+  const id = entry.id || Object.keys(bots).find(id => bots[id] === entry)
+  return robotLogin.isAdmitting(id) || coinflipSessions.has(id) || entry.manualMode || entry.manualSession || entry.manualWindow || entry.crateRoutineRunning || entry.crateLoopRunning || entry.cratesSequenceRunning || entry.inDumpRoutine || entry.dumpOperationActive || entry.inSpawnerRoutine || entry.spawnerDropRunning || entry.inAppleRoutine || entry.bookRoutineRunning || entry.shardshopLoopRunning || entry.aiChatRunning
+}
+const rtpRoaming = require(path.join(__dirname, 'rtp-roaming')).createRtpRoaming({
+  bots, env: () => process.env, directory: __dirname, io: fs, online: botOnline, busy: roamBusy,
+  setTimer: setTimeout, clearTimer: clearTimeout, yieldTurn: () => new Promise(resolve => setImmediate(resolve)),
+  log: (id, message) => logFor(id, `{cyan-fg}[roam] ${sanitize(message)}{/cyan-fg}`)
+})
+
+// Deferred RTP starts never duplicate an in-flight connection, and are
+// cancellable before login/server selection has completed.
+const pendingRtp = new Map()
+let nextRtpConnectionAt = 0
+function cancelPendingRtp(id) {
+  const task = pendingRtp.get(id)
+  if (!task) return false
+  clearTimeout(task.timer)
+  pendingRtp.delete(id)
+  return true
+}
+function startRtpTarget(id) {
+  if (!/^[A-Za-z0-9_]{1,16}$/.test(id) || ['__proto__', 'constructor', 'prototype'].includes(id)) return { ok: false, error: 'Invalid Minecraft username' }
+  if (pendingRtp.has(id)) return { ok: false, error: 'Connection/roaming already queued' }
+  const blocked = connectBlockReason(id)
+  if (blocked) return { ok: false, error: blocked }
+  const entry = bots[id]
+  if (botOnline(entry) && entry.normalStartupReady !== false && !entry.authPending && !robotLogin.isAdmitting(id)) return rtpRoaming.start(id)
+  const connectNeeded = !entry || (!botOnline(entry) && entry.connectionState !== 'connecting')
+  const delay = connectNeeded ? Math.max(0, nextRtpConnectionAt - Date.now()) : 0
+  if (connectNeeded) nextRtpConnectionAt = Date.now() + delay + readDelayMs(process.env.ROBOT_CONNECT_DELAY_MS, 5000)
+  const task = { timer: null, until: Date.now() + delay + readDelayMs(process.env.ROBOT_ADMISSION_TIMEOUT_MS, 180000) }
+  pendingRtp.set(id, task)
+  const check = () => {
+    if (pendingRtp.get(id) !== task) return
+    const current = bots[id]
+    if (!current || Date.now() >= task.until || connectBlockReason(id)) {
+      pendingRtp.delete(id)
+      logFor(SYSTEM_ID, `{yellow-fg}[roam] ${sanitize(id)}: connection/setup failed or timed out; restart explicitly.{/yellow-fg}`)
+      return
+    }
+    if (botOnline(current) && current.normalStartupReady !== false && !current.authPending && !robotLogin.isAdmitting(id)) {
+      pendingRtp.delete(id)
+      const result = rtpRoaming.start(id)
+      if (!result.ok) logFor(id, `{yellow-fg}[roam] ${sanitize(result.error)}{/yellow-fg}`)
+      return
+    }
+    task.timer = setTimeout(check, 500)
+  }
+  task.timer = setTimeout(() => {
+    if (connectNeeded) {
+      const current = bots[id]
+      if (!current || (!botOnline(current) && current.connectionState !== 'connecting')) {
+        try { current?.disconnectManually?.() } catch (_) {}
+        createBotInstance(id, current?.host, current?.port, current?.version)
+      }
+    }
+    check()
+  }, delay)
+  return { ok: true, queued: true }
+}
 
 // ── Manual interact mode (prismarine-viewer 3D + hand-driven controls) ───────
 // /manual-interact turns one bot into a slow, hand-driven avatar: browser 3D
@@ -818,17 +974,9 @@ const manual = createManualControls({ bots, logFor, sanitize, notifyBotsChanged,
 
 // ── Commands known to run locally on a bot rather than sent as raw in-game chat ─
 // ── Coinflip data collection, time series, analytics, and the settings tab ───
-// The registry is what the dashboard's .ENV tab edits. It normally reads
-// process.env itself, but bot.js is loaded under a sandboxed process in the
-// tests, so the value THIS module sees is handed in as the registry default —
-// which keeps a sandbox's environment authoritative while leaving a live
-// override able to beat it.
+// The registry is what the dashboard's .ENV tab edits. Defaults stay independent
+// of .env so removing a file key restores the real default, not a boot snapshot.
 function cfDefine (key, spec) {
-  const fromEnv = process.env[key]
-  if (fromEnv !== undefined && fromEnv !== '') {
-    const parsed = settings.coerce(spec.type || 'string', fromEnv)
-    if (parsed !== null) spec = { ...spec, def: parsed }
-  }
   settings.define(key, spec)
 }
 // Every knob here is registered with the settings registry, which is what makes
@@ -855,6 +1003,11 @@ cfDefine('COINFLIP_COOLDOWN_MAX_RETRIES', { type: 'int', def: 5, min: 1, group: 
 cfDefine('COINFLIP_DEEP_MIN_BUCKET', { type: 'int', def: 20, min: 1, group: 'Coinflip', desc: 'Flips a bucket needs before /bot-coinflip deep treats it as evidence rather than an anecdote' })
 cfDefine('COINFLIP_DEEP_Q', { type: 'number', def: 0.05, min: 0.0001, max: 0.5, group: 'Coinflip', desc: 'False-discovery rate a dissection must beat to count as a finding (Benjamini-Hochberg, across every test)' })
 cfDefine('COINFLIP_TZ_OFFSET_MIN', { type: 'int', def: -new Date().getTimezoneOffset(), min: -840, max: 840, group: 'Coinflip', desc: 'Minutes from UTC used for the hour-of-day dissection when a record has no server timestamp' })
+cfDefine('SHARD_SAMPLE_INTERVAL_MS', { type: 'ms', def: 60000, min: 60000, max: 120000, group: 'Shards', desc: 'Per-bot balance sampling interval; staggered and skipped during routines' })
+cfDefine('CRATE_COMMAND_COOLDOWN_MS', { type: 'ms', def: 6000, min: 1000, max: 300000, group: 'Timing', desc: 'Minimum gap before /warp crates and between cooldown retries' })
+cfDefine('CRATE_WARP_SETTLE_MS', { type: 'ms', def: 7000, min: 1000, max: 300000, group: 'Timing', desc: 'Wait for crate warp and cooldown replies before scanning' })
+cfDefine('PROXY_RECONNECT_STAGGER_MS', { type: 'ms', def: 5000, min: 1000, max: 60000, group: 'Connection', desc: 'Minimum retry spacing for bots sharing a proxy endpoint' })
+cfDefine('RECONNECT_STABLE_MS', { type: 'ms', def: 120000, min: 60000, max: 600000, group: 'Connection', desc: 'Healthy spawned time required before resetting retry backoff' })
 cfDefine('TIMESERIES_ENABLED', { type: 'bool', def: true, group: 'Time series', desc: 'Record samples to the data folder' })
 cfDefine('TIMESERIES_INTERVAL_MS', { type: 'ms', def: 3600000, min: 60000, group: 'Time series', desc: 'How often a sample is taken (default hourly)' })
 cfDefine('TIMESERIES_RANK_INTERVAL_MS', { type: 'ms', def: 21600000, min: 0, group: 'Time series', desc: 'How often ranks are probed (0 disables — each probe costs a /fix)' })
@@ -887,26 +1040,96 @@ cfDefine('EAPPLE_KIT_SLOT', { type: 'int', def: 14, min: 0, group: 'Kits', desc:
 cfDefine('EAPPLE_REWARD_SLOTS', { type: 'string', def: '21,15,13,11', group: 'Kits', desc: 'One /ege pass per slot: /kits → kit slot → this slot → /dispose (live)' })
 cfDefine('EAPPLE_DISPOSE_ITEMS', { type: 'string', def: 'experience_bottle,golden_apple,shield,totem_of_undying,*shulker_box', group: 'Kits', desc: 'Comma-separated globs moved into /dispose — exact names keep enchanted_golden_apple safe (live)' })
 cfDefine('EAPPLE_STEP_DELAY_MS', { type: 'ms', def: 1200, min: 100, group: 'Kits', desc: 'Pause between /ege GUI clicks and window opens (live)' })
-cfDefine('LOGIN_PASSWORD', { type: 'string', def: '123456', group: 'Auth', desc: 'Global /register + /login password. Resolved at each auth attempt, so a change applies to the next /auth-retry — a per-bot or group password is read at boot and still wins for those bots' })
-cfDefine('HOST', { type: 'string', def: 'play.fatalmc.org', group: 'Server', live: false, desc: 'Default server host (startup-only)' })
-cfDefine('PORT', { type: 'int', def: 25565, group: 'Server', live: false, desc: 'Default server port (startup-only)' })
-cfDefine('VERSION', { type: 'string', def: '1.21.2', group: 'Server', live: false, desc: 'Minecraft version to connect with (startup-only)' })
+cfDefine('LOGIN_PASSWORD', { type: 'string', def: '123456', group: 'Auth', desc: 'Live global account password; per-bot and group credentials remain higher priority for .env roster bots' })
+cfDefine('HOST', { type: 'string', def: 'play.fatalmc.org', group: 'Server', desc: 'Host used for future new connections; live sockets unchanged' })
+cfDefine('PORT', { type: 'int', def: 25565, min: 1, max: 65535, group: 'Server', desc: 'Port used for future new connections; live sockets unchanged' })
+cfDefine('VERSION', { type: 'string', def: '1.21.2', group: 'Server', desc: 'Version used for future new connections; live sockets unchanged' })
 cfDefine('BOT_NAMES', { type: 'list', group: 'Server', live: false, desc: 'The roster (startup-only — edit the file and restart to change it)' })
 cfDefine('CONNECT_DELAY_MS', { type: 'ms', def: 39500, min: 0, group: 'Timing', live: false, desc: 'Gap between initial bot connects (startup-only)' })
-// These six are read once while bot.js loads, so they are registered as
-// startup-only. The .ENV tab still shows and sets them, but it says plainly
-// that the running process keeps its old value — claiming otherwise is exactly
-// the lie this registry exists to prevent. Both /crates-all flags override the
-// Crates defaults per run, so the common change needs no restart at all.
-cfDefine('CRATES_ALL_DUMP', { type: 'string', def: 'tpa', group: 'Crates', live: false, desc: 'Default dump step for /crates-all (off|tpa|home|hidden|player:<name>). Startup-only; the per-run dump= flag overrides it' })
-cfDefine('CRATES_ALL_AFK_WARP', { type: 'bool', def: true, group: 'Crates', live: false, desc: 'Whether /crates-all warps back to AFK. Startup-only; afk=off overrides it per run' })
-cfDefine('CRATES_ALL_AFK_DELAY_MS', { type: 'ms', def: 15000, min: 0, group: 'Crates', live: false, desc: 'Delay before that AFK warp (0 = immediately). Startup-only; afk=now overrides it per run' })
-cfDefine('DUMP_HOME_COMMAND', { type: 'string', def: '/home stash', group: 'Dump', live: false, desc: 'The /home command used by dump=home (startup-only)' })
-cfDefine('TPA_MAIN_PLAYER', { type: 'string', def: (process.env.TPA_MAIN_PLAYER || process.env.TPA_TARGET_PLAYER || '').trim(), group: 'Dump', live: false, desc: 'Default /tpa target for the dump step (startup-only; TPA_TARGET_PLAYER is still read as an alias)' })
-cfDefine('WARP_COMMAND', { type: 'string', def: '/warp afk', group: 'Dump', live: false, desc: 'The AFK warp command (startup-only)' })
+// Routine defaults refresh on file changes and temporary overrides. Only
+// roster/listener wiring remains restart-only; per-run flags still take priority.
+cfDefine('CRATES_ALL_DUMP', { type: 'string', def: 'tpa', group: 'Crates', desc: 'Live default dump step for /crates-all (off|tpa|home|hidden|player:<name>)' })
+cfDefine('CRATES_ALL_AFK_WARP', { type: 'bool', def: true, group: 'Crates', desc: 'Live default for the final AFK warp; afk=off overrides it per run' })
+cfDefine('CRATES_ALL_AFK_DELAY_MS', { type: 'ms', def: 15000, min: 0, group: 'Crates', desc: 'Live delay before the AFK warp (0 = immediately); afk= overrides per run' })
+cfDefine('DUMP_HOME_COMMAND', { type: 'string', def: '/home stash', group: 'Dump', desc: 'Live /home command used by dump=home' })
+cfDefine('TPA_MAIN_PLAYER', { type: 'string', def: '', group: 'Dump', desc: 'Live default /tpa target; TPA_TARGET_PLAYER remains an alias' })
+cfDefine('WARP_COMMAND', { type: 'string', def: '/warp afk', group: 'Dump', desc: 'Live AFK warp command' })
 cfDefine('WEB_PORT', { type: 'int', def: 80, min: 1, max: 65535, group: 'Dashboard', live: false, desc: 'Dashboard port (startup-only)' })
 cfDefine('WEB_PASSWORD', { type: 'string', group: 'Dashboard', live: false, desc: 'Dashboard login (startup-only; leave empty for a generated one)' })
 cfDefine('TOR_CONTROL_PORTS', { type: 'string', def: '', group: 'Tor', desc: 'Tor control ports for /tor-newnym and the dashboard button — empty = every local proxy SOCKS port + 1, matching scripts/restart-tor.sh (live)' })
+cfDefine('TOR_ROTATE_DELAY_MS', { type: 'string', def: '5000', group: 'Tor', desc: 'Delay between bot reconnects during a /tor-newnym rotation, so a group rotate does not hit the login rate limit at once (live)' })
+
+// Refresh mutable tunables on file/override edits and before command/auth use.
+// Ports, storage paths, boot roster, interval wiring and existing sockets stay
+// restart-only; connection credentials/routes are used by future connections.
+function refreshRuntimeConfig() {
+HOST = process.env.HOST || 'play.fatalmc.org'
+PORT = readInt(process.env.PORT, 25565, 1, 65535)
+VERSION = process.env.VERSION || '1.21.2'
+BOT_PASSWORDS = parseBotPasswords(process.env)
+PROXY_GROUPS = parseProxyGroups(process.env)
+PROXY_GROUPS_ENABLED = PROXY_GROUPS.length > 0
+PROXY_DEFAULT = process.env.PROXY_HOST ? { host: process.env.PROXY_HOST, port: readInt(process.env.PROXY_PORT, 1080, 1, 65535), type: (process.env.PROXY_TYPE || 'socks5').toLowerCase(), user: process.env.PROXY_USER || '', pass: process.env.PROXY_PASS ?? process.env.PROXY_PASSWORD ?? '' } : null
+MAX_RECONNECT = readInt(process.env.MAX_RECONNECT, 17, 1, 100)
+GUI_SLOT = readInt(process.env.GUI_SLOT, 11, 1, 200)
+WARP_AFK = settings.get('WARP_COMMAND') || '/warp afk'
+WARP_BEFORE_CRATE = (process.env.WARP_BEFORE_CRATE ?? process.env.WARPORNOT ?? 'true').toLowerCase() !== 'false'
+SERVER_COMMAND = (process.env.SERVER_COMMAND || '').trim()
+CLICK_COMPASS_ENABLED = /^(1|true|yes|on)$/i.test(process.env.CLICK_COMPASS || '')
+TPA_MAIN_PLAYER = (settings.get('TPA_MAIN_PLAYER') || process.env.TPA_TARGET_PLAYER || '').trim()
+TPA_TRUSTED_BOTS = parseNameList(process.env.TPA_TRUSTED_BOTS || BOT_NAMES.join(','))
+DUMP_HOME_COMMAND = settings.get('DUMP_HOME_COMMAND') || '/home stash'
+CRATES_ALL_DUMP_ENV = parseCratesAllDump(settings.get('CRATES_ALL_DUMP'))
+CRATES_ALL_AFK_WARP = settings.get('CRATES_ALL_AFK_WARP')
+CRATES_ALL_AFK_DELAY_MS = settings.get('CRATES_ALL_AFK_DELAY_MS')
+CRATES_ALL_STAGGER_MS = readInt(process.env.CRATES_ALL_STAGGER_MS, 30000, 0, 2147483647)
+CRATES_ALL_STEP_WAIT_MS = readDelayMs(process.env.CRATES_ALL_STEP_WAIT_MS, 3000)
+CRATE_CLICK_DELAY_MS = readDelayMs(process.env.CRATE_CLICK_DELAY_MS, 900)
+CRATE_CLICK_TIMEOUT_MS = readDelayMs(process.env.CRATE_CLICK_TIMEOUT_MS, 180000)
+WARP_CRATES = process.env.CRATE_COMMAND || '/warp crates'
+CRATE_SHULKER_BLOCK = process.env.CRATE_SHULKER_BLOCK || 'red_shulker_box'
+CRATE_SCAN_RADIUS = readInt(process.env.CRATE_SCAN_RADIUS, 20, 1, 256)
+CRATE_REACH = readNumber(process.env.CRATE_REACH, 3.5, 0.5, 10)
+SHARDSHOP_LOOP_DELAY_MS = readDelayMs(process.env.SHARDSHOP_LOOP_DELAY_MS, 4200)
+SHARDSHOP_LOOP_TIMEOUT_MS = readDelayMs(process.env.SHARDSHOP_LOOP_TIMEOUT_MS, 60000)
+SHARDSHOP_LOOP_MAX_RUNS = readInt(process.env.SHARDSHOP_LOOP_MAX_RUNS, 200, 1, 10000)
+SHARDSHOP_STOP_PHRASES = (process.env.SHARDSHOP_STOP_PHRASES || 'insufficent fund,not enough,insufficient fund,no more shards,more shards').split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+CHAT_WATCHDOG_TIMEOUT_MS = readDelayMs(process.env.CHAT_WATCHDOG_TIMEOUT_MS, 600000)
+CHAT_WATCHDOG_COMMAND = (process.env.CHAT_WATCHDOG_COMMAND || '').trim()
+GUI_ITEM_SEARCH_ENABLED = /^(1|true|yes|on)$/i.test(process.env.GUI_ITEM_SEARCH_ENABLED || '')
+GUI_ITEM_SEARCH_TERMS = process.env.GUI_ITEM_SEARCH_TERMS || 'fatal|red;crate|key|candle'
+GUI_ITEM_SEARCH_GROUPS = GUI_ITEM_SEARCH_TERMS.split(';').map(group => group.split('|').map(s => s.trim().toLowerCase()).filter(Boolean)).filter(group => group.length)
+SPAWNER_REACH = readNumber(process.env.SPAWNER_REACH, 4.5, 0.5, 10)
+SPAWNER_MAX_COUNT = readInt(process.env.SPAWNER_MAX_COUNT, 64, 1, 1000)
+SPAWNER_SLOT_FIRST = readInt(process.env.SPAWNER_SLOT_FIRST, 13, 1, 200)
+SPAWNER_SLOT_SECOND = readInt(process.env.SPAWNER_SLOT_SECOND, 53, 1, 200)
+SPAWNER_WINDOW_WAIT_MS = readDelayMs(process.env.SPAWNER_WINDOW_WAIT_MS, 3000)
+SPAWNER_SLOT_DELAY_MS = readDelayMs(process.env.SPAWNER_SLOT_DELAY_MS, 1500)
+SPAWNER_NEXT_DELAY_MS = readDelayMs(process.env.SPAWNER_NEXT_DELAY_MS, 1500)
+DUMP_TPA_TIMEOUT_MS = readDelayMs(process.env.DUMP_TPA_TIMEOUT_MS, 45000)
+DUMP_SETTLE_MS = readDelayMs(process.env.DUMP_SETTLE_MS, 2500)
+DUMP_WARP_DELAY_MS = readDelayMs(process.env.DUMP_WARP_DELAY_MS, 2500)
+DUMP_CLICK_DELAY_MS = readDelayMs(process.env.DUMP_CLICK_DELAY_MS, 120)
+DUMP_CLICK_CONFIRM_MS = Math.max(250, readDelayMs(process.env.DUMP_CLICK_CONFIRM_MS, 1500))
+DUMP_OPEN_TIMEOUT_MS = readDelayMs(process.env.DUMP_OPEN_TIMEOUT_MS, 15000)
+CHEST_SCAN_RADIUS = readNumber(process.env.CHEST_SCAN_RADIUS, 30, 1, 256)
+CHEST_SCAN_COUNT = readInt(process.env.CHEST_SCAN_COUNT, 50, 1, 500)
+DATA_WEBHOOK_URL = (process.env.DATA_WEBHOOK_URL || '').trim()
+DATA_WEBHOOK_SECRET = (process.env.DATA_WEBHOOK_SECRET || '').trim()
+DATA_WEBHOOK_TIMEOUT_MS = readDelayMs(process.env.DATA_WEBHOOK_TIMEOUT_MS, 15000)
+}
+for (const key of ['LOGIN_PASSWORD_1', 'LOGIN_PASSWORD_2']) cfDefine(key, { type: 'string', def: '', group: 'Auth', desc: 'Alternative password for robot.txt admissions only (live)' })
+for (const [key, def] of Object.entries({ ROBOT_CONNECT_DELAY_MS: 5000, ROBOT_PASSWORD_DELAY_MS: 1500, ROBOT_ADMISSION_TIMEOUT_MS: 180000, RTP_INTERVAL_MS: 34800, RTP_ARRIVAL_TIMEOUT_MS: 30000, BASE_SCAN_INTERVAL_MS: 12000, RTP_PAUSE_ON_BASE_MS: 600000, FOOD_CHECK_INTERVAL_MS: 5000, PLAYER_PROXIMITY_INTERVAL_MS: 5000, PLAYER_PROXIMITY_COOLDOWN_MS: 300000, DISCORD_OFFLINE_REMINDER_MS: 1800000, DISCORD_STARTUP_GRACE_MS: 120000 })) cfDefine(key, { type: 'ms', def, min: key === 'DISCORD_OFFLINE_REMINDER_MS' || key === 'DISCORD_STARTUP_GRACE_MS' ? 0 : 1, max: 2147483647, group: key.startsWith('ROBOT_') ? 'Admission' : key.startsWith('DISCORD_') ? 'Monitoring' : 'Roaming', desc: 'Live delay, applied at the next scheduling decision' })
+cfDefine('BOT_RTP_BOTS', { type: 'string', def: '', group: 'Roaming', desc: 'Comma-separated connected accounts selected by bare /start-rtp' })
+cfDefine('RTP_COMMAND', { type: 'string', def: '/rtp world world', group: 'Roaming', desc: 'Live RTP command' })
+for (const [key, def, min, max] of [['BASE_SCAN_RADIUS', 192, 16, 512], ['BASE_ALERT_THRESHOLD', 4, 1, 4096], ['PLAYER_PROXIMITY_RADIUS', 32, 1, 256], ['FOOD_EAT_THRESHOLD', 18, 0, 20], ['RTP_MIN_MOVE_BLOCKS', 16, 1, 1000]]) cfDefine(key, { type: 'number', def, min, max, group: 'Roaming', desc: 'Live roam tuning' })
+for (const key of ['DISCORD_NOTIFICATIONS', 'DISCORD_VERBOSE_ALERTS']) cfDefine(key, { type: 'bool', def: key !== 'DISCORD_VERBOSE_ALERTS', group: 'Monitoring', desc: 'Verbose alerts are opt-in; default is fleet outage only' })
+for (const key of ['DISCORD_WEBHOOK_URL', 'DISCORD_USER_ID']) cfDefine(key, { type: 'string', def: '', group: 'Monitoring', desc: 'Live fleet-outage notification destination' })
+for (const [key, def, min, max] of [['CRATES_ALL_STAGGER_MS', 30000, 0, 2147483647], ['CRATES_ALL_STEP_WAIT_MS', 3000, 1, 2147483647], ['CRATE_CLICK_DELAY_MS', 900, 1, 2147483647], ['CRATE_CLICK_TIMEOUT_MS', 180000, 1, 2147483647], ['SHARDSHOP_LOOP_DELAY_MS', 4200, 1, 2147483647], ['SHARDSHOP_LOOP_TIMEOUT_MS', 60000, 1, 2147483647], ['SPAWNER_WINDOW_WAIT_MS', 3000, 1, 2147483647], ['SPAWNER_SLOT_DELAY_MS', 1500, 1, 2147483647], ['SPAWNER_NEXT_DELAY_MS', 1500, 1, 2147483647], ['DUMP_TPA_TIMEOUT_MS', 45000, 1, 2147483647], ['DUMP_SETTLE_MS', 2500, 1, 2147483647], ['DUMP_WARP_DELAY_MS', 2500, 1, 2147483647], ['DUMP_CLICK_DELAY_MS', 120, 1, 2147483647], ['DUMP_CLICK_CONFIRM_MS', 1500, 250, 2147483647], ['DUMP_OPEN_TIMEOUT_MS', 15000, 1, 2147483647], ['CHAT_WATCHDOG_TIMEOUT_MS', 600000, 1, 2147483647], ['DATA_WEBHOOK_TIMEOUT_MS', 15000, 1, 2147483647]]) cfDefine(key, { type: 'ms', def, min, max, group: 'Timing', desc: 'Live routine timing; used at the next step/scheduling decision' })
+for (const [key, def, min, max] of [['MAX_RECONNECT', 17, 1, 100], ['GUI_SLOT', 11, 1, 200], ['CRATE_SCAN_RADIUS', 20, 1, 256], ['SPAWNER_MAX_COUNT', 64, 1, 1000], ['SPAWNER_SLOT_FIRST', 13, 1, 200], ['SPAWNER_SLOT_SECOND', 53, 1, 200], ['CHEST_SCAN_COUNT', 50, 1, 500], ['SHARDSHOP_LOOP_MAX_RUNS', 200, 1, 10000]]) cfDefine(key, { type: 'int', def, min, max, group: 'Routines', desc: 'Live routine tuning' })
+for (const [key, def, min, max] of [['CRATE_REACH', 3.5, 0.5, 10], ['SPAWNER_REACH', 4.5, 0.5, 10], ['CHEST_SCAN_RADIUS', 30, 1, 256]]) cfDefine(key, { type: 'number', def, min, max, group: 'Routines', desc: 'Live scan/reach tuning' })
+for (const [key, def] of [['SERVER_COMMAND', ''], ['CRATE_COMMAND', '/warp crates'], ['CRATE_SHULKER_BLOCK', 'red_shulker_box'], ['GUI_ITEM_SEARCH_TERMS', 'fatal|red;crate|key|candle'], ['SHARDSHOP_STOP_PHRASES', 'insufficent fund,not enough,insufficient fund,no more shards,more shards'], ['CHAT_WATCHDOG_COMMAND', ''], ['DATA_WEBHOOK_URL', ''], ['DATA_WEBHOOK_SECRET', ''], ['BOT_PASSWORDS', ''], ['TPA_TRUSTED_BOTS', '']]) cfDefine(key, { type: 'string', def, group: 'Routines', desc: 'Live configuration; does not replace existing connections' })
+for (const [key, def] of [['CLICK_COMPASS', false], ['GUI_ITEM_SEARCH_ENABLED', false], ['WARP_BEFORE_CRATE', true]]) cfDefine(key, { type: 'bool', def, group: 'Routines', desc: 'Live routine switch' })
 
 const COINFLIP_FILE = process.env.COINFLIP_FILE || path.join(__dirname, 'data', 'coinflip-history.jsonl')
 const COINFLIP_SUMMARY_FILE = process.env.COINFLIP_SUMMARY_FILE || path.join(__dirname, 'data', 'coinflip-stats.json')
@@ -930,14 +1153,14 @@ const spawnerDrop = require(path.join(__dirname, 'spawner-drop')).createSpawnerD
   defaults: () => ({ durationMs: settings.get('SPAWNER_DROP_DURATION_MS'), cooldownMs: settings.get('SPAWNER_DROP_COOLDOWN_MS'), mode: settings.get('SPAWNER_DROP_MODE'), scope: settings.get('SPAWNER_DROP_SCOPE'), terms: [settings.get('SPAWNER_DROP_MATCH')] })
 })
 
-const LOCAL_COMMANDS = ['/evidence', '/connection', '/spawner-drop', '/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dump-spawners', '/dc', '/reconnect', '/crates', '/crates-loop', '/spawners', '/data', '/shardshop-loop', '/closeBot', '/bot-coinflip', '/bot-coinflip-all', '/ai-chat', '/repeat', '/use-book', '/enchanted-golden-apple-extract', '/ege', '/scripts', '/run-script']
+const LOCAL_COMMANDS = ['/server-commands', '/start-rtp', '/stop-rtp', '/evidence', '/connection', '/spawner-drop', '/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dump-spawners', '/dc', '/reconnect', '/crates', '/crates-loop', '/spawners', '/data', '/shardshop-loop', '/closeBot', '/bot-coinflip', '/bot-coinflip-all', '/ai-chat', '/repeat', '/use-book', '/enchanted-golden-apple-extract', '/ege', '/scripts', '/run-script']
 
 const logSubscribers = new Set()
 function subscribeLog(fn) { logSubscribers.add(fn); return () => logSubscribers.delete(fn) }
 
 function logFor(id, msg) {
 if (id !== SYSTEM_ID && !bots[id]) return
-const line = `${timestamp()} ${msg}`
+const line = `${timestamp()} ${safeDisplayText(msg)}`
 evidenceStore.captureDumpLine(id, line)
 const store = id === SYSTEM_ID ? systemLogs : bots[id].logs
 store.push({ text: line, time: Date.now() })
@@ -968,8 +1191,18 @@ function dispatchCommandToBot (msg, id) {
   const command = String(msg || '').trim()
   if (!command) return false
   if (!bots[id]) return false
+  if (bots[id]?.rtpRunning && !/^\/(?:status|connection|coordinates|evidence|stop-rtp|start-rtp)(?:\s|$)/.test(command)) {
+    logFor(id, '{yellow-fg}⚠ Stop roaming before broadcasting another operation to this bot.{/yellow-fg}')
+    return false
+  }
   if (manual.routeCommand(command, id)) return true
-  if (LOCAL_COMMANDS.includes(command.split(/\s+/)[0])) {
+  const verb = command.split(/\s+/)[0]
+  if (['/all', '/all-slow', '/start-login', '/new-gen', '/crates-all', '/bot-coinflip-all', '/reconnect-all', '/unban-all', '/exit', '/cron'].includes(verb)) {
+    logFor(id, '{yellow-fg}⚠ Fleet-wide command cannot be nested in a per-bot broadcast; run it directly.{/yellow-fg}')
+    return false
+  }
+  if (verb === '/start-rtp' || verb === '/stop-rtp') { handleCommand(`${verb} ${id}`, { selectedId: id }); return true }
+  if (verb === '/crates-solo' || LOCAL_COMMANDS.includes(verb)) {
     // Reuse the single-bot router so arguments (e.g. /crates purple) survive.
     handleCommand(command, { selectedId: id })
     return true
@@ -1089,6 +1322,11 @@ rssMB: Math.round(m.rss / 1048576), heapMB: Math.round(m.heapUsed / 1048576),
 uptimeSec: Math.floor(process.uptime()), clients: webHandle ? webHandle.clients.size : 0,
 evlLagMs, logPerSec: Math.round(logRateWindow / 2),
 bots: Object.keys(bots).length, online: Object.values(bots).filter(botOnline).length,
+shardsPerMinute: Object.keys(bots).reduce((sum, id) => {
+  const rate = botOnline(bots[id]) ? shardTracker.snapshot(id).shardsPerMinute : null
+  return rate == null ? sum : (sum == null ? 0 : sum) + rate
+}, null),
+shardsRateBots: Object.keys(bots).filter(id => botOnline(bots[id]) && shardTracker.snapshot(id).shardsPerMinute != null).length,
 memory: monitoring ? monitoring.getMemorySnapshot() : null
 }
 }
@@ -1096,7 +1334,13 @@ memory: monitoring ? monitoring.getMemorySnapshot() : null
 monitoring = createMonitoring({
   logFor, systemId: SYSTEM_ID, sanitize,
   getStats: () => globalStats(),
-  getBotCount: () => Object.keys(bots).length
+  getBotCount: () => Object.keys(bots).length,
+  getFleetHealth: () => {
+    const entries = Object.entries(bots).filter(([id, entry]) => !robotLogin.isAdmitting(id) && !connectBlockReason(id) && !(entry.connectionState === 'connecting' && !entry.everOnline))
+    if (initialPending > 0) return { ready: false }
+    if (startupSettledAt == null) startupSettledAt = Date.now()
+    return { ready: Date.now() - startupSettledAt >= settings.get('DISCORD_STARTUP_GRACE_MS'), total: entries.length, online: entries.filter(([, e]) => botOnline(e)).length }
+  }
 })
 
 function botSnapshot() {
@@ -1108,6 +1352,9 @@ if (typeof ping === 'number') { histArr.push(Math.max(0, ping)); if (histArr.len
 const online = botOnline(e)
 return {
 id, online, number: Object.keys(bots).indexOf(id) + 1,
+...shardTracker.snapshot(id),
+shardsPerMinute: online ? shardTracker.snapshot(id).shardsPerMinute : null,
+nextReconnectAt: e.nextReconnectAt || null,
 state: online ? 'online' : dataState.bots[id]?.banned ? 'banned' : e.connectionState || 'disconnected',
 disconnectedAt: e.disconnectedAt || null,
 disconnectReason: sanitize(e.lastDisconnectReason || dataState.bots[id]?.banReason || ''),
@@ -1126,6 +1373,8 @@ authKind: authState.get(id)?.failure ? escHtml(sanitize(authState.get(id).failur
 authReason: authState.get(id)?.failure ? escHtml(sanitize(authState.get(id).failure.reason)) : null,
 coinflip: coinflipSessions.get(id) || coinflipLastRun.get(id) || null,
 pingHist: histArr,
+serverCommandsUpdatedAt: e.serverCommandsUpdatedAt || null,
+serverCommandCount: e.serverCommands?.length || 0,
 manual: manual.snapshotFor(e),
 // connecting: bot exists but hasn't spawned yet (useful for filtering in web UI)
 connecting: !online && !dataState.bots[id]?.banned && e.connectionState === 'connecting'
@@ -1137,6 +1386,32 @@ connecting: !online && !dataState.bots[id]?.banned && e.connectionState === 'con
   disconnectReason: sanitize(row.reason || dataState.bots[row.bot]?.banReason || 'On removed list'),
   disconnectedAt: dataState.bots[row.bot]?.bannedAt || null, pingHist: []
 })))
+}
+function serverCommandSnapshot(id) {
+const entry = bots[id]
+return { bot: id || null, online: botOnline(entry), received: Boolean(entry?.serverCommandsReceived), source: entry?.serverCommandSource || null, updatedAt: entry?.serverCommandsUpdatedAt || null, commands: entry?.serverCommands || [] }
+}
+function commandTableFor(id) {
+const table = Object.assign(Object.create(null), COMMANDS)
+for (const row of bots[id]?.serverCommands || []) if (!Object.keys(COMMANDS).some(key => key.split(' ')[0] === row.command)) table[row.command] = 'Server command — ' + row.usages.slice(1, 4).join(' | ')
+return table
+}
+async function refreshServerCommands(id) {
+const entry = bots[id]
+if (!botOnline(entry) || typeof entry.bot.tabComplete !== 'function') throw new Error('Select an online bot; this server has not advertised commands yet')
+const now = Date.now()
+if (entry.serverCommandRefreshAt && now - entry.serverCommandRefreshAt < 5000) throw new Error('Wait five seconds before refreshing commands again')
+entry.serverCommandRefreshAt = now
+const rows = decodeCompletions(await entry.bot.tabComplete('/', false, true, 3000))
+if (bots[id] !== entry || !botOnline(entry)) throw new Error('Bot disconnected during discovery')
+if (!entry.serverCommandsReceived || entry.serverCommandSource !== 'tree') {
+entry.serverCommands = rows
+entry.serverCommandsReceived = true
+entry.serverCommandSource = 'tab-completion'
+entry.serverCommandsUpdatedAt = Date.now()
+notifyBotsChanged()
+}
+return serverCommandSnapshot(id)
 }
 function notifyBotsChanged() {
 if (tui) { try { tui.updateHeader() } catch (_) {} }
@@ -1162,13 +1437,30 @@ const MAX_HISTORY = 500
 const commandHistory = (() => {
 try {
 const data = fs.readFileSync(HISTORY_FILE, 'utf8')
-return data.split('\n').filter(Boolean).slice(-MAX_HISTORY)
+return data.split('\n').filter(Boolean).slice(-MAX_HISTORY).map(commandForLog)
 } catch (_) { return [] }
 })()
 function saveHistory() {
 try { fs.writeFileSync(HISTORY_FILE, commandHistory.join('\n') + '\n') } catch (_) {}
 }
+function safeDisplayText(value) {
+let text = String(value ?? '')
+// Auth commands must never become logs/history, including nested /chat and chains.
+text = text.replace(/(\/(?:login|register|changepassword|changepass)\b)\s+[^;\n&{}]*/gi, '$1 [redacted]')
+for (const [key, secret] of Object.entries(process.env)) {
+if (!settings.isSecret(key) || typeof secret !== 'string' || !secret) continue
+// Long raw credentials can occur in exception messages/server echoes.
+if (secret.length >= 4) text = text.split(secret).join('[redacted]')
+}
+// Block terminal escape/control injection from remote server text.
+return text.replace(/\x1b\][^\x07]*(?:\x07|$)/g, '').replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '')
+}
+function commandForLog(trimmed) {
+const redacted = String(trimmed).replace(/(\/env\s+set\s+\S+)\s+([^;&]*)/gi, (whole, prefix) => settings.isSecret(prefix.split(/\s+/).pop()) ? `${prefix} [redacted]` : whole)
+return safeDisplayText(redacted)
+}
 function recordHistory(trimmed) {
+trimmed = commandForLog(trimmed)
 if (commandHistory[commandHistory.length - 1] !== trimmed) {
 commandHistory.push(trimmed)
 if (commandHistory.length > MAX_HISTORY) commandHistory.shift()
@@ -1223,7 +1515,7 @@ label: ' Activity Log ',
 tags: true,
 padding: { left: 1, right: 1 },
 style: { border: { fg: 'gray' }, label: { fg: 'cyan', bold: true } },
-scrollable: true, alwaysScroll: true, mouse: true,
+scrollable: true, alwaysScroll: true, mouse: true, scrollback: LOG_VIEW_LINES,
 scrollbar: { ch: '│', style: { fg: 'cyan' } }
 })
 
@@ -1250,9 +1542,10 @@ style: { border: { fg: 'gray' }, label: { fg: 'cyan', bold: true } }
 })
 let tabCyclePrefix = null
 let tabCycleIndex = -1
+let tabCycleMatches = []
 function updateSuggestions () {
 const val = inputBox.getValue()
-const matches = commandSuggestions(val, COMMANDS, 8)
+const matches = commandSuggestions(val, commandTableFor(activeId), 8)
 if (!matches.length) {
 if (!suggestionBox.hidden) { suggestionBox.hide(); debouncedRender() }
 return
@@ -1269,7 +1562,8 @@ screen.append(inputBox)
 screen.append(suggestionBox)
 inputBox.focus()
 
-screen.key(['C-c'], () => process.exit(0))
+screen.key(['C-c'], () => handleCommand('/exit'))
+screen.key(['f2'], () => { handleCommand('/server-commands'); inputBox.focus() })
 
 // Automatically refocus the input box if the user clicks the log box
 logBox.on('click', () => { inputBox.focus() })
@@ -1291,8 +1585,8 @@ function updateHeader() {
 const names = Object.keys(bots)
 const activeIndex = names.indexOf(activeId) + 1
 const activeLabel = activeId ? `Active: [${activeIndex}] ${activeId}` : 'No active bot'
-const others = names.map((n, i) => i !== (activeIndex - 1) ? `[${i + 1}] ${n}` : null).filter(Boolean)
-const othersLabel = others.length ? ` | Others: ${others.join(', ')}` : ''
+const onlineCount = names.filter(id => botOnline(bots[id])).length
+const othersLabel = ` | Online ${onlineCount}/${names.length} | /switch <number> | /server-commands | F2 commands`
 const proxyLabel = PROXY_GROUPS_ENABLED
 ? ` — Proxy: ${PROXY_GROUPS.length} group(s)`
 : PROXY_ENABLED ? ` — Proxy: ${describeProxy(PROXY_DEFAULT)}` : ''
@@ -1332,13 +1626,12 @@ debouncedRender()
 inputBox.key('tab', () => {
 const val = inputBox.getValue()
 if (!val.startsWith('/')) return
-const matches = commandSuggestions(val, COMMANDS, 20)
-if (!matches.length) return
-// Repeated Tab cycles through the matches; typing anything else starts fresh.
-if (val !== tabCyclePrefix) { tabCyclePrefix = val; tabCycleIndex = -1 }
-tabCycleIndex = (tabCycleIndex + 1) % matches.length
+// Preserve the original match set across repeated Tab presses.
+if (val !== tabCyclePrefix) { tabCycleMatches = commandSuggestions(val, commandTableFor(activeId), 20); tabCycleIndex = -1 }
+if (!tabCycleMatches.length) return
+tabCycleIndex = (tabCycleIndex + 1) % tabCycleMatches.length
 // Strip parameter hints (e.g. "/warp <place>" → "/warp ")
-const base = matches[tabCycleIndex].key.replace(/ [<\[].*$/, '')
+const base = tabCycleMatches[tabCycleIndex].key.replace(/ [<\[].*$/, '')
 inputBox.setValue(base + ' ')
 tabCyclePrefix = base + ' '
 debouncedRender()
@@ -1514,6 +1807,7 @@ button.tb:hover{color:var(--txt);border-color:var(--acc)}
 .sg{padding:6px 10px;cursor:pointer;display:flex;gap:10px}
 .sg:hover{background:rgba(45,212,191,.08)}
 .sg b{color:var(--acc);white-space:nowrap}.sg span{color:var(--dim);font-size:11px}
+#torgroup{height:26px;max-width:140px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;color:var(--txt);font-size:11px;padding:0 4px}
 #help{position:absolute;inset:0;background:rgba(6,9,13,.95);z-index:9;overflow:auto;padding:26px}
 #help h3{color:var(--acc);margin-bottom:12px}
 #help .hcmd{display:flex;gap:12px;padding:4px 0;border-bottom:1px solid #141c26}
@@ -1522,7 +1816,7 @@ button.tb:hover{color:var(--txt);border-color:var(--acc)}
 #terminal{position:absolute;inset:0;background:#050708;z-index:40;display:flex;flex-direction:column}
 #terminal[hidden]{display:none}
 .terminal-head{display:flex;justify-content:space-between;align-items:center;padding:9px 12px;background:var(--panel);border-bottom:1px solid var(--line);color:var(--acc)}
-#terminalout{flex:1;overflow:auto;padding:12px;color:#b7f7c5;white-space:pre-wrap;word-break:break-word;font:13px/1.4 ui-monospace,'Cascadia Code','SF Mono',Menlo,Consolas,monospace}
+#terminalout{flex:1;min-height:0;position:relative;overflow:hidden;padding:10px 12px;color:#b7f7c5;font:13px/1.4 ui-monospace,'Cascadia Code','SF Mono',Menlo,Consolas,monospace}
 #terminalform{display:flex;gap:8px;align-items:center;padding:9px 12px;background:var(--panel);border-top:1px solid var(--line)}
 #terminalinput{flex:1;min-width:0;height:32px;background:var(--bg);border:1px solid var(--line);border-radius:6px;color:var(--txt);padding:7px 10px;font:inherit}
 #terminalinput:focus{outline:none;border-color:var(--acc)}
@@ -1531,14 +1825,14 @@ button.tb:hover{color:var(--txt);border-color:var(--acc)}
 .toast.bad{border-left-color:var(--red)}.toast.good{border-left-color:var(--grn)}
 .toast.out{opacity:0;transition:opacity .4s}
 @media(max-width:760px){header{overflow-x:auto}header>*{flex-shrink:0}#chips{flex-wrap:nowrap}#loghead{overflow-x:auto}#loghead>*{flex-shrink:0}#botlist{display:flex;gap:6px}.bot{margin-bottom:0}#app{grid-template-columns:1fr;grid-template-areas:"top" "side" "main";grid-template-rows:46px 160px 1fr}#cmdbar{left:0}#manualbar{left:0;overflow-x:auto;justify-content:flex-start}#search{width:110px}aside{display:flex;gap:6px;overflow-x:auto;overflow-y:hidden}.bot{min-width:180px}.views{min-width:140px;flex-direction:column}}
-</style><script src="/chart.js"></script><script src="/coinflip-dashboard.js"></script></head><body>
+</style><link rel="stylesheet" href="/xterm.css"><script src="/chart.js"></script><script src="/coinflip-dashboard.js"></script><script src="/xterm.js"></script><script src="/xterm-addon-fit.js"></script></head><body>
 <div id="app">
 <header><div class="logo">⛏ AFK<b>CONSOLE</b></div><div id="chips"></div><div id="wsstate" class="wsstate down">offline</div><button id="logout">sign out</button></header>
 <aside><div class="views"><div class="vchip on" data-view="all">ALL</div><div class="vchip" data-view="system">SYSTEM</div><button class="vchip" id="terminalbtn" type="button">TERMINAL</button><button class="vchip" id="envbtn" type="button" title="Temporary .env overrides — nothing is written to disk">.ENV</button><button class="vchip" id="coinflipbtn" type="button" title="Coinflip fleet analytics">COINFLIP</button><!--PLAYBTN--></div><label style="display:flex;align-items:center;gap:6px;padding:4px 0;font-size:11px;color:var(--dim);cursor:pointer"><input type="checkbox" id="show-all-bots" checked style="accent-color:var(--acc)">Show offline bots</label><div id="botlist"></div></aside>
 <main>
 <div id="loghead"><span id="channame">ALL CHANNELS</span><span id="newchip"></span>
 <input id="search" placeholder="filter logs…"><button class="tb" id="topbtn" type="button" title="scroll to top">↑ top</button><button class="tb" id="bottombtn" type="button" title="scroll to newest">↓ bottom</button><button class="tb" id="followbtn" type="button">⏸ pause</button>
-<button class="tb" id="clearbtn">clear</button><button class="tb" id="torbtn" type="button" title="Request fresh Tor circuits — the next reconnects leave through a new path">⟳ tor</button><button class="tb" id="docsbtn" type="button" title="Built-in documentation — commands, /dump grammar, troubleshooting">📚 docs</button><button class="tb" id="helpbtn">? cmds</button></div>
+<button class="tb" id="clearbtn">clear</button><button class="tb" id="torbtn" type="button" title="Request fresh Tor circuits and staggered-reconnect the chosen proxy group so the new path takes effect now">⟳ tor</button><select id="torgroup" class="tb" title="proxy group to rotate"></select><button class="tb" id="docsbtn" type="button" title="Built-in documentation — commands, /dump grammar, troubleshooting">📚 docs</button><button class="tb" id="servercmdsbtn" type="button">server cmds</button><button class="tb" id="helpbtn">? local cmds</button></div>
 <div id="logwrap"><div id="log"></div></div>
 <div id="guitui" hidden></div>
 <div id="manualbar" aria-label="Manual bot controls">
@@ -1571,9 +1865,10 @@ button.tb:hover{color:var(--txt);border-color:var(--acc)}
 <button class="tb" id="sendbtn">send</button>
 </form>
 <div id="help" hidden></div>
+<div id="servercmdspanel" hidden style="position:fixed;inset:0;z-index:40;background:var(--bg);overflow:auto;padding:18px"><div style="max-width:1100px;margin:auto"><div class="ehead"><b>SERVER COMMANDS</b><select id="servercmdbot" aria-label="Command account"></select><input id="servercmdfilter" placeholder="filter server commands…" aria-label="Filter server commands"><button class="tb" id="servercmdrefresh" type="button">refresh</button><button class="tb" id="servercmdclose" type="button">close</button></div><p id="servercmdnote"></p><div id="servercmdbody"></div></div></div>
 <div id="docs" hidden style="position:fixed;inset:0;z-index:40;background:var(--bg);overflow:auto;padding:14px"><div id="docsbox" style="max-width:1100px;margin:0 auto"><div class="ehead"><b>DOCS</b><span class="enote">built-in documentation — type /doc in the command bar to open this panel</span><input id="docsfilter" placeholder="filter docs…" autocomplete="off" spellcheck="false"><button class="tb" id="docsclose" type="button">close</button></div><div id="docsbody">loading…</div></div></div>
 <div id="envpanel" hidden><div id="envbox"><div class="ehead"><b>.ENV</b><span class="enote">temporary — applied to this running process only, and forgotten on the next restart (edit the file for a permanent change)</span><button class="tb" id="envresetall" type="button">reset all</button><button class="tb" id="envclose" type="button">close</button></div><div id="envbody">loading…</div></div></div>
-<div id="terminal" hidden><div class="terminal-head"><b>bash</b><button class="tb" id="terminalclose" type="button">close</button></div><pre id="terminalout"></pre><form id="terminalform"><span class="prompt">$</span><input id="terminalinput" autocomplete="off" spellcheck="false"><button class="tb" type="submit">run</button></form></div>
+<div id="terminal" hidden><div class="terminal-head"><b>bash</b><button class="tb" id="terminalclose" type="button">close</button></div><div id="terminalout"></div><form id="terminalform"><span class="prompt">$</span><input id="terminalinput" autocomplete="off" spellcheck="false"><button class="tb" type="submit">run</button></form></div>
 </main>
 </div>
 <div id="coinflippanel" hidden style="position:absolute;inset:0;z-index:35;background:var(--bg);overflow:auto;padding:14px">
@@ -1598,14 +1893,13 @@ button.tb:hover{color:var(--txt);border-color:var(--acc)}
 <script>
 (function(){
 'use strict'
-var ws=null,view=new URLSearchParams(location.search).get('view')||'all',follow=true,scrollOnNextLog=false,lines=[],hist=[],hIdx=-1,pending=0,cmds={},prevOnline={},botStates={},heldControls={},rcDelay=600,rcTimer=null,rt=null,pollTimer=null,pollBusy=false,terminalOpen=false,terminalEnabled=false
+var ws=null,view=new URLSearchParams(location.search).get('view')||'all',follow=true,scrollOnNextLog=false,lines=[],hist=[],hIdx=-1,pending=0,cmds={},prevOnline={},botStates={},heldControls={},rcDelay=600,rcTimer=null,rt=null,pollTimer=null,pollBusy=false,terminalOpen=false,terminalEnabled=false,torGroups=[]
 function el(i){return document.getElementById(i)}
 function setWsState(kind,text){var state=el('wsstate');state.className='wsstate '+kind;state.textContent=text}
-// Strips ANSI/VT100 escape and control sequences (color codes, cursor moves,
-// title-set OSC sequences, bracketed-paste toggles, etc.) that a real
-// interactive shell (xterm-256color) constantly emits. This is a plain <pre>
-// box, not a full terminal emulator, so those bytes must never be shown raw —
-// left unstripped they render as the "random mystery characters" bug.
+// Fallback renderer only (used if xterm.js fails to load): strips the
+// ANSI/VT100 escape sequences a real interactive shell (xterm-256color)
+// constantly emits. The primary renderer is the xterm.js emulator below, which
+// understands these sequences natively and draws real full-screen TUIs.
 var ANSI_CSI_RE=/\\x1b\\[[0-9;?]*[ -\\/]*[@-~]/g
 var ANSI_OSC_RE=/\\x1b\\][^\\x07\\x1b]*(?:\\x07|\\x1b\\\\)/g
 var ANSI_OTHER_RE=/\\x1b[@-Z\\\\-_]/g
@@ -1617,13 +1911,45 @@ return String(text)
 .replace(ANSI_OTHER_RE,'')
 .replace(CTRL_STRIP_RE,'')
 }
-function terminalWrite(text){var out=el('terminalout');out.textContent+=stripAnsi(text);out.scrollTop=out.scrollHeight}
+function terminalFallbackWrite(text){var out=el('terminalout')
+if(!out.dataset.fb){out.dataset.fb='1';out.style.whiteSpace='pre-wrap';out.style.wordBreak='break-word';out.style.overflow='auto'}
+out.textContent+=stripAnsi(text);out.scrollTop=out.scrollHeight}
+var term=null,termFit=null,termFallback=false
+function termEnsure(){
+if(term||termFallback)return term
+var T=window.Terminal&&(window.Terminal.Terminal||window.Terminal)
+if(typeof T!=='function'){termFallback=true;return null}
+try{
+term=new T({cursorBlink:true,fontSize:13,scrollback:5000,fontFamily:"ui-monospace,'Cascadia Code','SF Mono',Menlo,Consolas,monospace",theme:{background:'#050708',foreground:'#b7f7c5',cursor:'#2dd4bf'}})
+var F=window.FitAddon&&(window.FitAddon.FitAddon||window.FitAddon)
+if(typeof F==='function'){termFit=new F();term.loadAddon(termFit)}
+term.open(el('terminalout'))
+term.onData(function(d){if(!ws||ws.readyState!==1)return
+for(var i=0;i<d.length;i+=4000)ws.send(JSON.stringify({t:'terminal',action:'input',data:d.slice(i,i+4000)}))})
+term.onResize(function(s){if(ws&&ws.readyState===1)ws.send(JSON.stringify({t:'terminal',action:'resize',cols:s.cols,rows:s.rows}))})
+}catch(e){reportClientError('terminal init: '+((e&&e.message)||e),e&&e.stack);try{if(term)term.dispose()}catch(_){ }term=null;termFit=null;termFallback=true}
+return term
+}
+function termFitNow(){
+if(!term)return
+if(termFit){try{termFit.fit()}catch(e){ }}
+if(ws&&ws.readyState===1)ws.send(JSON.stringify({t:'terminal',action:'resize',cols:term.cols,rows:term.rows}))
+}
+function terminalWrite(text){
+var s=typeof text==='string'?text:String(text||'')
+if(term){try{term.write(s)}catch(e){reportClientError('terminal write: '+((e&&e.message)||e),e&&e.stack)}return}
+if(termFallback||!termEnsure()){terminalFallbackWrite(s);return}
+term.write(s)
+}
 function openTerminal(){
 if(!terminalEnabled){toast('SSH terminal is disabled','bad');return}
-if(!ws||ws.readyState!==1){terminalWrite('WebSocket is required for the terminal.\\n');return}
-terminalOpen=true;el('terminal').hidden=false;el('cmdbar').classList.add('cmdbar-hidden');el('terminalinput').focus();ws.send(JSON.stringify({t:'terminal',action:'open'}))
+if(!ws||ws.readyState!==1){toast('WebSocket is required for the terminal','bad');return}
+terminalOpen=true;el('terminal').hidden=false;el('cmdbar').classList.add('cmdbar-hidden')
+termEnsure()
+if(term){termFitNow();term.focus()}else{el('terminalinput').focus()}
+ws.send(JSON.stringify({t:'terminal',action:'open'}))
 }
-function closeTerminal(){terminalOpen=false;el('terminal').hidden=true;el('cmdbar').classList.remove('cmdbar-hidden');if(ws&&ws.readyState===1)ws.send(JSON.stringify({t:'terminal',action:'close'}))}
+function closeTerminal(){terminalOpen=false;el('terminal').hidden=true;el('cmdbar').classList.remove('cmdbar-hidden');if(term){try{term.reset()}catch(e){ }}else{el('terminalout').textContent=''}el('terminalinput').value='';if(ws&&ws.readyState===1)ws.send(JSON.stringify({t:'terminal',action:'close'}))}
 function reportClientError(message,stack){
 try{fetch('/api/client-error',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:String(message),stack:stack?String(stack):''})})}catch(_){}}
 window.addEventListener('error',function(e){reportClientError(e.message||'window error',e.error&&e.error.stack)})
@@ -1648,7 +1974,7 @@ fetch('/api/state?view='+encodeURIComponent(requestedView),{credentials:'same-or
 if(!r.ok)throw Error('HTTP '+r.status)
 return r.json()
 }).then(function(m){
-cmds=m.commands||cmds;hist=m.cmdHistory||hist;terminalEnabled=!!m.terminalEnabled;el('terminalbtn').hidden=!terminalEnabled;renderBots(m.bots||[]);renderStats(m.stats||{});buildHelp();if(view===requestedView)setLines(m.lines||[]);setWsState('up','http fallback')
+cmds=m.commands||cmds;hist=m.cmdHistory||hist;terminalEnabled=!!m.terminalEnabled;el('terminalbtn').hidden=!terminalEnabled;renderTorGroups(m.torGroups||[]);renderBots(m.bots||[]);renderStats(m.stats||{});buildHelp();if(view===requestedView)setLines(m.lines||[]);setWsState('up','http fallback')
 }).catch(function(){setWsState('down','offline')}).then(function(){pollBusy=false})
 }
 poll();pollTimer=setInterval(poll,${WEB_REFRESH_MS})
@@ -1662,14 +1988,14 @@ var endpoint=(location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws'
 try{ws=new WebSocket(endpoint)}catch(e){startHttpFallback();scheduleConnect();return}
 ws.onopen=function(){rcDelay=600;stopHttpFallback();setWsState('up','connected');ws.send(JSON.stringify({t:'sub',id:view}));}
 ws.onmessage=function(ev){var m;try{m=JSON.parse(ev.data)}catch(e){return}
-if(m.t==='hello'){cmds=m.commands||{};hist=m.cmdHistory||[];terminalEnabled=!!m.terminalEnabled;el('terminalbtn').hidden=!terminalEnabled;renderBots(m.bots||[]);renderStats(m.stats||{});buildHelp();toast('connected to console','good')}
+if(m.t==='hello'){cmds=m.commands||{};hist=m.cmdHistory||[];terminalEnabled=!!m.terminalEnabled;el('terminalbtn').hidden=!terminalEnabled;renderTorGroups(m.torGroups||[]);renderBots(m.bots||[]);renderStats(m.stats||{});buildHelp();toast('connected to console','good')}
 else if(m.t==='log'){addLines(m.entries||[])}
 else if(m.t==='bots'){renderBots(m.bots||[]);renderStats(m.stats||{})}
 else if(m.t==='select'){setView(m.id,false)}
 else if(m.t==='history'){if(m.id===view)setLines(m.lines||[])}
 else if(m.t==='clear'){if(m.id===view){lines=[];el('log').innerHTML=''}}
 else if(m.t==='terminal'){terminalWrite(m.data||'')}}
-ws.onclose=function(){releaseAllManualKeys();startHttpFallback();scheduleConnect()}
+ws.onclose=function(event){releaseAllManualKeys();closeTerminal();if(event&&event.code===1008){location.href='/login';return}startHttpFallback();scheduleConnect()}
 ws.onerror=function(){releaseAllManualKeys();startHttpFallback()}
 }
 function setView(v,subscribe){releaseAllManualKeys();view=v;el('selectedId').value=v;lines=[];pending=0;el('log').innerHTML='';el('newchip').style.display='none'
@@ -1682,6 +2008,7 @@ if(subscribe!==false&&ws&&ws.readyState===1)ws.send(JSON.stringify({t:'sub',id:v
 else if(pollTimer)startHttpFallback()
 updateManualBar()
 updateGuiTui()
+if(botStates[v])loadServerCommands(v,false)
 setFollow(true)}
 function scrollBottom(){var w=el('logwrap');w.scrollTop=w.scrollHeight;pending=0;el('newchip').style.display='none'}
 function setFollow(f){follow=f;el('followbtn').textContent=f?'⏸ pause':'▶ follow';if(f)scrollBottom()}
@@ -1810,8 +2137,31 @@ if(!control)return
 releaseManualKey(control,document.querySelector('.mkey[data-control="'+control+'"]'))
 })
 }
+var serverCommandRows=[],serverCommandBot=null,serverCommandVersion=null,serverCommandRequest=0
+function suggestionCommands(){var table=Object.assign({},cmds);if(serverCommandBot===view)serverCommandRows.forEach(function(row){if(!Object.keys(cmds).some(function(k){return k.split(' ')[0]===row.command}))table[row.command]='server — '+row.usages.slice(1,4).join(' | ')});return table}
+function renderServerCommands(){
+var body=el('servercmdbody');body.innerHTML='';var filter=el('servercmdfilter').value.toLowerCase()
+serverCommandRows.filter(function(row){return row.usages.join(' ').toLowerCase().indexOf(filter)>=0}).forEach(function(row){
+var button=document.createElement('button');button.className='tb';button.style.cssText='display:block;width:100%;text-align:left;margin:5px 0;padding:9px;white-space:normal';button.textContent=row.usages.slice(0,5).join(' | ')
+button.onclick=function(){setView(serverCommandBot);cinput.value='/chat '+row.command+' ';el('servercmdspanel').hidden=true;cinput.focus()};body.appendChild(button)})
+}
+function loadServerCommands(id,refresh){
+if(!id)return
+var request=++serverCommandRequest
+fetch('/api/server-commands?bot='+encodeURIComponent(id),{method:refresh?'POST':'GET',credentials:'same-origin',cache:'no-store'}).then(function(r){return r.json().then(function(m){if(!r.ok)throw Error(m.error||'Could not load commands');return m})}).then(function(m){
+if(request!==serverCommandRequest)return
+serverCommandRows=m.commands||[];serverCommandBot=m.bot;serverCommandVersion=m.updatedAt
+el('servercmdnote').textContent=m.bot+': '+serverCommandRows.length+' commands ('+(m.source||'not advertised yet')+'). Only commands exposed to this account are available. Click to prepare a server command; nothing is sent automatically.';renderServerCommands()
+}).catch(function(e){if(request!==serverCommandRequest)return;serverCommandRows=[];el('servercmdnote').textContent=e.message;renderServerCommands()})
+}
+el('servercmdsbtn').onclick=function(){var select=el('servercmdbot');select.innerHTML='';lastBotSnapshot.filter(function(b){return !b.removed}).forEach(function(b){var option=document.createElement('option');option.value=b.id;option.textContent=b.id+(b.online?'':' (offline)');select.appendChild(option)});select.value=botStates[view]?view:(lastBotSnapshot.find(function(b){return b.online})||{}).id||select.value;el('servercmdspanel').hidden=false;loadServerCommands(select.value,false)}
+el('servercmdbot').onchange=function(){loadServerCommands(this.value,false)}
+el('servercmdfilter').oninput=renderServerCommands
+el('servercmdrefresh').onclick=function(){loadServerCommands(el('servercmdbot').value,true)}
+el('servercmdclose').onclick=function(){el('servercmdspanel').hidden=true}
 var lastBotSnapshot=[]
-el('show-all-bots').onchange=function(){renderBots(lastBotSnapshot)}
+try{var offlinePref=localStorage.getItem('afk.showOffline');if(offlinePref!==null)el('show-all-bots').checked=offlinePref==='true'}catch(_){}
+el('show-all-bots').onchange=function(){try{localStorage.setItem('afk.showOffline',String(this.checked))}catch(_){}renderBots(lastBotSnapshot)}
 function renderBots(bs){lastBotSnapshot=bs;var box=el('botlist');box.innerHTML='';botStates={}
 var showAll = el('show-all-bots')?.checked || false
 for(var i=0;i<bs.length;i++){var b=bs[i]
@@ -1820,7 +2170,7 @@ var old=prevOnline[b.id]
 if(old===true&&!b.online)toast(b.id+(b.banned?' was banned':' went offline')+(b.kick?' — '+b.kick:''),'bad')
 if(old===false&&b.online)toast(b.id+' is online','good')
 prevOnline[b.id]=b.online
-if(!showAll && !b.online && !b.connecting && !b.banned && b.id!==view) continue
+if(!showAll && !b.online) continue
 var d=document.createElement('div')
 var cls = 'bot'
 if(b.online) cls += ' on'
@@ -1831,7 +2181,7 @@ d.setAttribute('data-id',b.id)
 var up=b.uptimeSec==null?'':fmtUp(b.uptimeSec)
 var manualHtml=b.manual&&b.manual.mode?'<span class="manual-badge">manual</span>':''
 var guiHtml=b.manual&&(b.manual.guiTui||b.manual.session)?'<span class="manual-badge" style="color:var(--cyan);border-color:rgba(103,232,249,.4)">gui</span>':''
-var bannedHtml=b.banned?'<span class="manual-badge" style="color:var(--red);border-color:rgba(248,113,113,.45)">⛔ banned</span>':''
+var bannedHtml=b.banned?'<span class="manual-badge" style="color:var(--red);border-color:rgba(248,113,113,.45)">⛔ '+(b.banKind==='permanent'||b.banKind==='blacklist'?'perma banned':'banned')+'</span>':''
 var authHtml=b.authFailed?'<span class="manual-badge" style="color:var(--red);border-color:rgba(248,113,113,.45)">🔑 '+b.authKind+'</span>':''
 var viewerHtml=b.manual&&b.manual.viewerPort?'<button class="manual-viewer" type="button" data-port="'+String(b.manual.viewerPort)+'">🌐 viewer</button>':''
 var cfHtml=b.coinflip?'<span class="manual-badge" style="color:var(--cyan);border-color:rgba(103,232,249,.4)">🎲 '+b.coinflip.flips+'/'+b.coinflip.planned+'</span>':''
@@ -1839,6 +2189,7 @@ var offlineHtml = !b.online && !b.connecting ? '<span class="manual-badge" style
 var connectingHtml = b.connecting ? '<span class="manual-badge" style="color:var(--yellow);border-color:rgba(255,200,0,.4)">⏳ connecting</span>' : ''
 d.innerHTML='<div class="bhead"><div class="dot"></div><div class="bname"></div>'+bannedHtml+authHtml+cfHtml+manualHtml+guiHtml+viewerHtml+connectingHtml+offlineHtml+(b.attempts?'<div class="batt">↻'+b.attempts+'</div>':'')+'</div>'
 +'<div class="bmeta"><span>'+(b.ping==null?'—':b.ping)+'ms</span><span>'+(b.health==null?'—':b.health)+'❤</span><span>'+(b.food==null?'—':b.food)+'🍗</span>'+(up?'<span>'+up+'</span>':'')+'</div>'
++'<div class="bmeta" title="Observed positive balance changes, estimated over the last minute; spending between probes can hide production. A dash means warming up, stale, or offline."><span>shards '+(b.shards==null?'—':Number(b.shards).toLocaleString())+'</span><span>≈ '+(b.shardsPerMinute==null?'—':Number(b.shardsPerMinute).toFixed(1))+' shards/min</span></div>'
 +'<canvas width="220" height="16"></canvas>'
 d.querySelector('.bname').textContent=(b.removed?'[removed] ':'['+(b.number||i+1)+'] ')+b.id
 if(b.banned)d.title='Banned'+(b.banKind?' ('+b.banKind+')':'')+(b.kick?' — '+b.kick:'')
@@ -1854,7 +2205,10 @@ if(viewerButton)viewerButton.onclick=(function(port){return function(e){e.preven
 box.appendChild(d)
 drawSpark(d.querySelector('canvas'),b.pingHist||[])}
 updateManualBar()
-updateGuiTui()}
+updateGuiTui()
+var selected=botStates[view]
+if(selected&&(serverCommandBot!==view||serverCommandVersion!==selected.serverCommandsUpdatedAt))loadServerCommands(view,false)
+}
 function drawSpark(cv,h){var ctx=cv.getContext('2d');ctx.clearRect(0,0,cv.width,cv.height)
 if(!h||h.length<2)return
 var mx=0;for(var i=0;i<h.length;i++)mx=Math.max(mx,h[i]);if(mx<=0)mx=1
@@ -1866,7 +2220,7 @@ function fmtUp(t){if(t<60)return t+'s';if(t<3600)return Math.floor(t/60)+'m'
 return Math.floor(t/3600)+'h'+Math.floor((t%3600)/60)+'m'}
 function renderStats(s){el('chips').innerHTML=''
 var items=[['bots',(s.online||0)+'/'+(s.bots||0)],['mem',(s.rssMB||0)+'M'],['lag',(s.evlLagMs||0)+'ms'],
-['logs',(s.logPerSec||0)+'/s'],['viewers',(s.clients||0)],['up',fmtUp(Math.floor(s.uptimeSec||0))]]
+['logs',(s.logPerSec||0)+'/s'],['shards/min ≈',(s.shardsPerMinute==null?'—':Number(s.shardsPerMinute).toFixed(1))+' ('+(s.shardsRateBots||0)+' sampled)'],['viewers',(s.clients||0)],['up',fmtUp(Math.floor(s.uptimeSec||0))]]
 for(var i=0;i<items.length;i++){var c=document.createElement('div');c.className='chip'
 var b=document.createElement('b');b.textContent=items[i][1]
 c.appendChild(document.createTextNode(items[i][0]+' '));c.appendChild(b);el('chips').appendChild(c)}}
@@ -1881,13 +2235,13 @@ fetch('/api/command',{method:'POST',credentials:'same-origin',headers:{'Content-
 function hideSugg(){el('sugg').hidden=true}
 function showSugg(){var v=cinput.value
 if(!v||v.charAt(0)!=='/'){hideSugg();return}
-var keys=Object.keys(cmds).filter(function(k){return k.indexOf(v)===0||(k.split(' ')[0]||'').indexOf(v)===0})
+var table=suggestionCommands();var keys=Object.keys(table).filter(function(k){return k.indexOf(v)===0||(k.split(' ')[0]||'').indexOf(v)===0})
 var box=el('sugg');box.innerHTML=''
 if(!keys.length){hideSugg();return}
 box.hidden=false
 for(var i=0;i<Math.min(keys.length,8);i++){(function(k){var d=document.createElement('div');d.className='sg'
 var b=document.createElement('b');b.textContent=k
-var sp=document.createElement('span');sp.textContent=cmds[k]||''
+var sp=document.createElement('span');sp.textContent=table[k]||''
 d.appendChild(b);d.appendChild(sp)
 d.onmousedown=function(e){e.preventDefault();cinput.value=k;cinput.focus();hideSugg()}
 box.appendChild(d)})(keys[i])}}
@@ -1956,7 +2310,9 @@ toast('cleared '+((m.cleared==null)?0:m.cleared)+' override(s)','good');envLoad(
 var pb=el('playbtn');if(pb)pb.onclick=function(){window.open('/play','_blank','noopener')}
 el('terminalclose').onclick=closeTerminal
 window.addEventListener('resize',function(){
-if(!terminalOpen||!ws||ws.readyState!==1)return
+if(!terminalOpen)return
+if(term){termFitNow();return}
+if(!ws||ws.readyState!==1)return
 var box=el('terminalout'),cols=Math.max(20,Math.min(400,Math.floor(box.clientWidth/8))),rows=Math.max(5,Math.min(200,Math.floor(box.clientHeight/18)))
 ws.send(JSON.stringify({t:'terminal',action:'resize',cols:cols,rows:rows}))
 })
@@ -1967,10 +2323,14 @@ Object.keys(cmds).forEach(function(k){var r=document.createElement('div');r.clas
 var b=document.createElement('b');b.textContent=k
 var sp=document.createElement('span');sp.textContent=cmds[k]||''
 r.appendChild(b);r.appendChild(sp);h.appendChild(r)})}
-el('torbtn').onclick=function(){var b=el('torbtn');b.disabled=true;toast('requesting new Tor circuits…')
-fetch('/api/tor/newnym',{method:'POST',credentials:'same-origin'}).then(function(r){return r.json()}).then(function(m){
+function renderTorGroups(gs){torGroups=gs||[];var sel=el('torgroup');if(!sel)return
+sel.innerHTML='';var opts=[{id:'all',label:'⟳ all groups'}].concat(torGroups)
+for(var i=0;i<opts.length;i++){var o=document.createElement('option');o.value=opts[i].id;o.textContent=opts[i].label;sel.appendChild(o)}}
+el('torbtn').onclick=function(){var b=el('torbtn');b.disabled=true;var grp=(el('torgroup')&&el('torgroup').value)||'all';toast('requesting fresh Tor circuits…')
+fetch('/api/tor/newnym',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({group:grp})}).then(function(r){return r.json()}).then(function(m){
 var rs=m.results||[],ok=rs.filter(function(x){return x.ok}).length
-toast(m.ok?'new Tor circuits on all '+rs.length+' instance(s)':'new circuits on '+ok+' of '+rs.length+' Tor instance(s) — see the system log',m.ok?'good':'bad')
+if(m.error)toast(m.error,'bad')
+else toast((m.ok?'fresh circuits on all '+rs.length+' Tor instance(s)':'new circuits on '+ok+' of '+rs.length+' Tor instance(s) — see the system log')+' · reconnecting '+(m.reconnected||0)+' bot(s) for '+(m.label||'every proxy'),m.ok?'good':'bad')
 b.disabled=false}).catch(function(){toast('could not request Tor circuits — see the system log','bad');b.disabled=false})}
 var docsData=null
 function renderDocs(){var body=el('docsbody');body.innerHTML='';if(!docsData){body.textContent='could not load the docs';return}
@@ -2002,7 +2362,7 @@ el('clearbtn').onclick=function(){lines=[];el('log').innerHTML=''
 if(view!=='all'&&view!=='system'&&ws&&ws.readyState===1)ws.send(JSON.stringify({t:'cmd',text:'/clear'}))}
 el('logout').onclick=function(){fetch('/logout',{method:'POST'}).then(function(){location.href='/login'},function(){location.href='/login'})}
 document.addEventListener('keydown',function(e){
-if(e.key==='/'&&document.activeElement!==cinput&&document.activeElement!==el('search')){
+if(e.key==='/'&&!terminalOpen&&!e.defaultPrevented&&!e.ctrlKey&&!e.metaKey&&!e.altKey&&!(e.target&&e.target.closest&&e.target.closest('input,textarea,select,[contenteditable="true"],.xterm'))){
 cinput.focus();if(!cinput.value)cinput.value='/';e.preventDefault()}})
 var chips=document.querySelectorAll('.vchip[data-view]')
 for(var ci=0;ci<chips.length;ci++)chips[ci].onclick=(function(v){return function(){setView(v)}})(chips[ci].getAttribute('data-view'))
@@ -2024,6 +2384,7 @@ return null
 
 const webTrace = (message) => {
 if (!WEB_TERMINAL_LOG) return
+message = safeDisplayText(message)
 const line = `[web] ${message}`
 const noisy = /^(GET \/api\/state|websocket message type=)/.test(message)
 if (!noisy) logFor(SYSTEM_ID, `{gray-fg}${sanitize(line)}{/gray-fg}`)
@@ -2032,7 +2393,8 @@ try { process.stdout.write(`[web] ${new Date().toISOString()} ${message}\n`) } c
 
 const password = WEB_PASSWORD || crypto.randomBytes(9).toString('base64url')
 if (!WEB_PASSWORD) {
-logFor(SYSTEM_ID, `{yellow-fg}⚠ WEB_PASSWORD not set — generated login password: ${password} (set WEB_PASSWORD in .env to pin it){/yellow-fg}`)
+// Bootstrap password is local-only: never publish it to shared bot logs.
+try { process.stderr.write(`[web] Generated login password: ${password} (set WEB_PASSWORD in .env to pin it)\n`) } catch (_) {}
 }
 
 const SESSION_MS = Math.max(0.1, WEB_SESSION_HOURS) * 3600_000
@@ -2224,7 +2586,7 @@ function parseCookies(req) {
   return out
 }
 function tokenFromReq(req, url) {
-return parseCookies(req).sid || (url && url.searchParams.get('token')) || null
+return parseCookies(req).sid || null
 }
 function timingSafeEq(a, b) {
 const A = Buffer.from(String(a)), B = Buffer.from(String(b))
@@ -2234,6 +2596,47 @@ return crypto.timingSafeEqual(A, B)
 // The analytics listener is a separate server outside this closure, so it is
 // handed the session check it needs here.
 webAuth = { sessionValid, tokenFromReq }
+// CSRF guard for browser-driven mutations and WebSocket upgrades. A web page
+// cannot set its own Origin or Sec-Fetch headers, so an attacking page cannot
+// forge them; non-browser clients (curl, scripts) send no Origin and are still
+// protected by password/session authentication.
+//
+// `Origin === Host` alone is wrong for real deployments: SSH tunnels, VS Code /
+// Devbox port-forwards and reverse proxies arrive with a REWRITTEN Host header,
+// which rejected every legitimate login POST. The browser's own Sec-Fetch-Site
+// is the authoritative signal; forwarded/allowed origins and loopback tunnels
+// cover older browsers and HTTP frontends that rewrite Host.
+function loopbackHost(host) {
+return /^(127\.0\.0\.1|localhost|::1|\[::1\]|::ffff:127\.0\.0\.1|\[::ffff:127\.0\.0\.1\])$/i.test(String(host || ''))
+}
+function sameOrigin(req) {
+const site = req.headers['sec-fetch-site']
+if (site === 'cross-site') return false
+// The browser asserts this request came from the page's own origin — the case
+// a Host-rewriting tunnel cannot express in the Host header.
+if (site === 'same-origin') return true
+const raw = req.headers.origin
+if (!raw) return true // CLI clients/scripts carry no cookie-based CSRF surface.
+if (raw === 'null') return false // opaque origin (sandbox/redirect) is never trusted
+let origin
+try { origin = new URL(raw) } catch (_) { return false }
+if (!['http:', 'https:'].includes(origin.protocol)) return false
+const originHost = String(origin.host).toLowerCase()
+const seenHosts = [req.headers.host, ...String(req.headers['x-forwarded-host'] || '').split(',')].map(h => String(h || '').trim().toLowerCase()).filter(Boolean)
+if (seenHosts.includes(originHost)) return true
+if (WEB_ALLOWED_ORIGINS.some(allowed => {
+const value = String(allowed).toLowerCase()
+return value === String(origin.origin).toLowerCase() || value === originHost
+})) return true
+// SSH tunnel / local port-forward: the connection reaches us over loopback and
+// the page itself is served from a loopback origin. An external attack page
+// reports its real https origin, so this cannot open a remote CSRF path.
+const peer = String(req.socket?.remoteAddress || '')
+return (!peer || loopbackHost(peer)) && loopbackHost(origin.hostname)
+}
+function originGuardMessage(req) {
+return `foreign origin forbidden: Origin ${sanitize(req.headers.origin || '(none)')} does not match Host ${sanitize(req.headers.host || '(none)')}. For a reverse proxy or tunnel add WEB_ALLOWED_ORIGINS=<origin> to .env.`
+}
 function readBody(req, cap) {
 cap = cap || 16384
 return new Promise(resolve => {
@@ -2288,6 +2691,14 @@ const server = http.createServer(async (req, res) => {
 try {
 const url = new URL(req.url, 'http://localhost')
 const p = url.pathname
+if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method) && !sameOrigin(req)) {
+res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8', 'X-Content-Type-Options': 'nosniff' })
+res.end(originGuardMessage(req))
+return
+}
+res.setHeader?.('Cache-Control', 'no-store')
+res.setHeader?.('X-Content-Type-Options', 'nosniff')
+res.setHeader?.('Referrer-Policy', 'no-referrer')
 webTrace(`${req.method} ${p} from ${req.socket.remoteAddress || '?'}`)
 if (p === '/health') { res.writeHead(200); res.end('ok'); return }
 if (p === '/favicon.ico') { res.writeHead(204); res.end(); return }
@@ -2344,6 +2755,7 @@ return
 if (p === '/logout' && req.method === 'POST') {
 const token = tokenFromReq(req, url)
 if (token) sessions.delete(token)
+for (const client of clients) if (client.token === token) { try { client.ws.close(1008, 'Signed out') } catch (_) {} }
 res.writeHead(303, { Location: '/login', 'Set-Cookie': 'sid=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0' })
 res.end()
 return
@@ -2361,12 +2773,14 @@ if (report.stack) webTrace(`browser stack: ${sanitize(String(report.stack)).slic
 res.writeHead(204); res.end(); return
 }
 if (p === '/api/settings' && req.method === 'GET') {
+settings.reload()
 // The .ENV tab: the registry's current values, grouped, with secrets withheld.
 res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
 res.end(JSON.stringify({ groups: settings.grouped(), overrides: settings.overrideCount() }))
 return
 }
 if (p === '/api/settings' && req.method === 'POST') {
+settings.reload()
 const body = await readBody(req, 8192)
 let msg
 try { msg = JSON.parse(body || '{}') } catch (_) { msg = null }
@@ -2378,6 +2792,7 @@ else logFor(SYSTEM_ID, `{yellow-fg}⚠ .ENV tab rejected ${sanitize(String(msg &
 return
 }
 if (p === '/api/settings/reset' && req.method === 'POST') {
+settings.reload()
 const body = await readBody(req, 8192)
 let msg
 try { msg = JSON.parse(body || '{}') } catch (_) { msg = null }
@@ -2388,7 +2803,13 @@ return
 }
 if (p === '/api/tor/newnym' && req.method === 'POST') {
 // The dashboard's "⟳ tor" button — the same code path as /tor-newnym.
-const result = await requestTorCircuits()
+// Optional JSON body: { "group": 2 | "default" | "all" | "<bot>", "reconnect": false }.
+const raw = await readBody(req, 2048)
+let msg = {}
+try { msg = JSON.parse(raw || '{}') } catch (_) { msg = {} }
+const scopeArg = msg && msg.group != null && msg.group !== '' ? String(msg.group) : 'all'
+const reconnect = !msg || msg.reconnect !== false
+const result = await torRotate(scopeArg, { reconnect })
 res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
 res.end(JSON.stringify(result))
 return
@@ -2400,10 +2821,19 @@ res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-C
 res.end(JSON.stringify(docsForApi({ commands: COMMANDS })))
 return
 }
+if (p === '/api/server-commands' && ['GET', 'POST'].includes(req.method)) {
+const id = url.searchParams.get('bot') || Object.keys(bots).find(id => botOnline(bots[id]))
+if (!id || !Object.hasOwn(bots, id)) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Select an available bot' })); return }
+try {
+const result = req.method === 'POST' ? await refreshServerCommands(id) : serverCommandSnapshot(id)
+res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(result))
+} catch (err) { res.writeHead(409, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: sanitize(err.message) })) }
+return
+}
 if (p === '/api/state' && req.method === 'GET') {
 const view = normalizeView(url.searchParams.get('view') || 'all') || 'all'
 res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
-res.end(JSON.stringify({ commands: COMMANDS, cmdHistory: commandHistory, bots: botSnapshot(), stats: globalStats(), terminalEnabled: SSH_ENABLED && WEB_TERMINAL_ENABLED, lines: historyForView(view) }))
+res.end(JSON.stringify({ commands: COMMANDS, cmdHistory: commandHistory, bots: botSnapshot(), stats: globalStats(), terminalEnabled: SSH_ENABLED && WEB_TERMINAL_ENABLED, torGroups: torGroupsInfo(), lines: historyForView(view) }))
 return
 }
 if (p === '/api/command' && req.method === 'POST') {
@@ -2412,7 +2842,7 @@ let msg
 try { msg = JSON.parse(body || '{}') } catch (_) { msg = null }
 if (!msg || typeof msg.text !== 'string' || !msg.text.trim()) { res.writeHead(400); res.end('invalid command'); return }
 const trimmed = msg.text.trim()
-webTrace(`HTTP command: ${sanitize(trimmed).slice(0, 300)}`)
+webTrace(`HTTP command: ${sanitize(commandForLog(trimmed)).slice(0, 300)}`)
 recordHistory(trimmed)
 let selectedId = null
 handleCommand(trimmed, {
@@ -2541,6 +2971,10 @@ if (p === '/coinflip-dashboard.js' && req.method === 'GET') {
   handleCoinflipDashboardJs(req, res)
   return
 }
+if ((p === '/xterm.js' || p === '/xterm-addon-fit.js' || p === '/xterm.css') && req.method === 'GET') {
+  handleXtermAsset(req, res)
+  return
+}
 res.writeHead(404); res.end('not found')
 } catch (err) {
 webTrace(`request error: ${sanitize(err.stack || err.message || String(err)).slice(0, 1600)}`)
@@ -2548,11 +2982,17 @@ try { res.writeHead(500); res.end('error') } catch (_) {}
 }
 })
 
-const wss = new WebSocket.Server({ noServer: true })
+const wss = new WebSocket.Server({ noServer: true, maxPayload: 16384 })
 server.on('upgrade', (req, socket, head) => {
 let url
 try { url = new URL(req.url, 'http://localhost') } catch (_) { socket.destroy(); return }
-webTrace(`upgrade ${req.url} from ${req.socket.remoteAddress || '?'}`)
+webTrace(`upgrade ${url.pathname} from ${req.socket.remoteAddress || '?'}`)
+if (!sameOrigin(req)) {
+const reason = originGuardMessage(req)
+socket.write(`HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: ${Buffer.byteLength(reason)}\r\nConnection: close\r\n\r\n${reason}`)
+socket.destroy()
+return
+}
 if (url.pathname !== '/ws') { socket.destroy(); return }
 if (!sessionValid(tokenFromReq(req, url))) {
 webTrace('upgrade rejected: invalid or missing session')
@@ -2560,7 +3000,7 @@ socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n')
 socket.destroy()
 return
 }
-wss.handleUpgrade(req, socket, head, ws => { webTrace('upgrade accepted'); addClient(ws) })
+wss.handleUpgrade(req, socket, head, ws => { webTrace('upgrade accepted'); addClient(ws, tokenFromReq(req, url)) })
 })
 
 function normalizeView(v) {
@@ -2581,10 +3021,11 @@ const e = bots[v]
 return e ? e.logs.slice(-LOG_VIEW_LINES).map(l => escHtml(l.text)) : []
 }
 
-function addClient(ws) {
-const ctx = { ws, view: 'all', alive: true }
+function addClient(ws, token) {
+const ctx = { ws, token, view: 'all', alive: true }
 webTrace('websocket client connected')
 let terminalSession = null
+let terminalSize = { cols: 120, rows: 40 }
 const closeTerminalProcess = () => {
 if (!terminalSession) return
 try { terminalSession.close() } catch (_) {}
@@ -2606,6 +3047,8 @@ if (terminalSession === session) terminalSession = null
 })
 logFor(SYSTEM_ID, `{cyan-fg}[ssh] Connecting terminal to ${SSH_CONFIG.username}@${SSH_CONFIG.host}:${SSH_CONFIG.port}…{/cyan-fg}`)
 session.connect().then(() => {
+if (terminalSession !== session) { session.close(); return }
+session.resize(terminalSize.cols, terminalSize.rows)
 logFor(SYSTEM_ID, `{green-fg}[ssh] Remote terminal connected as ${SSH_CONFIG.username}@${SSH_CONFIG.host}.{/green-fg}`)
 ctx.send({ t: 'terminal', data: `SSH connected to ${SSH_CONFIG.host} as ${SSH_CONFIG.username}\n` })
 }).catch(err => {
@@ -2615,12 +3058,14 @@ session.close()
 if (terminalSession === session) terminalSession = null
 })
 }
-ctx.send = obj => { if (ws.readyState === WebSocket.OPEN) { try { ws.send(JSON.stringify(obj)) } catch (_) {} } }
+ctx.send = obj => { if (!sessionValid(ctx.token)) { closeTerminalProcess(); try { ws.close(1008, 'Session expired'); } catch (_) {} ; return } if (ws.readyState === WebSocket.OPEN) { try { ws.send(JSON.stringify(obj)) } catch (_) {} } }
 clients.add(ctx)
 ws.on('pong', () => { ctx.alive = true })
 ws.on('error', () => {})
 ws.on('close', (code, reason) => { closeTerminalProcess(); clients.delete(ctx); webTrace(`websocket client closed code=${code} reason=${sanitize(String(reason || ''))}`) })
 ws.on('message', raw => {
+if (!sessionValid(ctx.token)) { closeTerminalProcess(); try { ws.close(1008, 'Session expired'); } catch (_) {} ; return }
+if (Buffer.byteLength(raw) > 16384) { try { ws.close(1009, 'Message too large'); } catch (_) {} ; return }
 let msg
 try { msg = JSON.parse(raw) } catch (_) { webTrace('websocket received invalid JSON'); return }
 webTrace(`websocket message type=${msg.t || 'unknown'}`)
@@ -2644,11 +3089,12 @@ logFor(SYSTEM_ID, '{yellow-fg}[ssh] Rejected oversized terminal input.{/yellow-f
 } else {
 terminalSession.write(msg.data)
 }
-} else if (msg.action === 'resize' && terminalSession) {
+} else if (msg.action === 'resize') {
 const cols = Number.parseInt(msg.cols, 10)
 const rows = Number.parseInt(msg.rows, 10)
 if (Number.isInteger(cols) && Number.isInteger(rows) && cols >= 20 && cols <= 400 && rows >= 5 && rows <= 200) {
-terminalSession.resize(cols, rows)
+terminalSize = { cols, rows }
+terminalSession?.resize(cols, rows)
 }
 }
 return
@@ -2671,7 +3117,7 @@ const v = normalizeView(msg.id)
 if (v) { ctx.view = v; ctx.send({ t: 'history', id: v, lines: historyForView(v) }) }
 }
 })
-ctx.send({ t: 'hello', commands: COMMANDS, cmdHistory: commandHistory, bots: botSnapshot(), stats: globalStats(), terminalEnabled: SSH_ENABLED && WEB_TERMINAL_ENABLED })
+ctx.send({ t: 'hello', commands: COMMANDS, cmdHistory: commandHistory, bots: botSnapshot(), stats: globalStats(), terminalEnabled: SSH_ENABLED && WEB_TERMINAL_ENABLED, torGroups: torGroupsInfo() })
 }
 
 // Batched log flush with per-connection routing: a client only receives lines
@@ -2820,10 +3266,20 @@ function isTrustedTpaName (name) {
   return TPA_TRUSTED_BOTS.some(trusted => trusted.toLowerCase() === String(name || '').toLowerCase())
 }
 
-function createBotInstance(username, host = HOST, port = PORT, version = VERSION) {
+function createBotInstance(username, host, port, version) {
+refreshRuntimeConfig()
+host = host || HOST
+port = port || PORT
+version = version || VERSION
 const id = username
+if (!/^[A-Za-z0-9_]{1,16}$/.test(id) || ['__proto__', 'constructor', 'prototype'].includes(id)) { logFor(SYSTEM_ID, '{red-fg}✗ Invalid Minecraft username.{/red-fg}'); return null }
+const blocked = connectBlockReason(id)
+if (blocked) { logFor(SYSTEM_ID, `{yellow-fg}⚠ ${sanitize(id)}: ${sanitize(blocked)}{/yellow-fg}`); return null }
+rtpRoaming.stop(id)
+robotLogin.reconnect(id)
 let connected = false
 let manualDisconnect = false
+let reconnectExhausted = false
 // Cancel any pending reconnect from a previous instance (timer lives on bots[id], not in closure)
 clearReconnectTimer(id)
 
@@ -2854,12 +3310,19 @@ logFor(fallback, `{red-fg}✗ Failed to create bot "${id}": ${sanitize(err.messa
 return null
 }
 
+try {
 bot.loadPlugin(armorManager)
 bot.loadPlugin(pathfinder)
+} catch (err) {
+try { bot.quit() } catch (_) {}
+logFor(SYSTEM_ID, `{red-fg}✗ Plugin setup failed for ${sanitize(id)}: ${sanitize(err.message)}{/red-fg}`)
+return null
+}
 
 bots[id] = {
-bot, spawnTime: null, logs: existingLogs, host, port, version,
+id, bot, spawnTime: null, logs: existingLogs, host, port, version,
 reconnectAttempts: existingReconnectAttempts,
+everOnline: bots[id]?.everOnline || false,
 reconnectTimer: null,
 lastKickReason: null,
 lastDisconnectReason: null, // stores raw error text for transfer-crash classification
@@ -2892,18 +3355,70 @@ lastPlayerChatAt: Date.now(), // chat activity watchdog — last time a player m
 lastPlayerChat: '', // latest player chat message
 }
 const entry = bots[id]
+// Remember actual command traffic, so a crate warp never follows /shardshop
+// or another server command inside the server's shared command cooldown.
+let trackedChat = null
+const trackServerCommands = () => {
+  if (typeof bot.chat !== 'function' || bot.chat === trackedChat) return
+  const originalChat = bot.chat.bind(bot)
+  trackedChat = (message) => {
+    if (typeof message === 'string' && message.startsWith('/')) entry.lastServerCommandAt = Date.now()
+    return originalChat(message)
+  }
+  bot.chat = trackedChat
+}
+trackServerCommands()
 entry.connectionState = 'connecting'
+entry.normalStartupReady = false
+entry.authenticated = !robotLogin.isAdmitting(id)
+entry.admissionAfkStarted = false
 entry.disconnectedAt = null
 recordEvidence(id, 'connections', { state: 'connecting', target: `${host}:${port}` })
 
 // Managed timers — all cleared on disconnect so nothing fires against a dead bot
 const timeouts = []
 const pushT = (fn, delay) => {
-const t = setTimeout(() => { const i = timeouts.indexOf(t); if (i >= 0) timeouts.splice(i, 1); fn() }, delay)
+const t = setTimeout(() => {
+const index = timeouts.indexOf(t); if (index >= 0) timeouts.splice(index, 1)
+const failed = err => { if (!robotLogin.fail(id, err.message || 'Setup error')) e(`Scheduled action failed: ${sanitize(err.message || String(err))}`) }
+try { const result = fn(); if (result?.catch) result.catch(failed) } catch (err) { failed(err) }
+}, delay)
 timeouts.push(t)
 return t
 }
 const clearAll = () => { timeouts.forEach(clearTimeout); timeouts.length = 0 }
+// Robot admission waits for chat authentication before running normal setup.
+// The selector path can schedule its own AFK; this fallback covers /server
+// setups which never open a selector window.
+entry.onAdmissionAuthenticated = () => {
+entry.authenticated = true
+if (entry.spawnTime) sendNormalStartup()
+}
+function sendNormalStartup() {
+if (robotLogin.isAdmitting(id)) {
+if (!entry.authenticated || entry.admissionSetupStarted) return
+entry.admissionSetupStarted = true
+}
+if (CLICK_COMPASS_ENABLED) {
+try { bot.activateItem() } catch (err) { if (!robotLogin.fail(id, err.message)) e(`activateItem failed: ${sanitize(err.message)}`) }
+} else {
+const command = SERVER_COMMAND || '/server lifesteal'
+try { bot.chat(command) } catch (err) { if (!robotLogin.fail(id, err.message)) e(`Server command failed: ${sanitize(err.message)}`) }
+}
+if (!CLICK_COMPASS_ENABLED) pushT(() => { if (bots[id] === entry && botOnline(entry)) entry.normalStartupReady = true }, 5000)
+if (robotLogin.isAdmitting(id) && !entry.admissionAfkStarted) {
+entry.admissionAfkStarted = true
+pushT(() => {
+if (bots[id] !== entry || !bot.entity || !entry.authenticated || entry.rtpRunning || !robotLogin.isAdmitting(id)) return
+try {
+bot.chat(WARP_AFK)
+// Remain in admission through the transfer grace so immediate setup errors
+// are closed rather than slipping into the normal reconnect path.
+pushT(() => { if (bots[id] === entry && botOnline(entry)) robotLogin.setupReady(id) }, 5000)
+} catch (err) { robotLogin.fail(id, err.message) }
+}, 60000)
+}
+}
 
 // Detect whether a disconnect was caused by a Velocity proxy transfer crash
 function isProxyCrash(reason) {
@@ -2913,10 +3428,11 @@ return PROXY_CRASH_PATTERNS.some(re => re.test(text))
 }
 
 const scheduleReconnect = (reason, rawError) => {
+if (robotLogin.fail(id, rawError || reason)) { clearAll(); return }
 clearAll()
 connected = false
 // ADDED CHECK: Prevent recursive calls if already reconnecting or manually disconnected
-if (manualDisconnect || bots[id]?.reconnectTimer) {
+if (bots[id] !== entry || manualDisconnect || reconnectExhausted || entry.reconnectTimer) {
 // If a reconnect is already scheduled, or if the user manually disconnected,
 // do not schedule another reconnect.
 return;
@@ -2934,36 +3450,37 @@ return
 const proxyCrash = isProxyCrash(rawError || reason)
 const attempt = bots[id]?.reconnectAttempts || 0
 
-// Check max reconnect limit (only for non-proxy-crash disconnects; proxy crashes reset the count)
-if (!proxyCrash && attempt >= MAX_RECONNECT) {
+// Protocol and transport failures must also respect the limit. Otherwise a
+// corrupt stream can loop forever at a flat delay and overload the proxy.
+if (attempt >= MAX_RECONNECT) {
 if (bots[id]) {
   bots[id].reconnectTimer = null
-  // Clear the counter so we don't spam "reached max reconnects" on every
-  // subsequent disconnect/error event. The bot is effectively dead until
-  // someone runs /reconnect manually.
-  bots[id].reconnectAttempts = 0
+  // Keep the count for the dashboard; the closure guard prevents repeated
+  // exhaustion logs. /reconnect creates a fresh lifecycle on explicit request.
+  reconnectExhausted = true
 }
 e(`${id} reached max reconnects (${MAX_RECONNECT}). Disconnected permanently. Use /reconnect to try again.`)
 monitoring?.onReconnectExhausted(id, MAX_RECONNECT)
 return
 }
 
-let delay
-if (proxyCrash) {
-// Proxy transfer crash → fast flat reconnect, don't increment backoff
-delay = FAST_RECONNECT_MS
-w(`${reason} (proxy transfer crash detected). Reconnecting in ${(delay / 1000).toFixed(1)}s…`)
-} else {
-// Real kick / unknown error → exponential backoff
-delay = Math.min(RECONNECT_BASE_MS * Math.pow(1.3, attempt), RECONNECT_MAX_MS)
-if (bots[id]) bots[id].reconnectAttempts = attempt + 1
-w(`${reason}. Auto-reconnecting in ${(delay / 1000).toFixed(1)}s (Attempt ${attempt + 1})…`)
+let delay = reconnectDelay(attempt, RECONNECT_BASE_MS, RECONNECT_MAX_MS)
+const selectedRoute = robotLogin.route(id)
+const proxy = process.env[`BOT_DIRECT_${id}`] === 'true' ? null : selectedRoute === undefined ? resolveBotProxy(id, PROXY_GROUPS, PROXY_DEFAULT) : selectedRoute
+if (proxy) {
+  const key = `${proxy.type || 'socks5'}:${proxy.host}:${proxy.port}`
+  const due = Math.max(Date.now() + delay, proxyReconnectSlots.get(key) || 0)
+  proxyReconnectSlots.set(key, due + settings.get('PROXY_RECONNECT_STAGGER_MS'))
+  delay = due - Date.now()
 }
-
-bots[id].reconnectTimer = setTimeout(() => {
-bots[id].reconnectTimer = null
-// Defer to next tick so reconnect never runs inside the disconnect/create call stack
-setImmediate(() => createBotInstance(id, host, port, version))
+entry.reconnectAttempts = attempt + 1
+entry.nextReconnectAt = Date.now() + delay
+w(`${reason}${proxyCrash ? ' (transport/protocol failure)' : ''}. Auto-reconnecting in ${(delay / 1000).toFixed(1)}s (Attempt ${attempt + 1})…`)
+entry.reconnectTimer = setTimeout(() => {
+if (bots[id] !== entry || manualDisconnect || connectBlockReason(id)) return
+entry.reconnectTimer = null
+entry.nextReconnectAt = null
+setImmediate(() => { if (bots[id] === entry && !manualDisconnect && !connectBlockReason(id)) createBotInstance(id, host, port, version) })
 }, delay)
 }
 
@@ -2976,6 +3493,14 @@ return false
 }
 
 if (bot._client) {
+bot._client.on('declare_commands', packet => {
+if (bots[id] !== entry) return
+entry.serverCommands = decodeCommandTree(packet)
+entry.serverCommandsReceived = true
+entry.serverCommandSource = 'tree'
+entry.serverCommandsUpdatedAt = Date.now()
+notifyBotsChanged()
+})
 let sentSettings = false
 let configLogCount = 0
 let configQuiet = false
@@ -3000,12 +3525,16 @@ logFor(id, `{magenta-fg}[state] -> ${newState}{/magenta-fg}`)
 // exit handler when it is active (post-spawn reconfigure), or re-enable
 // immediately for the initial login (velocity plugin not active yet).
 if (newState === 'configuration') {
+entry.serverCommands = []
+entry.serverCommandsReceived = false
+entry.normalStartupReady = false
 bot.physicsEnabled = false
 } else if (newState === 'play') {
 // Only re-enable if the velocity plugin hasn't taken us into
 // configuration (initial login). Otherwise let its exit handler
 // re-enable physics after the server finishes setup.
 if (!bot.inConfigurationPhase) bot.physicsEnabled = true
+pushT(() => { if (bots[id] === entry && botOnline(entry)) entry.normalStartupReady = true }, 5000)
 }
 })
 
@@ -3075,6 +3604,7 @@ const PLAY_ONLY_PACKETS = new Set([
 
 const origWrite = bot._client.write.bind(bot._client)
 bot._client.write = (name, params) => {
+if (fatalConnectionError || bot._client.ended || bots[id] !== entry) return
 if (bot._client.state === 'configuration') {
 if (PLAY_ONLY_PACKETS.has(name)) {
 logFor(id, `{red-fg}[config ->] BLOCKED play-only packet during configuration: ${name}{/red-fg}`)
@@ -3093,6 +3623,10 @@ i('Connected to server socket. Awaiting chat auth prompts…')
 // Listen to plain text messages to grep for auth requests
 bot.on('messagestr', (message) => {
 const text = message.toLowerCase()
+if (!detectPlayerChat(message)) {
+  const shards = parseShardBalance(message)
+  if (shards != null && bots[id] === entry) shardTracker.observe(id, shards)
+}
 monitoring?.inspectServerMessage(id, message)
 feedCoinflipLine(id, message)
 feedChatGameLine(message)
@@ -3110,6 +3644,8 @@ if (requester && bots[id]?.tpautoEnabled) {
 // Auth prompts ("Please login using /login <password>") and the server's replies
 // to them. planAuthAction decides both: it recognises a rejection and remembers
 // it, so a wrong password is reported once instead of being retried into a ban.
+if (robotLogin.onMessage(id, message)) return
+if (!detectPlayerChat(message) && /\b(?:successfully\s+(?:logged\s*in|registered|authenticated)|(?:login|authentication|registration)\s+(?:successful|success)|(?:logged\s*in|registered)\s+successfully)\b/i.test(message)) entry.authPending = false
 const authAction = planAuthAction(id, message)
 if (authAction.record) {
 const f = authAction.record
@@ -3122,13 +3658,15 @@ notifyBotsChanged()
 }
 }
 if (authAction.fallback) {
+entry.authPending = true
 w(`${id}: auth ${authAction.fallback.kind} rejected — trying the fallback password (from ${authAction.fallback.source}) in ${Math.round(authAction.fallback.delayMs / 1000)}s`)
 const fallbackPayload = authAction.fallback.command
-pushT(() => bot.chat(fallbackPayload), authAction.fallback.delayMs)
+pushT(() => { const state = authState.get(id); if (state) state.sentAt = Date.now(); bot.chat(fallbackPayload) }, authAction.fallback.delayMs)
 }
 if (authAction.skip) {
 i(`Auth prompt ignored for ${id} — ${authAction.skip.kind}: ${sanitize(authAction.skip.reason)} (fix it, then /auth-retry ${id})`)
 } else if (authAction.command) {
+entry.authPending = true
 i(`Auth prompt detected: sending /${authAction.kind} (password from ${authAction.source})`)
 const payload = authAction.command
 pushT(() => bot.chat(payload), 220 + Math.random() * 400)
@@ -3171,7 +3709,8 @@ bot._client.write('resource_pack_receive', { uuid: uuidStr, result: 3 }); // ACC
 
 // The server throws an "internal error" if LOADED is sent in the exact same tick.
 // We must restore the 50ms delay that was in the original code.
-setTimeout(() => {
+pushT(() => {
+if (bots[id] !== entry || fatalConnectionError || bot._client.ended) return
 bot._client.write('resource_pack_receive', { uuid: uuidStr, result: 0 }); // LOADED
 }, 50);
 } else {
@@ -3181,10 +3720,13 @@ bot.acceptResourcePack(); // For older versions it still works fine
 })
 
 bot.once('spawn', () => {
+if (bots[id] !== entry || fatalConnectionError || manualDisconnect) return
+trackServerCommands() // chat plugin is injected asynchronously on initial login
 connected = true
 const recoveredAfter = bots[id]?.reconnectAttempts || 0
 if (bots[id]?.bot === bot) {
   bots[id].spawnTime = Date.now()
+  bots[id].everOnline = true
   bots[id].connectionState = 'online'
 }
 recordEvidence(id, 'connections', { state: 'online', connection: connectionDetails(id, entry) })
@@ -3199,8 +3741,8 @@ monitoring?.onRecovered(id, recoveredAfter)
 s(`Spawned on ${host}:${port} (v${version}).`)
 notifyBotsChanged()
 
-// Stable for 60 s → reset backoff
-pushT(() => { if (connected && bots[id]) bots[id].reconnectAttempts = 0 }, 60_000)
+// Reset backoff only after sustained healthy spawned time.
+pushT(() => { if (connected && bots[id] === entry && !fatalConnectionError) entry.reconnectAttempts = 0 }, settings.get('RECONNECT_STABLE_MS'))
 
 // Auto-equip best armor immediately on spawn
 pushT(() => {
@@ -3211,13 +3753,13 @@ try { bot.armorManager.equipAll() } catch (_) {}
 if (CLICK_COMPASS_ENABLED) {
 pushT(() => {
 i('Right-clicking compass (server selector)…')
-try { bot.activateItem() } catch (err) { e(`activateItem failed: ${sanitize(err.message)}`) }
+sendNormalStartup()
 }, 3000 + Math.random() * 2000)
 } else {
 const spawnCommand = SERVER_COMMAND || '/server lifesteal'
 pushT(() => {
 i(`Sending server command after spawn: ${spawnCommand}`)
-try { bot.chat(spawnCommand) } catch (err) { e(`Server command failed: ${sanitize(err.message)}`) }
+sendNormalStartup()
 }, 3000 + Math.random() * 2000)
 }
 })
@@ -3232,7 +3774,7 @@ if (manual.onWindowOpen(id, window)) return
 // window. /dump opens chests to deposit items — the GUI item search, slot
 // auto-click, and delayed AFK warp must never run on them (it would grab
 // items out of the chest and warp away mid-dump).
-if (bots[id]?.inCrateRoutine || bots[id]?.inDumpRoutine || bots[id]?.inSpawnerRoutine || bots[id]?.inAppleRoutine) return
+if (bots[id]?.rtpRunning || bots[id]?.inCrateRoutine || bots[id]?.inDumpRoutine || bots[id]?.inSpawnerRoutine || bots[id]?.inAppleRoutine) return
 
 // Book auto mode (BOOK_AUTO): a GUI that holds a matching item hands the
 // window to /use-book (scan → hotbar slot 1 → /use && /use) and nothing else
@@ -3310,6 +3852,7 @@ pushT(async () => {
 if (!bot.currentWindow) { w('Window closed before click could fire.'); return }
 try {
 await bot.clickWindow(targetSlot, 0, 0)
+pushT(() => { if (bots[id] === entry && botOnline(entry)) entry.normalStartupReady = true }, 5000)
 if (currentEntry?.shardshopSlot != null) {
 i(`Clicked slot ${targetSlot} (shardshop slot) — waiting for server transfer…`)
 } else if (!foundTargetItem) {
@@ -3322,8 +3865,9 @@ i(`Clicked slot ${targetSlot} — matched configured item search`)
 
 // AFK Warp logic
 pushT(async () => {
-if (!foundTargetItem && currentEntry?.shardshopSlot == null) {
+if (!bots[id]?.rtpRunning && !foundTargetItem && currentEntry?.shardshopSlot == null) {
 bot.chat(WARP_AFK)
+pushT(() => { if (bots[id] === entry && botOnline(entry)) robotLogin.setupReady(id) }, 5000)
 i(`Warped — waiting for server transfer…`)
 }
 }, 54000 + Math.random() * 1600)
@@ -3341,6 +3885,7 @@ notifyBotsChanged()
 bot.on('message', (jsonMsg) => { try { c(jsonMsg.toString()) } catch (_) {} })
 
 bot.on('death', () => {
+  cancelPendingRtp(id)
   recordEvidence(id, 'deaths', { source: 'mineflayer:death', position: botLocation(bot), reason: 'Death observed; killer/cause unknown unless the server supplies a death message.', recentServerMessages: (bots[id]?.chatHistory || []).slice(-5) })
   spawnerDrop.stop(id, 'death')
   manual.stopManualMode(id)
@@ -3351,8 +3896,13 @@ if (bot._client) bot._client.on('death_combat_event', packet => {
 
 bot.on('kicked', (reason) => {
 if (bots[id]?.bot !== bot) return
+cancelPendingRtp(id)
 let text
 try { text = typeof reason === 'string' ? reason : JSON.stringify(reason) } catch (_) { text = 'unknown' }
+const banVerdict = classifyKick(text)
+// Admission failures normally close immediately, but permanent bans must be
+// persisted and removed first so /start-login cannot admit the account again.
+if (!banVerdict.permanent && robotLogin.fail(id, `Kicked during admission: ${text}`)) return
 if (bots[id]) {
 bots[id].lastKickReason = text
 bots[id].lastDisconnectReason = text
@@ -3367,9 +3917,9 @@ e(`Kicked: ${sanitize(text)}`)
 // bot is still reported as banned after a restart, and /data publishes it. That
 // record is reporting only — connecting is gated exclusively by the removed
 // list (removed-bots.json); a permanent ban is put there automatically below.
-const banVerdict = classifyKick(text)
 if (banVerdict.banned) {
 const alreadyBanned = Boolean(dataState.bots[id]?.banned)
+const previousBanKind = dataState.bots[id]?.banKind
 // The FIRST detection sets the clock. Later kicks from the same ban keep it, so a
 // reconnect attempt twenty minutes in cannot push the release time further out.
 const knownExpiry = Number(dataState.bots[id]?.banExpiresAt) || 0
@@ -3378,8 +3928,8 @@ const knownExpiry = Number(dataState.bots[id]?.banExpiresAt) || 0
 // says "temporary" (or only "possibly banned") without saying for how long, retry
 // after BAN_RETRY_MS rather than writing the account off.
 const unknownLength = !banVerdict.permanent && !banVerdict.durationMs && !banVerdict.expiresAt
-const expiresAt = knownExpiry || banVerdict.expiresAt ||
-  (banVerdict.durationMs ? Date.now() + banVerdict.durationMs : (unknownLength ? Date.now() + BAN_RETRY_MS : 0))
+const expiresAt = banVerdict.permanent ? 0 : (knownExpiry || banVerdict.expiresAt ||
+  (banVerdict.durationMs ? Date.now() + banVerdict.durationMs : (unknownLength ? Date.now() + BAN_RETRY_MS : 0)))
 const banRow = {
 bot: id,
 banned: true,
@@ -3391,7 +3941,8 @@ banKind: banVerdict.kind,
 banReason: banVerdict.reason,
 banExpiresAt: expiresAt
 }
-if (banVerdict.duration) banRow.banDuration = banVerdict.duration
+if (banVerdict.permanent) banRow.banDuration = null
+else if (banVerdict.duration) banRow.banDuration = banVerdict.duration
 if (banVerdict.caseId) banRow.banCaseId = banVerdict.caseId
 dataStore.upsertBot(dataState, banRow)
 dataStore.recordBan(dataState, {
@@ -3404,11 +3955,14 @@ expiresAt,
 permanent: banVerdict.permanent
 })
 persistData()
-if (!alreadyBanned) {
+if (!alreadyBanned || previousBanKind !== banVerdict.kind) {
 const note = banVerdict.permanent ? '' : (expiresAt ? ` — flag clears ${new Date(expiresAt).toLocaleString()}` : '')
 logFor(id, `{red-fg}⛔ ${sanitize(id)} is ${banVerdict.kind === 'suspected' ? 'possibly ' : ''}banned${banVerdict.duration ? ' for ' + sanitize(banVerdict.duration) : ''} (${sanitize(banVerdict.kind)})${note}{/red-fg}`)
 if (!banVerdict.permanent) logFor(id, `{yellow-fg}   Recorded in the data file for reporting only — it does not stop ${sanitize(id)} from reconnecting; only ${REMOVED_BOTS_FILE} does.{/yellow-fg}`)
 if (banVerdict.reason && banVerdict.reason !== text) logFor(id, `{red-fg}   reason: ${sanitize(banVerdict.reason)}${banVerdict.caseId ? ' [case ' + sanitize(banVerdict.caseId) + ']' : ''}{/red-fg}`)
+}
+// Always enforce a permanent verdict, even if an earlier temporary/suspected
+// flag already existed. Reporting deduplication must not bypass the gate.
 if (banVerdict.permanent) {
 const moved = removedBotsStore.addRemovedBot(removedBots, { bot: id, kind: banVerdict.kind, reason: banVerdict.reason, caseId: banVerdict.caseId }, { addedBy: 'ban-detection' })
 persistRemovedBots()
@@ -3417,46 +3971,56 @@ logFor(id, `{yellow-fg}   Remove it from BOT_NAMES too, or it will just be skipp
 if (PERMANENT_BAN_ACTION === 'remove' && dropFromRoster(id)) logFor(id, `{yellow-fg}   Removed from the live roster (PERMANENT_BAN_ACTION=hold keeps it visible instead).{/yellow-fg}`)
 }
 }
-}
 monitoring?.onKick(id, text)
 notifyBotsChanged()
 })
 
-// ── Velocity / proxy packet-level error interception ────────────────────────
+// A parse/zlib failure leaves the decoder unusable. Logging it and waiting
+// for keepAliveError caused a minute of zombie-online state and more writes
+// to the broken stream. Tear down just this bot; its end event schedules one
+// paced retry. Retain the first fault, not the later generic timeout.
 let lastRawError = null
-
-bot.on('error', (err) => {
+let fatalConnectionError = false
+const seenConnectionErrors = new WeakSet()
+const onConnectionError = (err) => {
+if (bots[id] !== entry) return
+if (err && typeof err === 'object') {
+  if (seenConnectionErrors.has(err)) return
+  seenConnectionErrors.add(err)
+}
+if (robotLogin.fail(id, err?.message || 'Connection error')) return
+if (fatalConnectionError) return
 lastRawError = err
-if (bots[id]) bots[id].lastDisconnectReason = err.message || String(err)
-const proxyCrash = isProxyCrash(err)
-if (proxyCrash) {
-w(`Proxy packet error (will auto-reconnect): ${sanitize(err.message || String(err))}`)
-} else {
-e(`Error: ${sanitize(err.message || String(err))}`)
+entry.lastDisconnectReason = err?.message || String(err)
+const transportFailure = isProxyCrash(err)
+if (!transportFailure) { e(`Connection error: ${sanitize(entry.lastDisconnectReason)}`); return }
+fatalConnectionError = true
+connected = false
+bot.physicsEnabled = false
+clearAll()
+entry.connectionState = 'disconnected'
+entry.disconnectedAt = Date.now()
+shardTracker.invalidate(id)
+recordEvidence(id, 'connections', { state: 'protocol-error', reason: sanitize(entry.lastDisconnectReason), version, protocolState: bot._client?.state })
+w(`Transport/protocol failure: ${sanitize(entry.lastDisconnectReason)} — closing this bot connection before retry.`)
+notifyBotsChanged()
+try {
+  bot._client?.end('connectionError')
+  bot._client?.socket?.destroy()
+} catch (closeError) { e(`Connection cleanup failed: ${sanitize(closeError.message)}`) }
 }
-})
-
-// Intercept _client-level errors — these fire for deserialization / zlib
-// failures that don't always propagate to the bot 'error' event.
-if (bot._client) {
-bot._client.on('error', (err) => {
-lastRawError = err
-if (bots[id]) bots[id].lastDisconnectReason = err.message || String(err)
-const proxyCrash = isProxyCrash(err)
-if (proxyCrash) {
-w(`Protocol-level crash (transfer?): ${sanitize(err.message || String(err))}`)
-} else {
-e(`Client error: ${sanitize(err.message || String(err))}`)
-}
-})
-}
+bot.on('error', onConnectionError)
+if (bot._client) bot._client.on('error', onConnectionError)
 
 bot.on('end', (reason) => {
+const connectedBeforeEnd = connected
 connected = false
 if (bots[id]?.bot !== bot) return
 entry.connectionState = 'disconnected'
+cancelPendingRtp(id)
 entry.disconnectedAt = Date.now()
 entry.spawnTime = null
+shardTracker.invalidate(id)
 recordEvidence(id, 'connections', { state: 'disconnected', reason: sanitize(entry.lastDisconnectReason || String(reason || 'socket closed')) })
 spawnerDrop.stop(id, 'disconnected')
 
@@ -3485,13 +4049,9 @@ const hasRealReason = lastRawError || bots[id]?.lastDisconnectReason
 let classificationReason = hasRealReason || reasonText
 
 // Special case: a bare socketClosed with NO kick packet and NO protocol
-// error, before this bot has ever reached spawn, while an outbound proxy
-// is in use — this is the signature of a Tor/SOCKS5 circuit dying under
-// the data burst that starts right after auth succeeds (world/chunk/
-// inventory data), not a real server kick. Treat it as a proxy crash so
-// it gets the fast, no-backoff reconnect instead of slow exponential
-// backoff eating into MAX_RECONNECT for something that isn't a real kick.
-if (!hasRealReason && PROXY_ENABLED && !bots[id]?.spawnTime && (reasonText === 'socketClosed' || !reasonText)) {
+// error, before this bot reached spawn, while using an outbound proxy.
+// It may be a failed tunnel; it still needs backoff, not unlimited fast retries.
+if (!hasRealReason && connectionDetails(id, entry).route === 'proxied' && !connectedBeforeEnd && (reasonText === 'socketClosed' || !reasonText)) {
 classificationReason = 'pre-spawn socketClosed (proxy tunnel likely dropped)'
 }
 
@@ -3503,6 +4063,7 @@ lastRawError = null
 
 bots[id].disconnectManually = () => {
 manualDisconnect = true
+rtpRoaming.stop(id)
 
 try { manual.stopManualMode(id) } catch (_) {}
 
@@ -3528,22 +4089,22 @@ return bot
 
 // ── Group configuration that would otherwise be discovered much later ───────
 // A group with no HOST is legitimate (it groups accounts and carries a login
-// password), but a PROXY_GROUP_<N>_* variable that belongs to no group is always
-// a mistake: the group scan stops at the first missing PROXY_GROUP_<N>_BOTS, so
-// everything after a gap is dropped. Both used to be entirely silent, and the
-// only symptom was bots logging in with the wrong password.
+// password). Sparse numbers are supported; empty groups can also serve as
+// routes for admissions and generated accounts.
 for (const g of PROXY_GROUPS) {
 if (!g.host) logFor(SYSTEM_ID, `{yellow-fg}⚠ PROXY_GROUP_${g.index} has no HOST — its ${g.bots.length} bot(s) use the default route${g.loginPassword ? `, but its login password still applies` : ''}.{/yellow-fg}`)
 }
 const ignoredGroupVars = findIgnoredProxyGroupVars(process.env, PROXY_GROUPS)
 if (ignoredGroupVars.length) {
 logFor(SYSTEM_ID, `{yellow-fg}⚠ ignored, no group declares them: ${sanitize(ignoredGroupVars.join(', '))}{/yellow-fg}`)
-logFor(SYSTEM_ID, '{yellow-fg}  Groups start at PROXY_GROUP_1_BOTS and stop at the first missing number, so one gap drops every later group.{/yellow-fg}')
+logFor(SYSTEM_ID, '{yellow-fg}  Empty/missing _BOTS lists are admission routes only; sparse group indexes are supported.{/yellow-fg}')
 }
 
 // ── Connect all bots with staggered delay ───────────────────────────────────
 let currentConnectDelay = 0
 const initialConnectTimers = []
+let initialPending = 0
+let startupSettledAt = null
 const initialBotOrder = RANDOMIZE_BOT_ORDER ? shuffledCopy(BOT_NAMES) : BOT_NAMES.slice()
 initialBotOrder.forEach((name, index) => {
 // removed-bots.json is the only gate at startup too: a ban flag in the data
@@ -3553,8 +4114,10 @@ if (blocked) {
 logFor(SYSTEM_ID, `{red-fg}⛔ ${sanitize(name)} is ${sanitize(blocked)} — not connecting. Run /unban ${sanitize(name)} to put it back.{/red-fg}`)
 return
 }
+initialPending++
 const timer = setTimeout(() => {
-createBotInstance(name)
+initialPending--
+if (!Object.keys(bots).some(id => id.toLowerCase() === name.toLowerCase())) createBotInstance(name)
 if (index === 0) switchTo(name)
 }, currentConnectDelay)
 initialConnectTimers.push(timer)
@@ -3611,9 +4174,13 @@ else entry.bot?.emit('end', 'proxy-watchdog: forced')
 // ── Command registry (original + /stats) ──────────────────────────────────────
 const COMMANDS = {
 '/all [first-last|name:first..last] <cmd>': 'Optional inclusive displayed 1–N or exact-name range; a selector alone previews targets without changing selection. Run a local command on EVERY bot, or broadcast a server command to all. ALL_CHAT_GUARD (on by default) refuses plain chat so a typo like "/all .server lifesteal" cannot make every bot say it — prefix with "!" to send chat deliberately ( /all !hello )',
+'/start-login [--retry <name>]': 'Admit shuffled robot.txt accounts immediately, independent of .env startup; direct then valid proxy groups, 5 seconds between attempts. Explicit --retry restores one blocked name.',
+'/stop-login': 'Cancel pending robot.txt connection attempts; in-flight admissions finish normally.',
+'/start-rtp [names|first-last|name:first..last|all]': 'Connect disconnected or new RTP accounts, then roam after setup; reuses existing connections. Arrivals append to rtp-locations.txt.',
+'/stop-rtp [names|range|all]': 'Stop roaming; bare command stops all roam sessions. Disconnect/death also stops roaming; restart explicitly.',
 '/all-slow [first-last|name:first..last] [delay] <cmd>': `Optional inclusive bot range before the optional delay; range alone previews targets. Like /all (chat guard included), but starts each bot ${ALL_SLOW_DELAY_MS / 1000}s apart (ALL_SLOW_DELAY_MS). An optional leading delay overrides it for that run, in the same units as sleep: /all-slow 30 /spawners, /all-slow 500ms /status`,
 '/all-slow-cancel [id]': 'Cancel a specific running /all-slow broadcast task by ID (e.g. /all-slow-cancel 1), or all tasks if no ID is specified',
-'/overview': 'Dashboard of every bot\'s health, food, ping, rank (via /fix + /rank), shards, coins, balance, and inventory slots',
+'/overview': 'Online-only dashboard of each bot\'s health, food, ping, rank (via /fix + /rank), shards, coins, balance, and inventory slots',
 '/enchanted-golden-apple-extract': 'The full kit-extract routine (alias /ege): one pass per EAPPLE_REWARD_SLOTS entry — /kits, click EAPPLE_KIT_SLOT, click the reward slot, /dispose — moving ONLY the EAPPLE_DISPOSE_ITEMS junk each pass so the enchanted golden apples stay in the inventory',
 '/ege': 'Alias for /enchanted-golden-apple-extract',
 '/scripts': 'List the bot-scripts/*.txt files available to /run-script',
@@ -3622,14 +4189,14 @@ const COMMANDS = {
 '/crates [color]': `Warp to crates, find + walk to the nearest shulker box of [color] (default: ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')}, within ${CRATE_SCAN_RADIUS} blocks) and right-click it; falls back to ${WARP_AFK} if not found or unreachable. [color] can be a name like "purple" or a full block id like "purple_shulker_box"`,
 '/crates-loop [n] [color]': 'Run /crates repeatedly (default: until failure). Specify n for a fixed count and/or a crate [color]',
 '/shardshop-loop [slot]': `Repeatedly run ${SHARDSHOP_COMMAND} until the server signals it's empty (grep: SHARDSHOP_STOP_PHRASES) or hits the ${SHARDSHOP_LOOP_MAX_RUNS}-run safety cap; optional [slot] overrides default GUI slot`,
-'/crates-all [n] [color] [dump=…] [afk=…] ["term" …] [shulker|chest] [shulker color]': `Run shardshop → crates → dump on bots 1 through n (default: all bots) targeting crate [color] (default: ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')}), ${(CRATES_ALL_STAGGER_MS / 1000).toFixed(0)}s apart so they don't hit the server at once. dump=off|tpa|home|hidden|player:<name> chooses the dump step and afk=now|off|<seconds> chooses the AFK warp; both override CRATES_ALL_DUMP / CRATES_ALL_AFK_WARP / CRATES_ALL_AFK_DELAY_MS for that run`,
-'/crates-solo [bot] [color] [dump=…] [afk=…] ["term" …] [shulker|chest] [shulker color]': 'Run shardshop → crates → dump on just one bot (default: active bot) targeting crate [color] — not all bots. Takes the same dump= / afk= flags as /crates-all',
+'/crates-all [n] [color] [delay=30s] [dump=…] [afk=…] ["term" …] [shulker|chest] [shulker color]': `Run shardshop → crates → dump on bots 1 through n (default: all bots) targeting crate [color] (default: ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')}), ${(CRATES_ALL_STAGGER_MS / 1000).toFixed(0)}s apart so they don't hit the server at once. dump=off|tpa|home|hidden|player:<name> chooses the dump step and afk=now|off|<seconds> chooses the AFK warp; both override CRATES_ALL_DUMP / CRATES_ALL_AFK_WARP / CRATES_ALL_AFK_DELAY_MS for that run. delay= overrides the start stagger (e.g. delay=30s)`,
+'/crates-solo [bot] [color] [delay=30s] [dump=…] [afk=…] ["term" …] [shulker|chest] [shulker color]': 'Run shardshop → crates → dump on just one bot (default: active bot) targeting crate [color] — not all bots. delay= postpones this bot\'s start; dump= / afk= flags work as in /crates-all',
   '/bot-coinflip [run|stats|deep|history|export] [args]': `The whole coinflip suite. \`run [PRICE] [AMOUNT] [BOT|all]\` plays AMOUNT flips (default ${settings.get('COINFLIP_DEFAULT_FLIPS')}) and records every one: PRICE is a fixed wager (500000) or a random range (10k-1m — the COINFLIP_WAGER_MIN–MAX defaults), a busy or rate-limited create is waited for and re-asked (never deleted), and the run stops at COINFLIP_STOP_LOSS. \`stats [BOT]\` is the win/loss picture with the fairness verdict. \`deep [BOT]\` dissects the history fourteen ways (what follows a loss run, transition table and lag correlation, run lengths, wager against balance and against absolute size, richest vs poorest, hour of day on the server clock, pace, session position, raising after a loss, opponents, money curve) with a confidence interval per bucket and p-values corrected across the whole family. \`history [n|clear confirm]\` lists or wipes the raw records. \`export [BOT]\` writes data/coinflip-export.csv. Anything else is refused with the list. The game's own /coinflip (create, delete, …) is a separate server command: this console does not intercept that name at all, so /coinflip create 10k reaches the selected bot untouched. Works with /all-slow: /all-slow /bot-coinflip run 10k-1m 20`,
   '/coinflip …': 'The game\'s own coinflip command, owned by the server. The console never intercepts it — /coinflip, /coinflip create 10k and /coinflip delete all reach the selected bot (or every bot with /all-slow) untouched',
   '/timeseries [sample [ranks]|series <metric> [bucket] [bot]|events|clear confirm|status]': 'The recorded samples of shards, coins, balance, rank and bans over time — a sparkline, the last buckets, and where the JSON lives. \`sample\` records one right now',
   '/analytics': 'Where the read-only analytics page is, plus the JSON endpoints behind it (/api/analytics, /api/coinflip, /api/timeseries, /api/export)',
   '/analyze [open|url|json]': 'Open the analytics page in browser (default), print the URL, or output the full JSON report. The page shows coinflip fairness tests, time-series charts (shards/coins/balance), fleet stats, ban events, and rank changes.',
-  '/env [list [filter]|get KEY|set KEY VALUE|reset KEY|reset-all]': 'Show or change a configuration value for THIS run only — nothing is ever written to the .env file and a restart forgets it. Keys marked startup-only were read once at boot. The dashboard has the same thing as the .ENV tab',
+  '/env [list [filter]|get KEY|set KEY VALUE|reset KEY|reset-all]': 'Show or change a configuration value for THIS run only — nothing is ever written to the .env file and a restart forgets it. Rereads .env before each command; file edits replace same-key overrides, while unrelated overrides survive. Ports/boot roster remain restart-only. The .ENV tab uses the same settings',
 '/spawners': `Without moving, right-click every ${SPAWNER_BLOCK.replace(/_/g, ' ')} already within reach (${SPAWNER_REACH} blocks), clicking GUI slot ${SPAWNER_SLOT_FIRST} then slot ${SPAWNER_SLOT_SECOND} on each one`,
 '/data': 'Compile all saved bot/spawner data, save the local JSON snapshot, and push the current snapshot to the Google Sheets Apps Script webhook. Subcommands: /data check (verify the webhook deployment end-to-end), /data status (show webhook config + tracked counts)',
 '/list': 'Compact one-line-per-bot status list (online / offline / last kick)',
@@ -3658,10 +4225,12 @@ const COMMANDS = {
 '/reconnect-all': 'Reconnect every currently disconnected bot',
 '/reconnect-all-slow': 'Reconnect ALL bots (online or offline) with a 30s delay between each to avoid rate limits',
 '/new-bot <n> [host] [port] [ver]': 'Create and connect a new bot',
+'/new-gen [count] [group=auto|direct|N]': 'Generate unique Minecraft names, atomically save to .env and balanced proxy groups, then connect staggered (1–100).',
+'/server-commands [filter] [--refresh]': 'List commands advertised by the Minecraft server to the selected account; refresh uses tab completion, never executes commands.',
 '/switch <id>': 'Switch view to a different bot by name or number',
 '/uptime': 'Show uptime for all bots',
 '/proxy': 'Show the currently configured outbound proxy',
-'/tor-newnym': 'Ask every local Tor instance for fresh circuits (control port = the SOCKS port + 1, or TOR_CONTROL_PORTS) — reconnects leave through a new path; live connections keep theirs until they reconnect',
+'/tor-newnym [group|bot|all] [--no-reconnect]': 'Request fresh Tor circuits and staggered-reconnect the chosen scope so the new path takes effect NOW (SIGNAL NEWNYM alone keeps live connections on their old circuit): a proxy group number, a bot name (its group), "default" for ungrouped bots, or "all"; --no-reconnect only signals',
 '/spawner-drop ["term"] [duration=60s] [cooldown=10s] [mode=duration|once|until-stop] [scope=all|inventory|gui]': 'Open the nearest in-reach spawner without walking or public chat; drop matching whole stacks from its GUI and/or carried inventory, including existing items. Default bones, 60s, one stack per 10s. Stop with /spawner-drop stop. GUI drops may be rejected by server plugins; stop on failure rather than retry',
 '/evidence': 'Persistent per-bot observed connection events, last 3 dump runs with outcome messages, and recent death observations. Full JSON: /api/evidence?bot=<name>; no inferred ban cause',
 '/connection': 'Show configured Minecraft destination and port, verified destination IP when available, direct/proxy route and TCP peer separately; never equate proxy IP with server or public egress IP',
@@ -3800,6 +4369,7 @@ function itemNbtText (item) {
 *   spawner items are deposited; every other item stays in the inventory.
 */
 async function tpaAndDump(bot, id, options = {}) {
+if (bots[id]?.rtpRunning) { logFor(id, '{yellow-fg}⚠ Stop roaming before dumping.{/yellow-fg}'); return }
 const spawnersOnly = Boolean(options.spawnersOnly)
 const useHome = Boolean(options.home)
 const skipWarp = Boolean(options.skipWarp)
@@ -4088,7 +4658,7 @@ function startHiddenDump (options = {}) {
     logFor(SYSTEM_ID, '{yellow-fg}⚠ Hidden dump requires TPA_MAIN_PLAYER in .env.{/yellow-fg}')
     return true
   }
-  const names = buildHiddenDumpQueue(Object.keys(bots).filter(id => id !== TPA_MAIN_PLAYER))
+  const names = buildHiddenDumpQueue(Object.keys(bots).filter(id => id !== TPA_MAIN_PLAYER && !bots[id]?.rtpRunning))
   if (!names.length) {
     logFor(SYSTEM_ID, '{yellow-fg}⚠ Hidden dump: no bots to send.{/yellow-fg}')
     return true
@@ -4101,7 +4671,7 @@ function startHiddenDump (options = {}) {
     gapMs: () => DUMP_HIDDEN_MIN_GAP_MS + Math.floor(Math.random() * (gapRange + 1)),
     start: (name, done) => {
       const entry = bots[name]
-      if (!entry?.bot?.entity) {
+      if (!entry?.bot?.entity || entry.rtpRunning) {
         logFor(name, `{yellow-fg}⚠ Hidden dump skipped: bot is disconnected.{/yellow-fg}`)
         done()
         return
@@ -4128,6 +4698,7 @@ function startHiddenDump (options = {}) {
 }
 
 function runLocalCommandForBot(id, cmd) {
+if (bots[id]?.rtpRunning && !/^\/(?:status|connection|coordinates|evidence|clear|inv|players|dc|disconnect|closeBot|reconnect)(?:\s|$)/.test(cmd)) { logFor(id, '{yellow-fg}⚠ Stop roaming before starting another routine.{/yellow-fg}'); return }
 const entry = bots[id]
 if (!entry) return false
 const { bot } = entry
@@ -4421,17 +4992,29 @@ const finish = (stopReason) => {
 if (settled) return
 settled = true
 bot.removeListener('messagestr', onMessage)
+bot.removeListener('end', onEnd)
 clearTimeout(clickTimer)
 clearTimeout(ceiling)
 resolve({ clicks, stopReason })
 }
 
-// Grep every plain-text server message for the stop phrases, case-insensitively.
+// Cooldown replies are retryable, not "Error" stop messages.
+let cooldownUntil = 0
 const onMessage = (message) => {
+if (detectPlayerChat(message) && !/^\s*(?:error|cooldown|command)\s*:/i.test(message)) return
+const cooldown = commandCooldownMs(message, settings.get('CRATE_COMMAND_COOLDOWN_MS'))
+if (cooldown) {
+  cooldownUntil = Date.now() + cooldown
+  clearTimeout(clickTimer)
+  clickTimer = setTimeout(clickOnce, cooldown)
+  return
+}
 const text = message.toLowerCase()
 if (CRATE_STOP_PHRASES.some(p => text.includes(p))) finish('message')
 }
+const onEnd = () => finish('despawned')
 bot.on('messagestr', onMessage)
+bot.on('end', onEnd)
 
 const ceiling = setTimeout(() => finish('timeout'), CRATE_CLICK_TIMEOUT_MS)
 
@@ -4442,14 +5025,56 @@ const freshBlock = bot.blockAt(block.position)
 if (!freshBlock || freshBlock.name !== blockName) { finish('block-gone'); return }
 try {
 await bot.lookAt(freshBlock.position.offset(0.5, 0.5, 0.5), true)
+if (settled) return
 await bot.activateBlock(freshBlock)
 clicks++
 } catch (_) { /* transient click failure — keep trying on the next tick */ }
-if (!settled) clickTimer = setTimeout(clickOnce, CRATE_CLICK_DELAY_MS)
+if (!settled) {
+clearTimeout(clickTimer)
+clickTimer = setTimeout(clickOnce, Math.max(CRATE_CLICK_DELAY_MS, cooldownUntil - Date.now()))
+}
 }
 
 clickOnce()
 })
+}
+
+// The warp shares a server-command cooldown with /shardshop and other
+// commands. Wait before sending, retry explicit cooldown replies at most twice,
+// and never continue scanning at the old location after a rejected warp.
+async function warpToCrates (id, entry) {
+const { bot } = entry
+const gapMs = settings.get('CRATE_COMMAND_COOLDOWN_MS')
+let cooldownUntil = 0
+let disconnected = false
+const onMessage = message => {
+  if (detectPlayerChat(message) && !/^\s*(?:error|cooldown|command)\s*:/i.test(message)) return
+  const cooldown = commandCooldownMs(message, gapMs)
+  if (cooldown) cooldownUntil = Math.max(cooldownUntil, Date.now() + cooldown)
+}
+const onEnd = () => { disconnected = true }
+bot.on('messagestr', onMessage)
+bot.on('end', onEnd)
+try {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const wait = Math.max(0, cooldownUntil - Date.now(), gapMs - (Date.now() - (entry.lastServerCommandAt || Date.now())))
+    if (wait > 0) await new Promise(resolve => setTimeout(resolve, wait))
+    if (disconnected || bots[id] !== entry || !botOnline(entry)) return false
+    cooldownUntil = 0
+    try { bot.chat(WARP_CRATES) } catch (err) {
+      logFor(id, `{red-fg}✗ Failed to send crate warp: ${sanitize(err.message)}{/red-fg}`)
+      return false
+    }
+    await new Promise(resolve => setTimeout(resolve, settings.get('CRATE_WARP_SETTLE_MS')))
+    if (disconnected || bots[id] !== entry || !botOnline(entry)) return false
+    if (!cooldownUntil) return true
+    logFor(id, `{yellow-fg}⚠ Crate warp hit command cooldown — ${attempt < 2 ? 'waiting before retry' : 'retry limit reached; aborting'}.{/yellow-fg}`)
+  }
+  return false
+} finally {
+  bot.removeListener('messagestr', onMessage)
+  bot.removeListener('end', onEnd)
+}
 }
 
 // ── /crates routine: warp → scan for shulker box → walk → right-click ──
@@ -4459,6 +5084,7 @@ async function runCrateRoutine(id, blockNameOverride) {
 const entry = bots[id]
 if (entry?.spawnerDropRunning) { logFor(id, '{yellow-fg}⚠ Stop /spawner-drop before /crates.{/yellow-fg}'); return false }
 if (entry?.manualMode) { logFor(id, `{yellow-fg}⚠ Stop manual interact (/manual-stop) before starting /crates.{/yellow-fg}`); return false }
+if (!botOnline(entry)) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return false }
 // A GUI session armed by /chat or /gui must not swallow this routine's window
 if (entry.suppressNextWindowClick) entry.suppressNextWindowClick = false
 if (entry.suppressWindowTimer) { clearTimeout(entry.suppressWindowTimer); entry.suppressWindowTimer = null }
@@ -4476,14 +5102,7 @@ const { bot } = entry
 try {
 if (WARP_BEFORE_CRATE) {
 logFor(id, `{cyan-fg}› Warping to crates (targeting ${blockName.replace(/_/g, ' ')})…{/cyan-fg}`)
-try { bot.chat(WARP_CRATES) } catch (err) {
-logFor(id, `{red-fg}✗ Failed to send "${sanitize(WARP_CRATES)}": ${sanitize(err.message)}{/red-fg}`)
-return false
-}
-
-// Wait for warp to complete (5 seconds + random 100-600ms)
-await new Promise(resolve => setTimeout(resolve, 5000 + 100 + Math.random() * 500))
-if (!bot.entity) { logFor(id, `{red-fg}✗ ${id} despawned during warp — aborting.{/red-fg}`); return false }
+if (!await warpToCrates(id, entry)) return false
 } else {
 logFor(id, `{cyan-fg}› Skipping warp (WARP_BEFORE_CRATE=false) — scanning from current position (targeting ${blockName.replace(/_/g, ' ')})…{/cyan-fg}`)
 }
@@ -4495,18 +5114,18 @@ maxDistance: CRATE_SCAN_RADIUS
 
 if (!block) {
 logFor(id, `{red-fg}✗ No ${blockName.replace(/_/g, ' ')} found within ${CRATE_SCAN_RADIUS} blocks — warping to afk instead.{/red-fg}`)
-try { bot.chat(WARP_AFK) } catch (_) {}
+if (bots[id] === entry && botOnline(entry)) { try { bot.chat(WARP_AFK) } catch (_) {} }
 return false
 }
 
 logFor(id, `{cyan-fg}› Found it at ${block.position.x}, ${block.position.y}, ${block.position.z} — walking over…{/cyan-fg}`)
 
 const reached = await walkToBlock(bot, block.position, { reach: CRATE_REACH, timeoutMs: 15000 })
-if (!bot.entity) return false
+if (bots[id] !== entry || !botOnline(entry)) return false
 
 if (!reached) {
 logFor(id, `{red-fg}✗ Couldn't reach the shulker box (timed out/stuck) — warping to afk instead.{/red-fg}`)
-try { bot.chat(WARP_AFK) } catch (_) {}
+if (bots[id] === entry && botOnline(entry)) { try { bot.chat(WARP_AFK) } catch (_) {} }
 return false
 }
 
@@ -4514,7 +5133,7 @@ return false
 const freshBlock = bot.blockAt(block.position)
 if (!freshBlock || freshBlock.name !== blockName) {
 logFor(id, `{red-fg}✗ Block at target location changed before I could click it — warping to afk instead.{/red-fg}`)
-try { bot.chat(WARP_AFK) } catch (_) {}
+if (bots[id] === entry && botOnline(entry)) { try { bot.chat(WARP_AFK) } catch (_) {} }
 return false
 }
 
@@ -4536,9 +5155,9 @@ logFor(id, `{yellow-fg}⚠ Stopped after ${clicks} click(s) — hit the ${(CRATE
 return true
 }
 } finally {
-if (bots[id]) {
-bots[id].crateRoutineRunning = false
-bots[id].inCrateRoutine = false
+if (bots[id] === entry) {
+entry.crateRoutineRunning = false
+entry.inCrateRoutine = false
 }
 }
 }
@@ -4995,6 +5614,7 @@ let afkWarp = flags.afkWarp == null ? CRATES_ALL_AFK_WARP : flags.afkWarp
 // for one explicitly (afk=now / afk=30).
 if (dump === 'hidden' && flags.afkWarp !== true) afkWarp = false
 const plan = { dump, target, afkWarp, afkDelayMs }
+if (flags.delayMs != null) plan.delayMs = flags.delayMs
 // Only present when this run actually carries dump filters, so a plain plan
 // keeps exactly the shape it has always had.
 if (flags.filter) plan.filter = normalizeDumpFilter(flags.filter)
@@ -5015,6 +5635,14 @@ return `${dump}, ${afk}${filterDesc ? `; ${filterDesc}` : ''}`
 
 async function runCratesAllSequenceForBot(id, blockNameOverride, plan = cratesAllPlan()) {
 const entry = bots[id]
+if (!entry || entry.rtpRunning || entry.cratesSequenceRunning) { logFor(id, '{yellow-fg}⚠ Bot absent, roaming or already running a crate sequence; skipped.{/yellow-fg}'); return }
+entry.cratesSequenceRunning = true
+try {
+return await runCratesAllSequenceSteps(id, blockNameOverride, plan)
+} finally { entry.cratesSequenceRunning = false }
+}
+async function runCratesAllSequenceSteps(id, blockNameOverride, plan) {
+const entry = bots[id]
 if (entry?.manualMode) { logFor(id, `{yellow-fg}⚠ Stop manual interact (/manual-stop) before running /crates-all on ${id}.{/yellow-fg}`); return }
 if (entry.suppressNextWindowClick) entry.suppressNextWindowClick = false
 if (entry.suppressWindowTimer) { clearTimeout(entry.suppressWindowTimer); entry.suppressWindowTimer = null }
@@ -5027,6 +5655,9 @@ logFor(id, `{yellow-fg}⚠ ${id} is already busy with a crate routine — skippi
 return
 }
 const { bot } = entry
+// A routine may spend shards between probes, so do not infer earnings across
+// this sequence; collect a fresh baseline once it is idle again.
+shardTracker.invalidate(id)
 logFor(id, `{cyan-fg}› /crates-all: starting sequence (shardshop → crates → dump)…{/cyan-fg}`)
 
 // 1. /shardshop-loop — sell off everything before making room for more
@@ -5091,15 +5722,21 @@ if (ids.length === 0) { logWarn('No bots to run /crates-all on.'); return }
 
 cratesAllRunning = true
 cratesAllHiddenStarted = false
-logInfo(`Starting /crates-all for ${ids.length} bot(s) [1–${ids.length}], ${(CRATES_ALL_STAGGER_MS / 1000).toFixed(0)}s apart — ${describeCratesAllPlan(plan)}…`)
+logInfo(`Starting /crates-all for ${ids.length} bot(s) [1–${ids.length}], ${(plan.delayMs ?? CRATES_ALL_STAGGER_MS) / 1000}s apart — ${describeCratesAllPlan(plan)}…`)
 
 try {
-await Promise.allSettled(
-ids.map((id, idx) => new Promise((resolve) => {
-setTimeout(() => { runCratesAllSequenceForBot(id, blockNameOverride, plan).finally(resolve) }, idx * CRATES_ALL_STAGGER_MS)
+const results = await Promise.allSettled(
+ids.map((id, idx) => new Promise((resolve, reject) => {
+const entry = bots[id]
+setTimeout(() => {
+if (bots[id] !== entry || !botOnline(entry)) { logFor(SYSTEM_ID, `{yellow-fg}⚠ Scheduled crate target ${sanitize(id)} changed or went offline; skipped.{/yellow-fg}`); resolve(); return }
+runCratesAllSequenceForBot(id, blockNameOverride, plan).then(resolve, reject)
+}, idx * (plan.delayMs ?? CRATES_ALL_STAGGER_MS))
 }))
 )
-logSuccess(`/crates-all finished for all ${ids.length} bot(s).`)
+const failures = results.filter(result => result.status === 'rejected')
+if (failures.length) logError(`/crates-all: ${failures.length} sequence(s) failed — ${sanitize(failures[0].reason?.message || String(failures[0].reason))}`)
+else logSuccess(`/crates-all finished for all ${ids.length} bot(s).`)
 } finally {
 cratesAllRunning = false
 }
@@ -5572,6 +6209,7 @@ const runtimeStartedAt = Date.now() - process.uptime() * 1000
 let timeseriesSampling = false
 
 function recordTimeseriesSample (id, sample, source) {
+  if (Number.isFinite(sample.shards)) shardTracker.observe(id, sample.shards)
   if (!settings.get('TIMESERIES_ENABLED')) return null
   const row = timeseries.botSample({
     bot: id,
@@ -5701,6 +6339,42 @@ function startTimeseriesSampler () {
   }
   const rankText = rankMs > 0 ? ` · ranks every ${cfDuration(rankMs)}` : ' · rank sampling off'
   logFor(SYSTEM_ID, `{cyan-fg}› Time-series sampling every ${cfDuration(intervalMs)} → ${TIMESERIES_FILE}${rankText}{/cyan-fg}`)
+}
+
+// Probe one idle bot at a time, spread over each sampling interval. This is
+// independent of the hourly analytics sampler, and never adds traffic while a
+// bot is using crates, shardshop, coinflip, admission, or manual GUIs.
+let shardSampleCursor = 0
+let shardSampleBusy = false
+let shardNextProbeAt = 0
+async function sampleNextShardBalance (now = Date.now()) {
+if (shardSampleBusy || timeseriesSampling || now < shardNextProbeAt) return false
+const ids = Object.keys(bots)
+if (!ids.length) return false
+const interval = settings.get('SHARD_SAMPLE_INTERVAL_MS')
+for (let i = 0; i < ids.length; i++) {
+  const id = ids[shardSampleCursor++ % ids.length]
+  const entry = bots[id]
+  if (!botOnline(entry) || roamBusy(entry) || entry.rtpRunning || entry.shardProbeAt && now - entry.shardProbeAt < interval) continue
+  shardSampleBusy = true
+  entry.shardProbeAt = now
+  shardNextProbeAt = now + Math.max(1000, Math.floor(interval / ids.length))
+  try {
+    const balance = await queryBalance(id, 'Shards', '/shards')
+    if (bots[id] === entry && botOnline(entry) && !roamBusy(entry) && balance != null) {
+      recordTimeseriesSample(id, { shards: balance }, 'shard-rate')
+      notifyBotsChanged()
+    }
+    return balance != null
+  } finally { shardSampleBusy = false }
+}
+return false
+}
+function startShardSampler () {
+  const timer = setInterval(() => {
+    sampleNextShardBalance().catch(err => logFor(SYSTEM_ID, `{yellow-fg}⚠ Shard sampling failed: ${sanitize(err.message)}{/yellow-fg}`))
+  }, 1000)
+  timer.unref?.()
 }
 
 // ── Analytics (read-only) ────────────────────────────────────────────────────
@@ -6370,7 +7044,7 @@ function handleCommand(raw, ctx) {
   if (chain.length > 1 || /^sleep(?:\s|$)/i.test(chain[0].command) || chain[0].command !== trimmed) {
     const requestedId = ctx && ctx.selectedId
     const activeId = requestedId || currentActiveId()
-    logFor(activeId || SYSTEM_ID, `{bold}{green-fg}❯ ${sanitize(trimmed)}{/green-fg}{/bold}`)
+    logFor(activeId || SYSTEM_ID, `{bold}{green-fg}❯ ${sanitize(commandForLog(trimmed))}{/green-fg}{/bold}`)
 
     return executeCommandChain(chain, ctx)
   }
@@ -6379,6 +7053,7 @@ function handleCommand(raw, ctx) {
 }
 
 function handleSingleCommand(raw, ctx, options = {}) {
+refreshRuntimeConfig()
 const trimmed = String(raw ?? '').trim()
 if (!trimmed) return
 
@@ -6406,7 +7081,40 @@ const logError = (msg) => logFor(activeId || SYSTEM_ID, `{red-fg}✗ ${msg}{/red
 
 // Echo the run command so the log is self-documenting (the web console needs it)
 if (!options.isChained) {
-log(`{bold}{green-fg}❯ ${sanitize(trimmed)}{/green-fg}{/bold}`)
+log(`{bold}{green-fg}❯ ${sanitize(commandForLog(trimmed))}{/green-fg}{/bold}`)
+}
+
+if (/^\/start-login(?:\s|$)/i.test(trimmed)) {
+const args = trimmed.split(/\s+/).slice(1)
+if (args.length && (args.length !== 2 || args[0] !== '--retry')) { logWarn('Usage: /start-login or /start-login --retry <name>'); return }
+const result = robotLogin.start({ retry: args[1] || null })
+if (!result.ok) logError(result.error)
+else logInfo('robot.txt admission started independently of .env connection attempts.')
+return
+}
+if (trimmed === '/stop-login') { robotLogin.stop(); logInfo('Stopped queued admissions; in-flight logins continue.'); return }
+if (/^\/(?:start|stop)-rtp(?:\s|$)/i.test(trimmed)) {
+const start = /^\/start-rtp(?:\s|$)/i.test(trimmed)
+const target = trimmed.replace(/^\/\S+\s*/, '').trim()
+const names = [...new Set([...Object.keys(bots), ...(!start ? pendingRtp.keys() : [])])]
+let ids
+if (!target) ids = start ? parseNameList(process.env.BOT_RTP_BOTS).map(name => names.find(id => id.toLowerCase() === name.toLowerCase()) || name) : names.filter(id => rtpRoaming.active(id) || pendingRtp.has(id))
+else if (target === 'all') ids = names
+else {
+const ranged = parseBroadcastTargets(target, names)
+if (ranged.error) { logWarn(ranged.error); return }
+ids = ranged.selected && !ranged.body ? ranged.ids : target.split(/[\s,]+/).map(name => names.find(id => id.toLowerCase() === name.toLowerCase()) || name)
+}
+if (!ids.length) { logWarn('No RTP targets; configure BOT_RTP_BOTS or specify names/range/all.'); return }
+for (const id of new Set(ids)) {
+if (start) { const result = startRtpTarget(id); if (!result.ok) logWarn(`${id}: ${result.error}`); else if (result.queued) logInfo(`${id}: queued connection and roaming after setup.`) }
+else { cancelPendingRtp(id); rtpRoaming.stop(id) }
+}
+return
+}
+if (activeId && bots[activeId]?.rtpRunning && /^\/(?:crates|crates-loop|crates-solo|dump|dump-spawners|spawners|spawner-drop|manual-interact|manual|use-book|ege|enchanted-golden-apple-extract|shardshop-loop|ai-chat|bot-coinflip|walk)(?:\s|$)/.test(trimmed)) {
+logWarn('Stop roaming with /stop-rtp before starting another routine on this bot.')
+return
 }
 
 // ── Destructive-command confirmation (see DO-NOT-KILL.md) ───────────────────
@@ -6856,12 +7564,13 @@ if (trimmed === '/data' || trimmed.startsWith('/data ')) {
 // ── /overview ───────────────────────────────
 
 if (trimmed === '/overview') {
-const names = Object.keys(bots)
+const names = Object.keys(bots).filter(name => botOnline(bots[name]))
+if (!names.length) { logInfo('No online bots.'); return }
 logInfo('{bold}── Bot Overview Dashboard ──{/bold}')
 logInfo('Querying shards, coins, balance, and rank…')
 
 Promise.all(names.map(name => {
-if (!bots[name]?.bot?.entity) return Promise.resolve({ name, shards: null, coins: null, money: null, rank: null })
+if (!botOnline(bots[name])) return Promise.resolve({ name, shards: null, coins: null, money: null, rank: null })
 return Promise.all([
 queryBalance(name, 'Shards', '/shards'),
 queryBalance(name, 'Coins', '/coins'),
@@ -6872,7 +7581,9 @@ queryBalance(name, 'Balance', '/bal')
 queryRank(name).then(rank => ({ name, shards, coins, money, rank }))
 )
 })).then(results => {
-results.forEach(({ name, shards, coins, money, rank }, idx) => {
+results.forEach(({ name, shards, coins, money, rank }) => {
+if (!botOnline(bots[name])) return
+const idx = Object.keys(bots).indexOf(name)
 recordTimeseriesSample(name, { shards, coins, balance: money, rank: rank || undefined }, 'overview')
 const b = bots[name]
 if (b?.bot?.entity) {
@@ -6886,8 +7597,6 @@ const rk = rank || 'N/A'
 const inv = inventorySlotUsage(b.bot)
 const invTxt = inv.used === null ? '?' : `${inv.used}/${inv.total} used, ${inv.free} free`
 log(`[${idx + 1}] {cyan-fg}${name}{/cyan-fg} : {green-fg}Online{/green-fg} | HP: ${hp} | Food: ${food} | Ping: ${ping}ms | Rank: ${rk} | Shards: ${sh} | Coins: ${co} | Balance: ${mo} | Inv: ${invTxt}`)
-} else {
-log(`[${idx + 1}] {cyan-fg}${name}{/cyan-fg} : {gray-fg}Offline / Connecting…{/gray-fg}`)
 }
 })
 }).catch(err => logError(`Overview failed: ${sanitize(err.message)}`))
@@ -7024,13 +7733,21 @@ logInfo('No outbound proxy configured — bots connect directly. Set PROXY_HOST 
 return
 }
 
-// ── /tor-newnym ─────────────────────────────
-if (trimmed === '/tor-newnym') {
-return requestTorCircuits().then(result => {
-if (!result.results.length) return result
+// ── /tor-newnym [group|bot|all] [--no-reconnect] ──
+if (/^\/tor-newnym(?:\s|$)/.test(trimmed)) {
+const args = trimmed.slice('/tor-newnym'.length).trim().split(/\s+/).filter(Boolean)
+const scopeArg = args.find(a => !a.startsWith('-')) || 'all'
+const reconnect = !args.some(a => /^--?no-?reconnect$/i.test(a))
+return torRotate(scopeArg, { reconnect }).then(result => {
+if (result.error) { logWarn(sanitize(result.error)); return result }
 const okCount = result.results.filter(r => r.ok).length
-if (result.ok) logSuccess(`New Tor circuits requested on all ${result.results.length} instance(s) — reconnects leave through a new path.`)
-else logWarn(`New circuits on ${okCount} of ${result.results.length} Tor instance(s) — the system log says which one failed.`)
+if (!result.results.length) logWarn(`No Tor instance to signal for ${result.label} — the system log explains why.`)
+else if (result.ok) logSuccess(`New Tor circuits on all ${result.results.length} instance(s) for ${result.label}.`)
+else logWarn(`New circuits on ${okCount} of ${result.results.length} Tor instance(s) for ${result.label} — the system log says which one failed.`)
+if (reconnect) {
+if (result.reconnected) logSuccess(`Reconnecting ${result.reconnected} bot(s) for ${result.label} — new connections leave through the fresh circuits.`)
+else logInfo(`No bots to reconnect for ${result.label}.`)
+}
 return result
 })
 }
@@ -7091,6 +7808,38 @@ manual.armWindowSuppression(bots[activeId])
 try { bots[activeId].bot.chat(msg) } catch (err) { logError(`Chat failed: ${sanitize(err.message)}`); return }
 log(`{green-fg}❯{/green-fg} Chat: ${sanitize(msg)}`)
 return
+}
+
+// ── Persistent generated roster ──────────────────────────────────────────
+if (/^\/new-gen(?:\s|$)/i.test(trimmed)) {
+const match = trimmed.match(/^\/new-gen(?:\s+(\d+))?(?:\s+group=(auto|direct|\d+))?$/i)
+if (!match) { logWarn('Usage: /new-gen [1-100] [group=auto|direct|N]'); return }
+try {
+const result = persistGeneratedBots({ file: path.join(__dirname, '.env'), env: process.env, existing: Object.keys(bots), blocked: (removedBots.bots || []).map(row => row.bot), count: Number(match[1] || 1), group: (match[2] || 'auto').toLowerCase(), io: fs })
+refreshRuntimeConfig()
+logSuccess(`Saved ${result.names.length} generated account(s) to .env before connecting.`)
+result.assignments.forEach(({ name, group }, index) => {
+logInfo(`${name}: ${group == null ? 'default/direct route' : `proxy group ${group}`}`)
+setTimeout(() => { if (!Object.hasOwn(bots, name) && !connectBlockReason(name)) createBotInstance(name) }, index * readDelayMs(process.env.ROBOT_CONNECT_DELAY_MS, 5000))
+})
+return result
+} catch (err) { logError(`No accounts connected: generation/save failed (${sanitize(err.code || err.message)}).`); return }
+}
+if (/^\/server-commands(?:\s|$)/i.test(trimmed)) {
+const args = trimmed.slice('/server-commands'.length).trim().split(/\s+/).filter(Boolean)
+const refresh = args.includes('--refresh')
+const query = args.filter(arg => arg !== '--refresh').join(' ').toLowerCase()
+const show = () => {
+const snapshot = serverCommandSnapshot(activeId)
+if (!snapshot.received) { logWarn('No advertised commands yet; select an online bot and use /server-commands --refresh.'); return }
+const rows = snapshot.commands.filter(row => row.command.toLowerCase().includes(query))
+logInfo(`── ${rows.length} server commands for ${sanitize(activeId)} (${snapshot.source}) ──`)
+rows.forEach(row => logInfo(sanitize(row.usages.slice(0, 5).join(' | '))))
+logInfo('Only commands advertised to this account are listed. Use /chat /command to bypass a local command with the same name.')
+return snapshot
+}
+if (refresh) return refreshServerCommands(activeId).then(show).catch(err => logWarn(sanitize(err.message)))
+return show()
 }
 
 // ── /new-bot ────────────────────────────────
@@ -7232,6 +7981,7 @@ if (parsedArgs.badColor) { logWarn(`Unknown crate color. Try one of: ${SHULKER_C
 const flags = parseCratesAllFlags(parsedArgs.flags)
 const unknown = [...flags.unknown, ...parsedArgs.unknown]
 if (unknown.length) { logWarn(`Unknown option "${sanitize(unknown[0])}". Usage: ${CRATES_ALL_USAGE}`); return }
+refreshRuntimeConfig()
 return runCratesAll(maxBots, parsedArgs.blockName, cratesAllPlan({ ...flags, filter: parsedArgs.filter }))
 }
 
@@ -7263,9 +8013,17 @@ if (unknown.length) { logWarn(`Unknown option "${sanitize(unknown[0])}". Usage: 
 
 if (!targetId) { logWarn(`No active bot. Usage: ${CRATES_ALL_SOLO_USAGE}`); return }
 if (!bots[targetId]) { logWarn(`No bot named "${sanitize(targetId)}".`); return }
+if (bots[targetId].rtpRunning) { logWarn('Stop roaming on the crate target first.'); return }
 
 const plan = cratesAllPlan({ ...flags, filter: parsedArgs.filter })
 logInfo(`Starting /crates-solo (shardshop → crates → dump) for ${targetId}${parsedArgs.blockName ? ` targeting ${parsedArgs.blockName.replace(/_/g, ' ')}` : ''} — ${describeCratesAllPlan(plan)}…`)
+if (plan.delayMs > 0) {
+const entry = bots[targetId]
+return new Promise(resolve => setTimeout(() => {
+if (bots[targetId] !== entry || !botOnline(entry)) { logWarn('Scheduled crate target changed or went offline; skipped.'); resolve(); return }
+runCratesAllSequenceForBot(targetId, parsedArgs.blockName, plan).then(resolve, err => { logError(sanitize(err.message)); resolve() })
+}, plan.delayMs))
+}
 return runCratesAllSequenceForBot(targetId, parsedArgs.blockName, plan)
 }
 
@@ -7688,6 +8446,9 @@ if (trimmed === '/analyze' || trimmed.startsWith('/analyze ')) {
 }
 
 if (trimmed === '/env' || trimmed.startsWith('/env ')) {
+  const reloadResult = settings.reload()
+  if (!reloadResult.ok) { logError(reloadResult.error); return }
+  refreshRuntimeConfig()
   const rest = trimmed.slice('/env'.length).trim()
   const parts = rest.split(/\s+/).filter(Boolean)
   const sub = parts[0] || 'list'
@@ -7803,7 +8564,7 @@ if (CHAT_WATCHDOG_ENABLED) {
     const now = Date.now()
     for (const id of Object.keys(bots)) {
       const e = bots[id]
-      if (!botOnline(e) || e.spawnerDropRunning) continue // not spawned or explicitly operating a spawner GUI — nothing to keep alive
+      if (!botOnline(e) || e.rtpRunning || e.spawnerDropRunning) continue // not spawned or explicitly operating a spawner GUI — nothing to keep alive
       const idle = now - (e.lastPlayerChatAt || now)
       if (idle >= CHAT_WATCHDOG_TIMEOUT_MS) {
         e.lastPlayerChatAt = now // reset so it does not re-fire every check tick
@@ -7819,9 +8580,13 @@ if (CHAT_WATCHDOG_ENABLED) {
 }
 
 // ── Interface startup ─────────────────────────────────────────────────────────
+settings.onChange(refreshRuntimeConfig)
+const watchedEnv = settings.watch(path.join(__dirname, '.env'))
+if (!watchedEnv.ok) logWarn(watchedEnv.error)
 tui = startTUI()
 webHandle = startWebGUI()
 startTimeseriesSampler()
+startShardSampler()
 analyticsServer = startAnalyticsServer()
 
 if (tui || webHandle) {

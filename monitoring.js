@@ -62,13 +62,15 @@ function normalizeKickText (message) {
       if (flat) return flat
     } catch (_) { /* not JSON after all */ }
   }
-  return message
+  return tidyChatText(message)
 }
 
 // Collapses the padding and blank lines a branded ban screen is full of, while
 // keeping line breaks (the reason and the expiry live on their own lines).
 function tidyChatText (text) {
   return String(text || '')
+    .replace(/§[0-9a-fk-or]/gi, '')
+    .replace(/\x1b\[[0-9;]*m/g, '')
     .replace(/[\t\u00a0]+/g, ' ')
     .replace(/ {2,}/g, ' ')
     .replace(/\s*\n\s*/g, '\n')
@@ -137,14 +139,17 @@ function classifyKick (message) {
 
   const blacklist = BLACKLIST_RE.test(text)
   const suspect = !blacklist && SUSPECT_RE.test(text)
-  const banWord = blacklist || suspect || BAN_WORD_RE.test(text) || Boolean(EXTRA_BAN_RE && EXTRA_BAN_RE.test(text))
+  // On a kick screen, an explicit "permanent" is authoritative even when
+  // branded components separate it from "banned" or call it a duration.
+  const explicitPermanent = /\bpermanent(?:ly)?\b/i.test(text) || PERM_WORD_RE.test(text) || PERM_EXPIRES_IN_RE.test(text)
+  const banWord = explicitPermanent || blacklist || suspect || BAN_WORD_RE.test(text) || Boolean(EXTRA_BAN_RE && EXTRA_BAN_RE.test(text))
   if (!banWord) return empty
 
   const relative = text.match(BAN_EXPIRES_IN_RE) || text.match(BAN_DURATION_RE)
   const absolute = text.match(BAN_EXPIRES_AT_RE)
-  const duration = relative ? String(relative[1]).replace(/\s+/g, ' ').trim().replace(/[.,]$/, '') : ''
+  const duration = !explicitPermanent && relative ? String(relative[1]).replace(/\s+/g, ' ').trim().replace(/[.,]$/, '') : ''
   const durationMs = parseBanDuration(duration)
-  const expiresAt = absolute ? Date.parse(absolute[1]) || 0 : 0
+  const expiresAt = !explicitPermanent && absolute ? Date.parse(absolute[1]) || 0 : 0
 
   let kind
   if (blacklist) kind = 'blacklist'
@@ -156,7 +161,7 @@ function classifyKick (message) {
   // "Expires in: permanent" — the value is a word, not a number, so the
   // duration regex never sees it and the ban was classified temporary while
   // being held forever. A server that says the ban is permanent in words means it.
-  if (PERM_EXPIRES_IN_RE.test(text)) kind = 'permanent'
+  if (explicitPermanent && !blacklist) kind = 'permanent'
 
   let reason = text
   const reasonMatch = text.match(BAN_REASON_RE)
@@ -208,7 +213,7 @@ function readHostMemory() {
   }
 }
 
-function createMonitoring({ logFor, systemId, sanitize, getStats, getBotCount }) {
+function createMonitoring({ logFor, systemId, sanitize, getStats, getBotCount, getFleetHealth }) {
   const cfg = {
     webhook: (process.env.DISCORD_WEBHOOK_URL || '').trim(),
     userId: (process.env.DISCORD_USER_ID || '').trim(),
@@ -247,11 +252,19 @@ function createMonitoring({ logFor, systemId, sanitize, getStats, getBotCount })
     const color = level === 'error' ? 'red' : level === 'warn' ? 'yellow' : level === 'ok' ? 'green' : 'cyan'
     try { logFor(systemId, `{${color}-fg}[monitor] ${sanitize(message)}{/${color}-fg}`) } catch (_) {}
   }
+  function refreshDiscord() {
+    cfg.webhook = (process.env.DISCORD_WEBHOOK_URL || '').trim()
+    cfg.userId = (process.env.DISCORD_USER_ID || '').trim()
+    cfg.discordEnabled = envBool('DISCORD_NOTIFICATIONS', true)
+    cfg.mentionCriticalOnly = envBool('DISCORD_MENTION_CRITICAL_ONLY', false)
+    cfg.minSendIntervalMs = envInt('DISCORD_MIN_SEND_INTERVAL_MS', 1200, 250)
+  }
   function mention(critical) {
     if (!cfg.userId || (cfg.mentionCriticalOnly && !critical)) return ''
     return `<@${cfg.userId}>`
   }
   async function postDiscord(payload, attempt = 0) {
+    refreshDiscord()
     if (!cfg.discordEnabled || !cfg.webhook || typeof fetch !== 'function') return false
     const wait = Math.max(0, cfg.minSendIntervalMs - (Date.now() - lastDiscordSend))
     if (wait) await new Promise(resolve => setTimeout(resolve, wait))
@@ -279,6 +292,8 @@ function createMonitoring({ logFor, systemId, sanitize, getStats, getBotCount })
     return false
   }
   function notify({ key, title, description, color = 0xf59e0b, critical = false, cooldownMs = cfg.eventCooldownMs, fields = [] }) {
+    refreshDiscord()
+    if (!envBool('DISCORD_VERBOSE_ALERTS', false)) return Promise.resolve(false)
     const now = Date.now()
     if (key && now - (eventTimes.get(key) || 0) < cooldownMs) return Promise.resolve(false)
     if (key) eventTimes.set(key, now)
@@ -421,13 +436,38 @@ function createMonitoring({ logFor, systemId, sanitize, getStats, getBotCount })
   function onFatal(kind, details) {
     return notify({ key: `fatal:${kind}`, title: `Bot process ${kind}`, description: clampText(details, 3500), color: 0xdc2626, critical: true, cooldownMs: 60000 })
   }
+  let outage = false
+  let lastOutageAlert = null
+  async function checkFleet() {
+    refreshDiscord()
+    const health = getFleetHealth ? getFleetHealth() : { ready: false }
+    if (!health.ready || !Number.isInteger(health.total) || health.total <= 0) return false
+    const offline = health.total - health.online
+    // Strictly greater than 2/5, not >=. Recovery resets the outage episode;
+    // no recovery message and no coordinates ever enter this payload.
+    if (offline * 5 <= health.total * 2) { outage = false; lastOutageAlert = null; return false }
+    const now = Date.now()
+    const reminder = envInt('DISCORD_OFFLINE_REMINDER_MS', 1800000, 0)
+    if (outage && (!reminder || (lastOutageAlert != null && now - lastOutageAlert < reminder))) return false
+    if (!cfg.discordEnabled || !cfg.webhook) return false
+    outage = true
+    lastOutageAlert = now
+    local('warn', `Fleet outage: ${offline}/${health.total} bots offline`)
+    const payload = { content: `${mention(true)} ${offline}/${health.total} bots offline`.trim(), allowed_mentions: { parse: [], users: cfg.userId ? [cfg.userId] : [] } }
+    queue = queue.then(() => postDiscord(payload)).catch(err => { local('error', `Discord queue error: ${err.message}`); return false })
+    const sent = await queue
+    if (!sent) { outage = false; lastOutageAlert = null }
+    return sent
+  }
+  const fleetTimer = setInterval(checkFleet, 10000)
+  fleetTimer.unref?.()
   let timer = null
   if (cfg.memoryEnabled) {
     timer = setInterval(checkMemory, cfg.memoryIntervalMs)
     if (timer.unref) timer.unref()
     setTimeout(checkMemory, 1000).unref?.()
   }
-  return { cfg, notify, checkMemory, getMemorySnapshot: () => ({ ...memory }), inspectServerMessage, onKick, onBan, onAuthFailure, onDisconnect, onRecovered, onReconnectExhausted, onProxyStall, onSecurityLockout, onFatal, stop: () => timer && clearInterval(timer) }
+  return { cfg, notify, checkFleet, checkMemory, getMemorySnapshot: () => ({ ...memory }), inspectServerMessage, onKick, onBan, onAuthFailure, onDisconnect, onRecovered, onReconnectExhausted, onProxyStall, onSecurityLockout, onFatal, stop: () => { if (timer) clearInterval(timer); clearInterval(fleetTimer) } }
 }
 
 module.exports = { createMonitoring, classifyKick, chatText, parseBanDuration }
