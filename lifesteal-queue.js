@@ -12,8 +12,14 @@
 //            player until deathban, then a fresh random bot takes over.
 //   idle   — every other bot stays `/warp afk` (sent once, not spammed).
 // Roster  — every ROSTER_TICK_MS the manager tops the fleet back up to
-//            TARGET_BOTS via /new-gen semantics (persistGeneratedBots +
-//            staggered connects). It NEVER removes bots.
+//            TARGET_BOTS (default 20) via /new-gen semantics
+//            (persistGeneratedBots + staggered connects). It NEVER removes
+//            bots. Server-banned bots count as missing, so a ban wave is
+//            replaced with fresh /new-gen names and the loop continues like
+//            nothing happened.
+// Tor     — /lifesteal-start restarts Tor FIRST via
+//            `brew services restart tor` (LIFESTEAL_TOR_RESTART_CMD override).
+//            Nothing else about Tor is touched (no NEWNYM/proxy changes).
 //
 // Deathban note: a lifesteal deathban (~24h) still lets the account join the
 // server, it just cannot `/server lifesteal`. Deathbanned bots are therefore
@@ -28,7 +34,7 @@
 // fake bots. All server traffic goes through deps.sendChat(id, msg).
 
 const DEFAULTS = {
-  targetBots: 25,
+  targetBots: 20,
   duelsCmd: '/duelsroomqueue',
   queueCmd: '/queue',
   arenaWarp: '/warp arena',
@@ -73,6 +79,15 @@ function readConfig (env) {
     deathbanMs: num('LIFESTEAL_DEATHBAN_MS', DEFAULTS.deathbanMs, 60000),
     resendCooldownMs: num('LIFESTEAL_RESEND_MS', DEFAULTS.resendCooldownMs, 5000),
   }
+}
+
+// Tor restart command used ONLY by /lifesteal-start (runs first, before any
+// role assignment). Deliberately separate from PROXY_RESTART_CMD and the
+// NEWNYM machinery so no other Tor behavior changes.
+function lifestealTorRestartCmd (env) {
+  const e = env || {}
+  const custom = String(e.LIFESTEAL_TOR_RESTART_CMD || '').trim()
+  return custom || 'brew services restart tor'
 }
 
 // Deathban wording seen on lifesteal servers: "deathban", "death banned",
@@ -142,6 +157,10 @@ function createLifestealQueue (deps) {
   // ensureRoster(missing) -> called when fleet is below target; bot.js wires
   // this to persistGeneratedBots + staggered createBotInstance. Never removes.
   const ensureRoster = deps.ensureRoster || (() => ({ ok: false, error: 'no roster hook' }))
+  // isBanned(id) -> true when the account is server-banned (bot.js wires this
+  // to the persisted dataStore ban flag). Banned bots are excluded from roles
+  // and counted as missing so /new-gen replaces them.
+  const isBanned = deps.isBanned || (() => false)
   const getEnv = deps.getEnv || (() => ({}))
 
   const state = {
@@ -161,7 +180,15 @@ function createLifestealQueue (deps) {
     const bots = getBots() || {}
     return Object.keys(bots).filter(id => {
       if (isDeathbanned(id)) return false
+      try { if (isBanned(id)) return false } catch (_) {}
       try { return isOnline(bots[id]) } catch (_) { return false }
+    })
+  }
+
+  function bannedIds () {
+    const bots = getBots() || {}
+    return Object.keys(bots).filter(id => {
+      try { return isBanned(id) } catch (_) { return false }
     })
   }
 
@@ -463,19 +490,28 @@ function createLifestealQueue (deps) {
     state.tpa.nextAt = t + state.cfg.tpaCooldownMs + Math.floor(Math.random() * Math.max(0, state.cfg.tpaIntervalMs - state.cfg.tpaCooldownMs))
   }
 
+  function requestTopUp (missing, why) {
+    if (!(missing > 0)) return
+    log(null, `roster ${why} — requesting ${missing} via /new-gen (never removes)`)
+    try {
+      const out = ensureRoster(missing)
+      if (out && typeof out.then === 'function') out.catch(err => log(null, `roster top-up failed: ${err && err.message ? err.message : err}`))
+    } catch (err) { log(null, `roster top-up failed: ${err && err.message ? err.message : err}`) }
+  }
+
   function maintainRoster () {
     const t = now()
     if (t - state.lastRosterCheck < state.cfg.rosterTickMs) return
     state.lastRosterCheck = t
     state.cfg = readConfig(getEnv())
+    // Banned bots are dead weight for lifesteal: count them as missing so the
+    // fleet is topped back up to a full set of usable bots.
     const total = allIds().length
-    const missing = state.cfg.targetBots - total
+    const banned = bannedIds().length
+    const effective = total - banned
+    const missing = state.cfg.targetBots - effective
     if (missing > 0) {
-      log(null, `roster ${total}/${state.cfg.targetBots} — requesting ${missing} via /new-gen (never removes)`)
-      try {
-        const out = ensureRoster(missing)
-        if (out && typeof out.then === 'function') out.catch(err => log(null, `roster top-up failed: ${err && err.message ? err.message : err}`))
-      } catch (err) { log(null, `roster top-up failed: ${err && err.message ? err.message : err}`) }
+      requestTopUp(missing, `${effective}/${state.cfg.targetBots} usable (${banned} banned)`)
     }
   }
 
@@ -547,6 +583,25 @@ function createLifestealQueue (deps) {
   }
 
   // ── events ─────────────────────────────────────────────────────────────
+  // A server ban must not stall the loop: drop the role, immediately order a
+  // /new-gen replacement for the lost bot, and refill the role from whoever
+  // is still usable. The banned account itself is left alone (never removed).
+  function onBan (id, reason) {
+    if (!state.running) return
+    const r = roleOf(id)
+    try { stopForward(id) } catch (_) {}
+    if (r === 'arena') resetArena()
+    if (r) {
+      state.roles[r] = null
+      log(null, `${r} bot ${id} banned (${reason || 'ban detected'}) — replacing via /new-gen and picking a new random bot`)
+    } else {
+      log(null, `bot ${id} banned (${reason || 'ban detected'}) — replacing via /new-gen`)
+    }
+    state.afkSent.delete(id)
+    requestTopUp(1, `ban replacement for ${id}`)
+    try { tick() } catch (_) {}
+  }
+
   function onDeath (id) {
     if (!state.running) return
     if (isDeathbanned(id)) return
@@ -592,14 +647,15 @@ function createLifestealQueue (deps) {
 
   return {
     start, stop, status, tick,
-    onDeath, onKick, onMessage,
-    isDeathbanned, roleOf,
+    onDeath, onKick, onBan, onMessage,
+    isDeathbanned, roleOf, bannedIds,
     _state: state, _readConfig: readConfig,
   }
 }
 
 module.exports = {
   createLifestealQueue,
+  lifestealTorRestartCmd,
   readConfig,
   isDeathbanText,
   isBlockedAhead,

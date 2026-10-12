@@ -1244,7 +1244,8 @@ const LOCAL_COMMANDS = ['/server-commands', '/start-rtp', '/stop-rtp', '/evidenc
 // hold forward until collision, one bot spams /tpa round-robin until
 // deathban (parked 24h, can still join server just not /server lifesteal),
 // everyone else stays /warp afk. Roster tops up to LIFESTEAL_TARGET_BOTS
-// (default 25) via /new-gen semantics and never removes bots.
+// (default 20) via /new-gen semantics and never removes bots. Server-banned
+// bots count as missing so they are replaced with fresh names.
 const lifestealQueue = require(path.join(__dirname, 'lifesteal-queue')).createLifestealQueue({
   getBots: () => bots,
   isOnline: (entry) => botOnline(entry),
@@ -1255,6 +1256,7 @@ const lifestealQueue = require(path.join(__dirname, 'lifesteal-queue')).createLi
   },
   log: (id, msg) => logFor(id || SYSTEM_ID, `{cyan-fg}[lifesteal] ${sanitize(msg)}{/cyan-fg}`),
   getEnv: () => process.env,
+  isBanned: (id) => { try { const row = dataState.bots[id]; return Boolean(row?.banned && dataStore.isBanActive(row).held) } catch (_) { return false } },
   ensureRoster: (missing) => {
     try {
       const result = persistGeneratedBots({ file: path.join(__dirname, '.env'), env: process.env, existing: Object.keys(bots), blocked: (removedBots.bots || []).map(row => row.bot), count: Number(missing) || 1, group: 'auto', io: fs })
@@ -4190,6 +4192,7 @@ if (PERMANENT_BAN_ACTION === 'remove' && dropFromRoster(id)) logFor(id, `{yellow
 }
 if (banVerdict.banned) {
   if (banVerdict.kind !== 'temporary') robotLogin.fail(id, `Kicked during admission: ${text}`)
+  try { lifestealQueue.onBan(id, banVerdict.reason || text) } catch (_) {}
   autoTorRotation.check().catch(err => logFor(SYSTEM_ID, `{red-fg}[Tor] Check failed: ${sanitize(err.message)}{/red-fg}`))
 }
 monitoring?.onKick(id, text)
@@ -4449,7 +4452,7 @@ const COMMANDS = {
 '/reconnect-all-slow': 'Reconnect ALL bots (online or offline) with a 30s delay between each to avoid rate limits',
 '/new-bot <n> [host] [port] [ver]': 'Create and connect a new bot',
 '/new-gen [count] [group=auto|direct|N]': 'Generate unique Minecraft names, atomically save to .env and balanced proxy groups, then connect staggered (1–100).',
-'/lifesteal-start': 'Start lifesteal automation: random bot /duelsroomqueue + random bot /queue (replaced on death, same bot allowed), one non-queue bot loops /warp arena → 5s → forward-until-hit, one bot spams /tpa until deathban (24h park), rest /warp afk, roster tops up to LIFESTEAL_TARGET_BOTS=25 via /new-gen (never removes)',
+'/lifesteal-start': 'Restarts Tor first (brew services restart tor, LIFESTEAL_TOR_RESTART_CMD override — nothing else Tor-related changes), then: random bot /duelsroomqueue + random bot /queue (replaced on death, same bot allowed), one non-queue bot loops /warp arena → 5s → forward-until-hit, one bot spams /tpa until deathban (24h park), rest /warp afk. Banned bots are replaced via /new-gen so the loop continues; roster tops up to LIFESTEAL_TARGET_BOTS=20 (never removes)',
 '/lifesteal-stop': 'Stop lifesteal automation and release held forward keys',
 '/lifesteal-status': 'Show lifesteal roles (duels/queue/arena/tpa), online/total counts and deathbanned bots',
 '/server-commands [filter] [--refresh]': 'List commands advertised by the Minecraft server to the selected account; refresh uses tab completion, never executes commands.',
@@ -4961,7 +4964,21 @@ case '/evidence': {
   return true
 }
 case '/spawner-drop': return spawnerDrop.route(id, String(cmd).slice('/spawner-drop'.length))
-case '/lifesteal-start': { const r = lifestealQueue.start(); logFor(id, r.ok ? '{green-fg}✓ Lifesteal automation started.{/green-fg}' : `{yellow-fg}⚠ ${sanitize(r.error || 'already running')}{/yellow-fg}`); return true }
+case '/lifesteal-start': {
+  // Tor-first: restart the local Tor service before assigning any roles.
+  // Scoped to this command only — PROXY_RESTART_CMD / NEWNYM / watchdog paths are untouched.
+  const lifestealTorCmd = (process.env.LIFESTEAL_TOR_RESTART_CMD || '').trim() || 'brew services restart tor'
+  logFor(id, `{cyan-fg}[lifesteal] Restarting Tor first: ${sanitize(lifestealTorCmd)}…{/cyan-fg}`)
+  try {
+    exec(lifestealTorCmd, { timeout: 120000 }, (err, stdout, stderr) => {
+      if (err) logFor(id, `{yellow-fg}⚠ [lifesteal] Tor restart exited with an error (continuing anyway): ${sanitize(err.message)}${stderr ? ' — ' + sanitize(String(stderr).slice(0, 200)) : ''}{/yellow-fg}`)
+      else logFor(id, `{green-fg}✓ [lifesteal] Tor restart done${stdout ? ': ' + sanitize(String(stdout).slice(0, 200)) : ''}. Continuing.{/green-fg}`)
+    })
+  } catch (err) { logFor(id, `{yellow-fg}⚠ [lifesteal] Tor restart failed to launch (continuing anyway): ${sanitize(err.message)}{/yellow-fg}`) }
+  const r = lifestealQueue.start()
+  logFor(id, r.ok ? '{green-fg}✓ Lifesteal automation started.{/green-fg}' : `{yellow-fg}⚠ ${sanitize(r.error || 'already running')}{/yellow-fg}`)
+  return true
+}
 case '/lifesteal-stop': { const r = lifestealQueue.stop(); logFor(id, r.ok ? '{green-fg}✓ Lifesteal automation stopped.{/green-fg}' : `{yellow-fg}⚠ ${sanitize(r.error || 'not running')}{/yellow-fg}`); return true }
 case '/lifesteal-status': {
   const s = lifestealQueue.status()

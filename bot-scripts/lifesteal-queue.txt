@@ -1,4 +1,5 @@
 # lifesteal-queue — run with: /lifesteal-start (not /run-script lifesteal-queue)
+# /lifesteal-start restarts Tor FIRST: brew services restart tor
 # This file documents the JS automation in lifesteal-queue.js. The .txt runner
 # cannot do random picks / death replacement / collision / deathban loops, so
 # the real automation is the /lifesteal-start command wired in bot.js.
@@ -13,7 +14,9 @@
 #     deathban (~24h: can still join server, just not /server lifesteal),
 #     then a fresh random bot takes over and the banned one is parked
 #   - every other bot stays /warp afk (sent once)
-#   - roster tops up to LIFESTEAL_TARGET_BOTS=25 via /new-gen, never removes
+#   - roster tops up to LIFESTEAL_TARGET_BOTS=20 via /new-gen, never removes
+#   - banned bots count as missing: replaced with fresh /new-gen names so the
+#     loop continues like nothing happened
 #
 # Commands:
 #   /lifesteal-start | /lifesteal-stop | /lifesteal-status
