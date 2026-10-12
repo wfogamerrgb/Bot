@@ -12,7 +12,8 @@ function makeHarness (names, opts) {
     if (opts.botExtra) Object.assign(bots[n].bot, opts.botExtra(n))
   }
   let t = 1000000
-  const env = { LIFESTEAL_TARGET_BOTS: '25', ...(opts.env || {}) }
+  const env = { LIFESTEAL_TARGET_BOTS: '20', ...(opts.env || {}) }
+  const banned = new Set(opts.banned || [])
   const q = LQ.createLifestealQueue({
     getBots: () => bots,
     isOnline: (e) => !!e?.bot?.entity,
@@ -20,6 +21,7 @@ function makeHarness (names, opts) {
     log: () => {},
     now: () => t,
     getEnv: () => env,
+    isBanned: (id) => banned.has(id),
     ensureRoster: (missing) => { harness.rosterAsked.push(missing); return { ok: true } },
     rand: (n) => 0, // deterministic: always first of pool
     setTimer: () => ({}),
@@ -90,11 +92,11 @@ test('deathban parks the tpa bot for 24h and promotes a fresh bot', () => {
 })
 
 test('roster maintainer asks for missing bots but never removes', () => {
-  const h = makeHarness(['A', 'B'], { env: { LIFESTEAL_TARGET_BOTS: '25', LIFESTEAL_ROSTER_TICK_MS: '0' } })
+  const h = makeHarness(['A', 'B'], { env: { LIFESTEAL_TARGET_BOTS: '20', LIFESTEAL_ROSTER_TICK_MS: '0' } })
   h.q.start()
   h.q.tick()
   assert.ok(h.rosterAsked.length >= 1, 'should request top-up when below target')
-  assert.equal(h.rosterAsked[0], 23)
+  assert.equal(h.rosterAsked[0], 18)
   // above target: no request
   h.rosterAsked.length = 0
   for (let i = 0; i < 30; i++) h.bots['X' + i] = { bot: { entity: {} } }
@@ -118,4 +120,39 @@ test('arena bot is never the duels or queue bot', () => {
     assert.ok(s.arena !== s.duels && s.arena !== s.queue, `run ${i}: arena distinct`)
     h.q.stop()
   }
+})
+
+test('banned bots are excluded from roles and replaced via /new-gen', () => {
+  const h = makeHarness(['A', 'B', 'C', 'D', 'E', 'F'], { banned: ['A', 'B'] })
+  h.q.start()
+  const s = h.q.status()
+  for (const holder of Object.values(s.roles).filter(Boolean)) {
+    assert.ok(holder !== 'A' && holder !== 'B', 'banned bots must not hold roles')
+  }
+  h.q.tick()
+  h.advance(70000)
+  h.q.tick()
+  // 6 total - 2 banned = 4 effective < 20 target -> top-up asked
+  assert.ok(h.rosterAsked.length >= 1, 'banned bots should count as missing')
+  h.q.stop()
+})
+
+test('onBan drops the role, orders one replacement, and refills immediately', () => {
+  const h = makeHarness(['A', 'B', 'C', 'D', 'E', 'F'])
+  h.q.start()
+  const first = h.q.status().roles.duels
+  assert.ok(first)
+  h.env.LIFESTEAL_ROSTER_TICK_MS = '999999999'
+  h.rosterAsked.length = 0
+  h.q.onBan(first, 'banned: test wave')
+  assert.equal(h.rosterAsked.length, 1, 'a ban should order exactly one /new-gen replacement')
+  assert.equal(h.rosterAsked[0], 1)
+  assert.ok(h.q.status().roles.duels, 'duels role should be refilled from usable bots')
+  h.q.stop()
+})
+
+test('lifestealTorRestartCmd defaults to brew services restart tor', () => {
+  assert.equal(LQ.lifestealTorRestartCmd({}), 'brew services restart tor')
+  assert.equal(LQ.lifestealTorRestartCmd({ LIFESTEAL_TOR_RESTART_CMD: 'systemctl restart tor' }), 'systemctl restart tor')
+  assert.equal(LQ.lifestealTorRestartCmd({ LIFESTEAL_TOR_RESTART_CMD: '  ' }), 'brew services restart tor')
 })
