@@ -17,7 +17,7 @@ function harness(text = 'New1\nNew2\nNew3\nNew4', options = {}) {
   }
   const manager = createRobotLogin({ io, env: () => env, now: () => time, random: () => 0.999, setTimer(fn, delay) { const t = { fn, at: time + delay, delay }; timers.set(t, t); return t }, clearTimer: t => timers.delete(t), startupPending: () => pending, roster: () => options.roster || [], existing: () => [...live], blocked: name => name === 'Banned', connect(name) { attempts.push({ name, time, route: manager.route(name) }); live.add(name); return true }, close(name) { closed.push(name); live.delete(name) }, send(name, cmd) { sent.push([name, cmd, time]) }, log: text => logs.push(text), isPlayerChat: text => text.startsWith('Player:') })
   function advance(ms) { const end = time + ms; for (;;) { const next = [...timers.values()].filter(t => t.at <= end).sort((a, b) => a.at - b.at)[0]; if (!next) break; timers.delete(next); time = next.at; next.fn() } time = end }
-  return { manager, files, attempts, closed, sent, logs, env, advance, setPending: p => { pending = p }, live }
+  return { manager, files, attempts, closed, sent, logs, env, advance, stall(ms) { time += ms }, flush() { const due = [...timers.values()].filter(t => t.at <= time); for (const t of due) { timers.delete(t); t.fn() } }, setPending: p => { pending = p }, live }
 }
 test('ignores pending startup attempts, skips case-insensitive ghosts and blocked names without cooldown or route slots', () => {
   const h = harness('Old\nold\nLive\nBanned\nBad-name\nRemoved\nNew1\nNEW1\nNew2\nNew3\nNew4', { roster: ['OLD'], live: ['LIVE'], env: { PROXY_GROUP_1_HOST: 'p1', PROXY_GROUP_3_HOST: 'p3' } })
@@ -33,7 +33,7 @@ test('ignores pending startup attempts, skips case-insensitive ghosts and blocke
 test('routes ignore invalid proxies and include valid empty-list/gapped groups', () => {
   assert.deepEqual(admissionRoutes({ PROXY_GROUP_1_HOST: 'x', PROXY_GROUP_1_PORT: 'bad', PROXY_GROUP_2_HOST: 'x', PROXY_GROUP_2_TYPE: 'ssh', PROXY_GROUP_8_HOST: 'proxy', PROXY_GROUP_8_BOTS: '' }).map(r => r?.index ?? null), [null, 8])
 })
-test('password candidates advance only after rejection, wait 1.5 seconds and stop on success', () => {
+test('password candidates advance only after rejection, wait at least 5 seconds and stop on success', () => {
   const h = harness('New1')
   h.manager.start()
   h.manager.onMessage('New1', 'Please /login password')
@@ -43,12 +43,12 @@ test('password candidates advance only after rejection, wait 1.5 seconds and sto
   h.manager.onMessage('New1', 'Player: wrong password')
   h.manager.onMessage('New1', 'Wrong password!')
   h.manager.onMessage('New1', 'Please /login password')
-  h.advance(1499)
+  h.advance(4999)
   assert.equal(h.sent.length, 1)
   h.advance(1)
   assert.equal(h.sent[1][1], '/login two')
   h.manager.onMessage('New1', 'Wrong password')
-  h.advance(1500)
+  h.advance(5000)
   assert.equal(h.sent[2][1], '/login three')
   h.manager.onMessage('New1', 'Successfully logged in!')
   h.manager.setupReady('New1')
@@ -56,6 +56,31 @@ test('password candidates advance only after rejection, wait 1.5 seconds and sto
   h.advance(180000)
   assert.equal(h.closed.length, 0)
   assert.equal(h.manager.fail('New1', 'later error'), false, 'normal reconnect resumes after setup')
+})
+test('all routes, register commands and fallback candidates share a global five-second send queue', () => {
+  const h = harness('New1\nNew2\nNew3', { env: { ROBOT_CONNECT_DELAY_MS: '1', ROBOT_AUTH_DELAY_MS: '1', PROXY_GROUP_1_HOST: 'localhost' } })
+  h.manager.start(); h.advance(2)
+  h.manager.onMessage('New1', 'Please /login password')
+  h.manager.onMessage('New2', 'Please /register password')
+  h.manager.onMessage('New3', 'Please /login password')
+  h.advance(250)
+  h.manager.onMessage('New1', 'Wrong password')
+  h.advance(15000)
+  assert.deepEqual(h.sent.map(row => row[0]), ['New1', 'New2', 'New3', 'New1'])
+  assert.deepEqual(h.sent.map(row => row[2]), [252, 5252, 10252, 15252])
+  assert.match(h.sent[1][1], /^\/register /)
+  assert.equal(h.sent[3][1], '/login two')
+})
+test('late event-loop timers cannot burst authentication sends', () => {
+  const h = harness('New1\nNew2', { env: { ROBOT_CONNECT_DELAY_MS: '1' } })
+  h.manager.start(); h.advance(1)
+  h.manager.onMessage('New1', 'Please /login password')
+  h.manager.onMessage('New2', 'Please /login password')
+  h.stall(20000); h.flush()
+  assert.equal(h.sent.length, 1)
+  h.advance(4999); assert.equal(h.sent.length, 1)
+  h.advance(1); assert.equal(h.sent.length, 2)
+  assert.equal(h.sent[1][2] - h.sent[0][2], 5000)
 })
 test('success during fallback wait cancels pending password and waits for setup', () => {
   const h = harness('New1')

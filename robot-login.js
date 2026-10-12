@@ -30,6 +30,9 @@ function createRobotLogin({ env = () => process.env, directory = __dirname, io =
   let routeIndex = 0
   let lastAttempt = null
   let running = false
+  let nextAuthSlot = 0
+  let lastAuthSent = null
+  const authGap = () => Math.max(5000, readDelayMs(env().ROBOT_AUTH_DELAY_MS, 5000))
   const file = name => path.join(directory, name)
   function read(name, optional = false) {
     try { return io.readFileSync(file(name), 'utf8') } catch (err) {
@@ -41,7 +44,7 @@ function createRobotLogin({ env = () => process.env, directory = __dirname, io =
   function state(name) { return states.get(keyOf(name)) }
   function cleanReason(reason) {
     let text = String(reason || 'Admission failed').replace(/[\r\n\t]/g, ' ')
-    for (const s of states.values()) for (const password of s.passwords) if (password) text = text.split(password).join('[redacted]')
+    for (const s of states.values()) for (const password of s.passwords) if (password) text = text.split(password).join('••••')
     return text.slice(0, 500)
   }
   function cancelAuth(s) {
@@ -81,15 +84,23 @@ function createRobotLogin({ env = () => process.env, directory = __dirname, io =
     if (s.scheduled) return
     s.kind = kind
     s.scheduled = true
-    s.authTimer = setTimer(() => {
-      s.scheduled = false
+    // Reserve FIFO slots across every admission, route and fallback. Recheck
+    // actual send time too: delayed event-loop callbacks must never burst.
+    const due = Math.max(now() + delay, nextAuthSlot)
+    nextAuthSlot = due + authGap()
+    const dispatch = () => {
       s.authTimer = null
-      if (s.phase === 'blocked' || s.authenticated) return
+      if (s.phase === 'blocked' || s.authenticated) { s.scheduled = false; return }
+      const remaining = lastAuthSent == null ? 0 : lastAuthSent + authGap() - now()
+      if (remaining > 0) { s.authTimer = setTimer(dispatch, remaining); return }
+      s.scheduled = false
       const password = s.passwords[s.passwordIndex]
       if (!password) { fail(s.name, 'No login password configured'); return }
       s.sentAt = now()
+      lastAuthSent = s.sentAt
       try { send(s.name, kind === 'register' ? `/register ${password} ${password}` : `/login ${password}`) } catch (_) { fail(s.name, 'Failed to send authentication command') }
-    }, delay)
+    }
+    s.authTimer = setTimer(dispatch, due - now())
   }
   function onMessage(name, message) {
     const s = state(name)
@@ -110,7 +121,7 @@ function createRobotLogin({ env = () => process.env, directory = __dirname, io =
       if (verdict.kind === 'bad-password' && s.passwordIndex + 1 < s.passwords.length) {
         s.passwordIndex++
         cancelAuth(s)
-        schedulePassword(s, s.kind || 'login', readDelayMs(env().ROBOT_PASSWORD_DELAY_MS, 1500))
+        schedulePassword(s, s.kind || 'login', Math.max(authGap(), readDelayMs(env().ROBOT_PASSWORD_DELAY_MS, 5000)))
         log(`${s.name}: password rejected; trying candidate ${s.passwordIndex + 1} after the configured delay.`)
       } else fail(name, verdict.kind === 'bad-password' ? 'All configured login passwords rejected' : `Authentication ${verdict.kind}`)
       return true
@@ -137,9 +148,24 @@ function createRobotLogin({ env = () => process.env, directory = __dirname, io =
     // to the rejected primary on every ordinary reconnect.
     return env()[s.passwordKeys[s.passwordIndex]] || s.passwords[s.passwordIndex]
   }
+  function waitForBan(name) {
+    const s = state(name)
+    if (!s || !['admitting', 'waiting-ban'].includes(s.phase)) return false
+    cancelAuth(s)
+    if (s.timeout) clearTimer(s.timeout)
+    s.phase = 'waiting-ban'
+    s.sentAt = null
+    return true
+  }
   function reconnect(name) {
     const s = state(name)
-    if (!s || s.phase !== 'admitted') return
+    if (s?.phase === 'waiting-ban') {
+      s.phase = 'admitting'
+      s.authenticated = false
+      s.setupReady = false
+      s.timeout = setTimer(() => fail(name, 'Login/setup admission timed out'), readDelayMs(env().ROBOT_ADMISSION_TIMEOUT_MS, 180000))
+    }
+    if (!s || !['admitted', 'admitting'].includes(s.phase)) return
     cancelAuth(s)
     s.authenticated = false
     s.sentAt = null
@@ -215,6 +241,6 @@ function createRobotLogin({ env = () => process.env, directory = __dirname, io =
     } catch (err) { return { ok: false, error: `Cannot read robot.txt/removed.txt (${err.code || 'I/O error'})` } }
   }
   function stop() { running = false; queue = []; if (timer) clearTimer(timer); timer = null }
-  return { start, stop, state, fail, route, setupReady, onMessage, reconnect, rememberedPassword, pending: () => running, isAdmitting: name => state(name)?.phase === 'admitting' }
+  return { start, stop, state, fail, waitForBan, route, setupReady, onMessage, reconnect, rememberedPassword, pending: () => running, isAdmitting: name => state(name)?.phase === 'admitting' }
 }
 module.exports = { createRobotLogin, admissionRoutes, namesFromText }

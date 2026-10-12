@@ -15,6 +15,7 @@ function runtime(env = {}) {
   const timers = new Map()
   const createdBots = []
   const authAlerts = []
+  const torRotations = []
   // Two HTTP servers run in production (dashboard, analytics) on different
   // ports, so handlers are routed by the port each one listens on. "Last
   // created" would let startAnalyticsServer() shadow the dashboard.
@@ -63,8 +64,9 @@ function runtime(env = {}) {
     mkdirSync() {}, renameSync(from, to) { fakeFiles.set(path.basename(to), fakeFiles.get(path.basename(from))); fakeFiles.delete(path.basename(from)) }, unlinkSync(file) { fakeFiles.delete(path.basename(file)) }, existsSync: () => false
   }
   const source = fs.readFileSync(path.join(__dirname, '..', 'bot.js'), 'utf8')
+  const Clock = class extends Date { static now() { return env.TEST_CLOCK_NOW ?? Date.now() } }
   const context = vm.createContext({
-    Buffer, URL, URLSearchParams, console, process: processMock, __dirname: path.join(__dirname, '..'),
+    Date: Clock, Buffer, URL, URLSearchParams, console, process: processMock, __dirname: path.join(__dirname, '..'),
     setTimeout: setTimer, clearTimeout: clearTimer,
     setInterval: setTimer, clearInterval: clearTimer, setImmediate: fn => setTimer(fn, 0),
     require(name) {
@@ -104,13 +106,19 @@ function runtime(env = {}) {
       if (name === './monitoring') return {
         // A ban verdict that matches nothing, so the kick path stays exercised
         // without a live connection.
-        classifyKick: message => ({ banned: false, permanent: false, kind: '', duration: '', durationMs: 0, expiresAt: 0, reason: String(message ?? ''), caseId: '', text: String(message ?? '') }),
+        classifyKick: env.TEST_CLASSIFY_KICK ? require('../monitoring').classifyKick : message => ({ banned: false, permanent: false, kind: '', duration: '', durationMs: 0, expiresAt: 0, reason: String(message ?? ''), caseId: '', text: String(message ?? '') }),
         // Alerts are recorded rather than dropped: "alert once" is a property of
         // the auth guard, so it has to be observable from a test.
         createMonitoring: () => ({ getMemorySnapshot: () => null, onDisconnect() {}, onKick() {}, onBan() {}, onAuthFailure(botId, failure) { authAlerts.push({ botId, failure }) }, onProxyStall() {}, onReconnectExhausted() {}, onFatal() {}, onSecurityLockout() {}, inspectServerMessage() {}, onRecovered() {} })
       }
       // Resolved against this test file, not against bot.js, so it needs an entry.
       if (name === './removed-bots') return require('../removed-bots')
+      if (name === './tor-fleet') {
+        const tor = require('../tor-fleet')
+        return env.TEST_TOR_ROTATION ? { ...tor, createAllBannedTorRotation: opts => tor.createAllBannedTorRotation({ ...opts, rotate: async endpoint => { torRotations.push(endpoint); return { ok: true, before: '198.51.100.1', after: '198.51.100.2' } } }) } : tor
+      }
+      if (name === path.join(__dirname, '..', 'robot-login')) return { createRobotLogin: opts => require('../robot-login').createRobotLogin({ ...opts, random: () => 0.999, now: () => Number(processMock.env.TEST_AUTH_NOW ?? Date.now()) }), namesFromText: require('../robot-login').namesFromText }
+      if (name === './pearl-stasis') return require('../pearl-stasis')
       if (name === './server-commands') return require('../server-commands')
       if (name === './generated-bots') return require('../generated-bots')
       if (name === './coinflip-dashboard-static') return require('../coinflip-dashboard-static')
@@ -175,8 +183,32 @@ function runtime(env = {}) {
     ws.command = msg => ws.emit('message', JSON.stringify(msg))
     return ws
   }
-  return { context, run, timers, initialOrder, request, login, socket, authAlerts, createdBots, fakeFiles }
+  return { context, run, timers, initialOrder, request, login, socket, authAlerts, createdBots, fakeFiles, torRotations }
 }
+
+test('new bot instances respond to the exact stasis chat without requesting movement', async () => {
+  const { Vec3 } = require('vec3')
+  const { TRIGGER_MESSAGE } = require('../pearl-stasis')
+  const r = runtime({ TEST_CREATE_BOTS: true })
+  r.run(`createBotInstance('D')`)
+  const bot = r.createdBots[0]
+  const block = { name: 'oak_trapdoor', position: new Vec3(1, 64, 2) }
+  const clicks = []
+  Object.assign(bot, {
+    entity: { position: new Vec3(1, 64, 1), eyeHeight: 1.62 },
+    findBlocks: () => [block.position], blockAt: () => block, canSeeBlock: () => true,
+    activateBlock: async target => clicks.push(target),
+    setControlState () { assert.fail('Must not move') },
+    chat () { assert.fail('Must not chat or warp') }
+  })
+  r.run(`bots.D.connectionState = 'online'`)
+  bot.emit('messagestr', 'Main: wrong code 23642')
+  assert.equal(clicks.length, 0)
+  bot.emit('messagestr', 'Main: ' + TRIGGER_MESSAGE)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(clicks, [block])
+  assert.deepEqual(bot.entity.position, new Vec3(1, 64, 1))
+})
 
 test('dashboard commands admit robot.txt names without touching the .env roster; admission errors close without reconnect', async () => {
   const r = runtime({ TEST_CREATE_BOTS: true, TEST_ROBOT_TEXT: 'A\na\nD\n', LOGIN_PASSWORD: 'pw', CLICK_COMPASS: 'false' })
@@ -202,7 +234,7 @@ test('dashboard commands admit robot.txt names without touching the .env roster;
   assert.equal(r.createdBots.length, 1)
 })
 test('robot success waits through normal AFK setup, cancels fallback and keeps the successful candidate on reconnect', () => {
-  const r = runtime({ TEST_CREATE_BOTS: true, TEST_ROBOT_TEXT: 'D', LOGIN_PASSWORD: 'wrong', LOGIN_PASSWORD_1: 'right', CLICK_COMPASS: 'false' })
+  const r = runtime({ TEST_CREATE_BOTS: true, TEST_ROBOT_TEXT: 'D', TEST_AUTH_NOW: 0, LOGIN_PASSWORD: 'wrong', LOGIN_PASSWORD_1: 'right', CLICK_COMPASS: 'false' })
   r.run(`handleCommand('/start-login')`)
   const bot = r.createdBots[0], sent = []
   bot.chat = cmd => sent.push(cmd)
@@ -210,9 +242,9 @@ test('robot success waits through normal AFK setup, cancels fallback and keeps t
   // Fire the stable-backoff timer first; both it and AFK use 60 seconds.
   const stable = [...r.timers.keys()].find(t => t.delay === r.run("settings.get('RECONNECT_STABLE_MS')")); r.timers.delete(stable); stable.fn()
   bot.emit('messagestr', 'Please /login password')
-  const auth = [...r.timers.keys()].find(t => t.delay === 250); r.timers.delete(auth); auth.fn()
+  const auth = [...r.timers.keys()].find(t => t.delay === 250); r.timers.delete(auth); r.run('process.env.TEST_AUTH_NOW = 250'); auth.fn()
   bot.emit('messagestr', 'Wrong password')
-  const fallback = [...r.timers.keys()].find(t => t.delay === 1500); r.timers.delete(fallback); fallback.fn()
+  const fallback = [...r.timers.keys()].find(t => t.delay === 5000 && String(t.fn).includes('lastAuthSent')); r.timers.delete(fallback); r.run('process.env.TEST_AUTH_NOW = 5250'); fallback.fn()
   bot.emit('messagestr', 'Successfully logged in')
   assert.deepEqual(sent.slice(0, 3), ['/login wrong', '/login right', '/server lifesteal'])
   assert.equal(r.run(`robotLogin.isAdmitting('D')`), true)
@@ -295,7 +327,8 @@ test('shared TUI logs, history and settings never expose auth or proxy credentia
   r.run(`logFor('A', 'server echo login-secret next-secret next-group-secret proxy-user \\x1b[2Jmalicious'); recordHistory('/login short')`)
   const res = await r.request('/api/state', '', cookie, 'GET')
   assert.doesNotMatch(res.body, /login-secret|next-secret|next-group-secret|proxy-user|\\u001b|\/login short|\/register abc/)
-  assert.match(res.body, /redacted/)
+  assert.doesNotMatch(res.body, /\[redacted\]/)
+  assert.match(res.body, /••••/)
   const settings = await r.request('/api/settings', '', cookie, 'GET')
   assert.doesNotMatch(settings.body, /next-secret|next-group-secret|proxy-user/)
 })
@@ -328,6 +361,56 @@ test('origin guard allows tunnels and proxies but keeps blocking CSRF', async ()
   const spoof = { host: 'evil.example', origin: 'http://127.0.0.1:81' }
   assert.equal((await run(spoof, '203.0.113.9')).status, 403)
   assert.equal(connect(spoof, '203.0.113.9').destroyed, true)
+})
+test('login page preserves same-origin form Origin instead of turning it into null', async () => {
+  const r = runtime()
+  for (const route of ['/login', '/login?e=1']) {
+    const page = await r.request(route, '', '', 'GET')
+    assert.equal(page.status, 200)
+    assert.equal(page.headers['Referrer-Policy'], 'same-origin')
+    assert.equal(page.headers['Cache-Control'], 'no-store')
+    assert.match(page.body, /method="post" action="\/login"/)
+  }
+})
+test('origin guard normalizes default ports for login, mutations and websocket upgrades', async () => {
+  const r = runtime({ WEB_ALLOWED_ORIGINS: 'https://allowed.example:443,bare.example:80' })
+  for (const headers of [
+    { host: '52.237.167.218:80', origin: 'http://52.237.167.218' },
+    { host: 'dashboard.example:80', origin: 'http://dashboard.example' },
+    { host: 'DASHBOARD.EXAMPLE:443', origin: 'https://dashboard.example' },
+    { host: '[::1]:80', origin: 'http://[::1]' },
+    { host: 'localhost:80', origin: 'https://dashboard.example', 'x-forwarded-host': 'dashboard.example:443' },
+    { host: 'localhost:80', origin: 'http://dashboard.example', 'x-forwarded-host': 'internal.example:8080, dashboard.example:80' },
+    { host: 'localhost:80', origin: 'https://allowed.example' },
+    { host: 'localhost:80', origin: 'http://bare.example' }
+  ]) {
+    const login = await r.request('/login', 'password=test-only', '', 'POST', null, headers, '203.0.113.9')
+    assert.equal(login.status, 303, JSON.stringify(headers))
+    assert.equal(login.headers.Location, '/')
+    const cookie = login.headers['Set-Cookie'].split(';')[0]
+    const mutation = await r.request('/api/client-error', '{}', cookie, 'POST', null, headers, '203.0.113.9')
+    assert.equal(mutation.status, 204, JSON.stringify(headers))
+    const ws = r.socket(cookie, headers, '203.0.113.9')
+    assert.equal(ws.destroyed, undefined, JSON.stringify(headers))
+    assert.equal(ws.messages[0].t, 'hello')
+  }
+})
+test('origin guard still rejects foreign origins and mismatched nondefault ports at login', async () => {
+  const r = runtime({ WEB_ALLOWED_ORIGINS: 'https://allowed.example:443' }), cookie = await r.login()
+  for (const headers of [
+    { host: 'dashboard.example:80', origin: 'https://evil.example' },
+    { host: 'dashboard.example:8080', origin: 'http://dashboard.example' },
+    { host: 'dashboard.example:443', origin: 'https://dashboard.example:8443' },
+    { host: 'localhost:80', origin: 'https://allowed.example:8443' },
+    { host: 'localhost:80', origin: 'https://allowed.example', 'sec-fetch-site': 'cross-site' },
+    { host: 'dashboard.example:80', origin: 'http://dashboard.example', 'sec-fetch-site': 'cross-site' },
+    { host: 'localhost:80', origin: 'null', 'sec-fetch-site': 'same-origin' }
+  ]) {
+    const login = await r.request('/login', 'password=test-only', '', 'POST', null, headers, '203.0.113.9')
+    assert.equal(login.status, 403, JSON.stringify(headers))
+    assert.equal(login.headers['Set-Cookie'], undefined)
+    assert.equal(r.socket(cookie, headers, '203.0.113.9').destroyed, true, JSON.stringify(headers))
+  }
 })
 test('foreign-origin mutations and websocket upgrades are rejected; logout revokes existing sockets', async () => {
   const r = runtime(), cookie = await r.login()
@@ -833,6 +916,89 @@ test('chat games stay disabled and preserve the user-configured server pace', ()
   assert.equal(tuned.run("settings.get('CHAT_GAME_GUESS_MS')"), 50, 'and stays overridable')
 })
 
+test('all-banned Tor snapshots retain dropped admission routes and exclude suspected or expired bans', async () => {
+  const r = runtime({ TEST_CREATE_BOTS: true, TEST_CLASSIFY_KICK: true, TOR_AUTO_ROTATE_BANNED: 'false', TEST_AUTH_NOW: 0, TEST_ROBOT_TEXT: 'D\nE', ROBOT_CONNECT_DELAY_MS: '1', LOGIN_PASSWORD: 'pw', PROXY_GROUP_1_HOST: 'localhost', PROXY_GROUP_1_PORT: '9150' })
+  r.run(`handleCommand('/start-login')`)
+  // D is direct; E uses the local Tor admission route, independently of _BOTS.
+  const connect = [...r.timers.keys()].find(t => t.delay === 1 && String(t.fn).includes('tick'))
+  assert.ok(connect)
+  r.timers.delete(connect); r.run('process.env.TEST_AUTH_NOW = 1'); connect.fn()
+  assert.equal(r.createdBots.length, 2)
+  r.createdBots[1].emit('kicked', 'You are permanently banned for abuse')
+  assert.equal(r.run('Boolean(bots.E)'), false)
+  const row = plain(r.run(`torBanSnapshot().find(row => row.id === 'E')`))
+  assert.equal(row.banned, true)
+  assert.equal(row.proxy.port, 9150)
+  assert.match(r.fakeFiles.get('removed.txt'), /E/)
+  r.run(`dataState.bots.E.banKind = 'suspected'`)
+  assert.equal(r.run(`torBanSnapshot().find(row => row.id === 'E').banned`), false)
+  r.run(`dataState.bots.E.banKind = 'temporary'; dataState.bots.E.banExpiresAt = Date.now() - 1`)
+  assert.equal(r.run(`torBanSnapshot().find(row => row.id === 'E').banned`), false)
+})
+test('actual ban events rotate only the fully banned shared Tor endpoint without reconnecting banned bots', async () => {
+  const r = runtime({ TEST_CREATE_BOTS: true, TEST_CLASSIFY_KICK: true, TEST_TOR_ROTATION: true, PROXY_GROUP_1_BOTS: 'A,B', PROXY_GROUP_1_HOST: 'localhost', PROXY_GROUP_1_PORT: '9150', PROXY_GROUP_2_BOTS: 'C', PROXY_GROUP_2_HOST: 'localhost', PROXY_GROUP_2_PORT: '9250' })
+  r.run(`createBotInstance('A'); createBotInstance('B')`)
+  r.createdBots[0].emit('kicked', 'You are permanently banned for abuse')
+  await Promise.resolve()
+  assert.equal(r.torRotations.length, 0, 'B is not yet confirmed banned')
+  r.createdBots[1].emit('kicked', 'You are permanently banned for abuse')
+  await Promise.resolve()
+  assert.equal(r.torRotations.length, 1)
+  assert.equal(r.torRotations[0].port, 9150)
+  assert.equal(r.run('Boolean(bots.C)'), true, 'other circuit is untouched')
+  assert.equal(r.createdBots.length, 2, 'banned accounts are not reconnected')
+  await r.run('autoTorRotation.check()')
+  assert.equal(r.torRotations.length, 1, 'duplicate checks are not duplicate rotations')
+})
+test('temporary bans wait until expiry, retry once, and rearm the wait if still banned', () => {
+  const env = { TEST_CREATE_BOTS: true, TEST_CLASSIFY_KICK: true, TOR_AUTO_ROTATE_BANNED: 'false', TEST_CLOCK_NOW: 100000 }
+  const r = runtime(env)
+  r.run(`createBotInstance('A')`)
+  const first = r.createdBots[0]
+  first.emit('kicked', 'You are temporarily banned for 10 minutes')
+  first.emit('end', 'socketClosed')
+  const retry = r.run('bots.A.reconnectTimer')
+  assert.equal(retry.delay, 600000)
+  assert.equal(r.run('bots.A.reconnectAttempts'), 0)
+  assert.equal(r.run('bots.A.nextReconnectAt'), 700000)
+  env.TEST_CLOCK_NOW = 699999; r.timers.delete(retry); retry.fn()
+  assert.equal(r.createdBots.length, 1, 'even an early timer cannot bypass expiry')
+  const due = r.run('bots.A.reconnectTimer'); r.timers.delete(due)
+  env.TEST_CLOCK_NOW = 700000; due.fn()
+  assert.equal(r.createdBots.length, 2)
+  r.createdBots[1].emit('kicked', 'You are temporarily banned for 5 minutes')
+  r.createdBots[1].emit('end', 'socketClosed')
+  assert.equal(r.run('bots.A.nextReconnectAt'), 1000000, 'expired old timestamp must not make a tight retry loop')
+  assert.equal(r.run('bots.A.reconnectTimer.delay'), 300000)
+  r.run('bots.A.disconnectManually()')
+  assert.equal(r.run('bots.A.reconnectTimer'), null, 'manual disconnect cancels the ban retry')
+})
+test('temporary admission bans wait instead of permanently removing the text-file account', () => {
+  const r = runtime({ TEST_CREATE_BOTS: true, TEST_CLASSIFY_KICK: true, TOR_AUTO_ROTATE_BANNED: 'false', TEST_ROBOT_TEXT: 'D', LOGIN_PASSWORD: 'test-pw', TEST_CLOCK_NOW: 100000 })
+  r.run(`handleCommand('/start-login')`)
+  assert.equal(r.createdBots.length, 1, channelLogs(r, 'system') + r.run('systemLogs.map(row => row.text).join("|")'))
+  r.createdBots[0].emit('kicked', 'You are temporarily banned')
+  r.createdBots[0].emit('end', 'socketClosed')
+  assert.equal(r.run(`robotLogin.state('D').phase`), 'waiting-ban')
+  assert.equal(r.fakeFiles.has('removed.txt'), false)
+  assert.equal(r.run('bots.D.reconnectTimer.delay'), 1800000)
+  assert.equal(r.run('bots.D.reconnectAttempts'), 0)
+})
+test('very long temporary bans use safe chunked timers rather than overflowing Node timeouts', () => {
+  const r = runtime({ TEST_CREATE_BOTS: true, TEST_CLASSIFY_KICK: true, TOR_AUTO_ROTATE_BANNED: 'false', TEST_CLOCK_NOW: 100000 })
+  r.run(`createBotInstance('A')`)
+  r.createdBots[0].emit('kicked', 'You are temporarily banned for 30 days')
+  assert.equal(r.run('bots.A.reconnectTimer.delay'), 2147483647)
+  assert.equal(r.run('bots.A.nextReconnectAt'), 2592100000)
+})
+test('Tor snapshot counts configured-but-not-connected bots and actual connection routes', () => {
+  const r = runtime({ BOT_NAMES: 'A,B,C,Waiting', PROXY_GROUP_1_BOTS: 'A,B,Waiting', PROXY_GROUP_1_HOST: 'localhost', PROXY_GROUP_1_PORT: '9150', PROXY_GROUP_2_BOTS: 'C', PROXY_GROUP_2_HOST: 'localhost', PROXY_GROUP_2_PORT: '9250' })
+  r.run(`bots.A.torProxy = { host: 'localhost', port: 9050, type: 'socks5' }`)
+  const rows = plain(r.run('torBanSnapshot()'))
+  assert.equal(rows.find(row => row.id === 'Waiting').proxy.port, 9150)
+  assert.equal(rows.find(row => row.id === 'Waiting').banned, false)
+  assert.equal(rows.find(row => row.id === 'A').proxy.port, 9050, 'live connection route wins over edited group config')
+})
 // The dashboard's "⟳ tor" button: per-port results, failures never throw.
 // --no-reconnect / "reconnect": false keep the sweep reporting-only here —
 // the reconnect half of a rotation has its own test below.

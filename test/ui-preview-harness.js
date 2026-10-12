@@ -42,6 +42,7 @@ const server = http.createServer((req, res) => {
   if (url.pathname === '/chart.js') return send(panel.getChartJs(), 'application/javascript')
   if (url.pathname === '/coinflip-dashboard.js') return send(panel.getCoinflipDashboardJs(), 'application/javascript')
   if (url.pathname === '/xterm.js' || url.pathname === '/xterm-addon-fit.js' || url.pathname === '/xterm.css') return xterm.handleXtermAsset(req, res)
+  if (url.pathname === '/api/docs') return send(require('../docs').docsForApi({ commands }))
   if (url.pathname === '/api/analytics') return send(report)
   if (url.pathname === '/api/coinflip/summary') return send(summary)
   if (url.pathname === '/api/coinflip/deep') return send(deep)

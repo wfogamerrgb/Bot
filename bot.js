@@ -27,6 +27,7 @@ const {
   parseCommandChain,
   executeCommandChain: executeCommandChainBase,
   parseNameList,
+  classifyNameTaken,
   parseDataArgs,
   hasInventoryItems,
   randomInt,
@@ -59,6 +60,8 @@ const {
 } = require('./bot-controls')
 const os = require('os')
 const { createMonitoring, classifyKick } = require('./monitoring')
+const { createAllBannedTorRotation } = require('./tor-fleet')
+const { createPearlStasis } = require('./pearl-stasis')
 const removedBotsStore = require('./removed-bots')
 const net = require('net')
 const fs = require('fs')
@@ -66,7 +69,8 @@ const path = require('path')
 const http = require('http')
 const crypto = require('crypto')
 const { decodeCommandTree, decodeCompletions } = require('./server-commands')
-const { persistGeneratedBots } = require('./generated-bots')
+const { persistGeneratedBots, persistRegeneratedName } = require('./generated-bots')
+const { namesFromText } = require(path.join(__dirname, 'robot-login'))
 const zlib = require('zlib')
 const { exec, execFile } = require('child_process')
 const { createTerminal, sshConfig } = require('./expose-terminal')
@@ -281,13 +285,68 @@ function dropFromRoster (id) {
   return true
 }
 
+// ── Taken-username regeneration ──────────────────────────────────────────
+// A generated name can collide with a real Minecraft account; the server then
+// reports the username as taken/claimed and no retry can succeed. Retire the
+// name (removed list + removed.txt, so nothing admits or regenerates it) and
+// bring the same job back up under a fresh generated name in the same route.
+// This is /new-gen naming applied automatically, one replacement per report.
+const MAX_TAKEN_NAME_REGENS = 200
+let takenNameRegens = 0
+function retireTakenName (id, reason) {
+  // Stop any in-flight admission; the name is unusable, not misconfigured.
+  try { robotLogin.fail(id, `Name taken: ${reason}`) } catch (_) {}
+  try {
+    const file = path.join(__dirname, 'removed.txt')
+    const text = fs.readFileSync(file, 'utf8')
+    if (!namesFromText(text).some(n => n.toLowerCase() === id.toLowerCase())) {
+      fs.appendFileSync(file, `${text && !text.endsWith('\n') ? '\n' : ''}${id}\t# ${new Date().toISOString()} name taken — retired\n`)
+    }
+  } catch (_) {}
+  try {
+    removedBotsStore.addRemovedBot(removedBots, { bot: id, kind: 'name-taken', reason }, { addedBy: 'name-regeneration' })
+    persistRemovedBots()
+  } catch (_) {}
+}
+function handleTakenName (id, entry, detail) {
+  const verdict = classifyNameTaken(detail)
+  if (!verdict) return false
+  if (entry?.nameTakenHandled) return true
+  if (entry) entry.nameTakenHandled = true
+  const host = entry?.host ?? HOST, port = entry?.port ?? PORT, version = entry?.version ?? VERSION
+  retireTakenName(id, verdict.reason)
+  const retireRoster = () => { if (bots[id]) dropFromRoster(id) }
+  if (takenNameRegens >= MAX_TAKEN_NAME_REGENS) {
+    logFor(id, `{red-fg}⛔ ${sanitize(id)} is taken (${sanitize(verdict.reason)}) and the replacement budget is exhausted — run /new-gen for fresh names.{/red-fg}`)
+    retireRoster()
+    return true
+  }
+  takenNameRegens++
+  let replacement
+  try {
+    replacement = persistRegeneratedName({ file: path.join(__dirname, '.env'), env: process.env, taken: id, existing: Object.keys(bots), blocked: (removedBots.bots || []).map(row => row.bot), io: fs })
+  } catch (err) {
+    logFor(id, `{red-fg}⛔ ${sanitize(id)} is taken (${sanitize(verdict.reason)}), and generating a replacement failed (${sanitize(err.code || err.message)}) — run /new-gen for fresh names.{/red-fg}`)
+    retireRoster()
+    return true
+  }
+  refreshRuntimeConfig()
+  const route = replacement.direct ? 'direct route' : replacement.group != null ? `proxy group ${replacement.group}` : 'auto route'
+  logFor(id, `{yellow-fg}⚠ ${sanitize(id)} is taken (${sanitize(verdict.reason)}) — retired, generated replacement ${sanitize(replacement.name)} (${route}).{/yellow-fg}`)
+  retireRoster()
+  const delay = readDelayMs(process.env.ROBOT_CONNECT_DELAY_MS, 5000)
+  setTimeout(() => {
+    if (!Object.hasOwn(bots, replacement.name) && !connectBlockReason(replacement.name)) createBotInstance(replacement.name, host, port, version)
+  }, delay)
+  return true
+}
+
 // ── Connect gate ────────────────────────────────────────────────────────────
 // removed-bots.json is the ONLY thing that stops a bot from connecting. Ban
-// flags in the data file are reporting only (dashboard, /list, /data, the
-// spreadsheet) — they must never gate dialling, because a bad verdict or a
-// stale flag would strand an account with no way back short of hand-editing
-// data/. If a ban should actually keep a bot out, it belongs on the removed
-// list (ban-detection puts permanent bans there automatically, /unban reverses).
+// flags in the data file do not gate initial/explicit connections: each new
+// session can try once. A freshly confirmed temporary ban pauses automatic
+// retries until its expiry instead of using transport backoff. Permanent bans
+// enter the removed list (ban-detection adds them, /unban reverses).
 function connectBlockReason (id) {
   const removal = removedEntryFor(id)
   return removal ? `on the removed list (${removedBotsStore.describeRemovedBot(removal)})` : null
@@ -754,9 +813,12 @@ client.emit('end', errMsg)
 }
 }
 
-function makeProxyConnect(targetHost, targetPort, onLog, username) {
+function resolvedProxy(username) {
 const admissionRoute = robotLogin.route(username)
-const proxy = process.env[`BOT_DIRECT_${username}`] === 'true' ? null : admissionRoute === undefined ? resolveBotProxy(username, PROXY_GROUPS, PROXY_DEFAULT) : admissionRoute
+return process.env[`BOT_DIRECT_${username}`] === 'true' ? null : admissionRoute === undefined ? resolveBotProxy(username, PROXY_GROUPS, PROXY_DEFAULT) : admissionRoute
+}
+function makeProxyConnect(targetHost, targetPort, onLog, username) {
+const proxy = resolvedProxy(username)
 if (!proxy) return undefined
 return proxy.type === 'http'
 ? makeHttpConnect(targetHost, targetPort, onLog, proxy)
@@ -876,6 +938,7 @@ return null
 const SYSTEM_ID = '__system__'
 const systemLogs = [] // mirrors a bots[id].logs array, for messages with no associated bot
 const bots = Object.create(null) // username → { bot, spawnTime, logs[], host, port, version, reconnectAttempts, … }
+const pearlStasis = createPearlStasis({ getBots: () => bots, logFor })
 const shardTracker = createShardTracker()
 const proxyReconnectSlots = new Map() // pace retries sharing the same outbound proxy
 let activeId = null
@@ -895,6 +958,24 @@ const robotLogin = require(path.join(__dirname, 'robot-login')).createRobotLogin
   isPlayerChat: message => Boolean(detectPlayerChat(message)),
   onAuthenticated: id => bots[id]?.onAdmissionAuthenticated?.(),
   log: message => logFor(SYSTEM_ID, `{cyan-fg}[login] ${sanitize(message)}{/cyan-fg}`)
+})
+function torBanSnapshot() {
+  const configuredNames = [...BOT_NAMES, ...parseNameList(process.env.BOT_NAMES), ...PROXY_GROUPS.flatMap(g => g.bots)]
+  const configured = new Set(configuredNames.map(id => id.toLowerCase()))
+  const ids = [...new Map([...Object.keys(dataState.bots), ...configuredNames, ...Object.keys(bots)].map(id => [id.toLowerCase(), id])).values()]
+  return ids.map(name => {
+    const id = Object.keys(bots).find(key => key.toLowerCase() === name.toLowerCase()) || name
+    const entry = bots[id]
+    const row = dataState.bots[id] || Object.entries(dataState.bots).find(([key]) => key.toLowerCase() === name.toLowerCase())?.[1]
+    const proxy = entry && Object.hasOwn(entry, 'torProxy') ? entry.torProxy
+      : configured.has(name.toLowerCase()) || robotLogin.state(id) ? resolvedProxy(id) : row?.banTorProxy
+    return { id, proxy, online: botOnline(entry), banned: Boolean(row?.banned && row.banKind !== 'suspected' && dataStore.isBanActive(row).held), bannedAt: row?.bannedAt }
+  })
+}
+const autoTorRotation = createAllBannedTorRotation({
+  snapshot: torBanSnapshot,
+  enabled: () => settings.get('TOR_AUTO_ROTATE_BANNED'),
+  log: message => logFor(SYSTEM_ID, `{cyan-fg}[Tor] ${sanitize(message)}{/cyan-fg}`)
 })
 function roamBusy(entry) {
   if (!entry) return true
@@ -1057,6 +1138,8 @@ cfDefine('WARP_COMMAND', { type: 'string', def: '/warp afk', group: 'Dump', desc
 cfDefine('WEB_PORT', { type: 'int', def: 80, min: 1, max: 65535, group: 'Dashboard', live: false, desc: 'Dashboard port (startup-only)' })
 cfDefine('WEB_PASSWORD', { type: 'string', group: 'Dashboard', live: false, desc: 'Dashboard login (startup-only; leave empty for a generated one)' })
 cfDefine('TOR_CONTROL_PORTS', { type: 'string', def: '', group: 'Tor', desc: 'Tor control ports for /tor-newnym and the dashboard button — empty = every local proxy SOCKS port + 1, matching scripts/restart-tor.sh (live)' })
+cfDefine('TOR_AUTO_ROTATE_BANNED', { type: 'bool', def: true, group: 'Tor', desc: 'When every assigned bot on one local Tor SOCKS endpoint is confirmed banned, request NEWNYM and verify a changed probe exit IP; never unban/reconnect blocked accounts (live)' })
+cfDefine('ROBOT_AUTH_DELAY_MS', { type: 'ms', def: 5000, min: 5000, group: 'Auth', desc: 'Global minimum spacing of start-login /login and /register sends, including fallback candidates (live)' })
 cfDefine('TOR_ROTATE_DELAY_MS', { type: 'string', def: '5000', group: 'Tor', desc: 'Delay between bot reconnects during a /tor-newnym rotation, so a group rotate does not hit the login rate limit at once (live)' })
 
 // Refresh mutable tunables on file/override edits and before command/auth use.
@@ -1444,19 +1527,19 @@ function saveHistory() {
 try { fs.writeFileSync(HISTORY_FILE, commandHistory.join('\n') + '\n') } catch (_) {}
 }
 function safeDisplayText(value) {
-let text = String(value ?? '')
+let text = String(value ?? '').replace(/\[redacted\]/gi, '••••')
 // Auth commands must never become logs/history, including nested /chat and chains.
-text = text.replace(/(\/(?:login|register|changepassword|changepass)\b)\s+[^;\n&{}]*/gi, '$1 [redacted]')
+text = text.replace(/(\/(?:login|register|changepassword|changepass)\b)\s+[^;\n&{}]*/gi, '$1 ••••')
 for (const [key, secret] of Object.entries(process.env)) {
 if (!settings.isSecret(key) || typeof secret !== 'string' || !secret) continue
 // Long raw credentials can occur in exception messages/server echoes.
-if (secret.length >= 4) text = text.split(secret).join('[redacted]')
+if (secret.length >= 4) text = text.split(secret).join('••••')
 }
 // Block terminal escape/control injection from remote server text.
 return text.replace(/\x1b\][^\x07]*(?:\x07|$)/g, '').replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '')
 }
 function commandForLog(trimmed) {
-const redacted = String(trimmed).replace(/(\/env\s+set\s+\S+)\s+([^;&]*)/gi, (whole, prefix) => settings.isSecret(prefix.split(/\s+/).pop()) ? `${prefix} [redacted]` : whole)
+const redacted = String(trimmed).replace(/(\/env\s+set\s+\S+)\s+([^;&]*)/gi, (whole, prefix) => settings.isSecret(prefix.split(/\s+/).pop()) ? `${prefix} ••••` : whole)
 return safeDisplayText(redacted)
 }
 function recordHistory(trimmed) {
@@ -1820,6 +1903,22 @@ button.tb:hover{color:var(--txt);border-color:var(--acc)}
 #terminalform{display:flex;gap:8px;align-items:center;padding:9px 12px;background:var(--panel);border-top:1px solid var(--line)}
 #terminalinput{flex:1;min-width:0;height:32px;background:var(--bg);border:1px solid var(--line);border-radius:6px;color:var(--txt);padding:7px 10px;font:inherit}
 #terminalinput:focus{outline:none;border-color:var(--acc)}
+.reference-overlay{position:fixed;inset:0;z-index:45;padding:28px;background:rgba(3,8,13,.82);backdrop-filter:blur(8px);display:grid;place-items:center}
+.reference-overlay[hidden]{display:none}
+.reference-panel{width:min(1120px,100%);max-height:calc(100dvh - 56px);display:flex;flex-direction:column;overflow:hidden;border:1px solid #2a3a49;border-radius:18px;background:var(--panel);box-shadow:0 24px 90px rgba(0,0,0,.55)}
+.reference-head{padding:24px 28px 20px;display:flex;align-items:flex-start;gap:16px;border-bottom:1px solid var(--line);background:linear-gradient(135deg,rgba(45,212,191,.08),transparent)}
+.reference-head>div{flex:1;min-width:0}.reference-eyebrow{color:var(--acc);font-size:10px;letter-spacing:1.6px;text-transform:uppercase}.reference-head h2{font-size:24px;letter-spacing:-.7px;line-height:1.25;margin:6px 0 8px;color:#edf6fb}.reference-head p{font:13px/1.6 system-ui,sans-serif;color:var(--dim);margin:0;max-width:680px}
+.reference-close{width:34px;height:34px;flex:none;border:1px solid var(--line);border-radius:9px;background:var(--panel2);color:var(--txt);font:20px system-ui;cursor:pointer}.reference-close:hover{border-color:var(--acc);color:var(--acc)}
+.reference-tools{padding:16px 28px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;border-bottom:1px solid var(--line)}
+.reference-search{flex:1;min-width:180px;position:relative}.reference-search span{position:absolute;left:12px;top:10px;font-size:15px;color:var(--dim)}.reference-search input{width:100%;height:38px;padding:8px 12px 8px 36px;border:1px solid var(--line);border-radius:9px;background:var(--bg);color:var(--txt);font:13px system-ui,sans-serif}
+.reference-tools select{max-width:240px;height:38px;padding:0 12px;background:var(--bg);color:var(--txt);border:1px solid var(--line);border-radius:9px;font:inherit;font-size:12px}.reference-tools button.tb{height:38px;padding:0 14px;font-size:12px}.reference-count{font-size:11px;color:var(--dim);white-space:nowrap}
+.reference-panel :is(button,input,select,a):focus-visible{outline:2px solid var(--acc);outline-offset:3px}
+.reference-content{overflow:auto;overscroll-behavior:contain;min-height:0;padding:24px 28px 28px}.reference-status{margin:0;padding:14px 28px;color:var(--dim);font:12px/1.6 system-ui,sans-serif;border-bottom:1px solid var(--line)}
+.command-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,290px),1fr));gap:12px}.server-command-card{background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:16px;text-align:left;cursor:pointer;color:var(--txt);display:flex;flex-direction:column;gap:12px;min-width:0}.server-command-card:hover{border-color:var(--acc);background:rgba(45,212,191,.045)}.server-command-card strong{color:var(--cyan);font:600 15px ui-monospace,monospace;overflow-wrap:anywhere}.command-usage{font:11px/1.7 ui-monospace,monospace;color:var(--dim);overflow-wrap:anywhere;white-space:pre-wrap}.command-prepare{font:11px system-ui,sans-serif;color:var(--acc);margin-top:auto;align-self:flex-end}
+.reference-empty{grid-column:1/-1;padding:38px 20px;text-align:center;border:1px dashed var(--line);border-radius:12px;color:var(--dim);font:13px/1.7 system-ui,sans-serif}.reference-empty strong{display:block;color:var(--txt);font-size:15px;margin-bottom:6px}
+.docs-layout{display:grid;grid-template-columns:210px minmax(0,1fr);min-height:0;overflow:hidden}.docs-nav{padding:20px 14px;overflow:auto;border-right:1px solid var(--line);background:rgba(0,0,0,.09)}.docs-nav a{display:block;color:var(--dim);font:12px/1.5 system-ui,sans-serif;padding:9px 12px;margin-bottom:4px;border-radius:8px;text-decoration:none}.docs-nav a:hover{color:var(--acc);background:rgba(45,212,191,.07)}.docs-nav a span{float:right;color:var(--acc);font-size:10px;margin-left:6px}
+.docs-section{scroll-margin-top:20px;margin-bottom:30px}.docs-section h3{color:#e8f0f6;font:600 18px system-ui,sans-serif;margin:0 0 5px}.docs-summary{color:var(--dim);font:12px/1.6 system-ui,sans-serif;margin:0 0 16px}.docs-card{border:1px solid var(--line);border-radius:12px;background:var(--panel2);padding:18px;margin-bottom:10px}.docs-card h4{margin:0 0 9px;color:var(--cyan);font:600 13px/1.5 ui-monospace,monospace;overflow-wrap:anywhere}.docs-card p{margin:0;color:#aab9c6;font:13px/1.75 system-ui,sans-serif;white-space:pre-wrap;overflow-wrap:anywhere}.docs-examples{display:flex;flex-direction:column;gap:6px;margin-top:13px}.docs-example{display:flex;gap:10px;border:1px solid var(--line);border-radius:7px;background:var(--bg);padding:9px 12px}.docs-example span{color:var(--acc)}.docs-example code{color:#cddce7;font:11px/1.6 ui-monospace,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
+@media(max-width:760px){.reference-overlay{padding:10px}.reference-panel{max-height:calc(100dvh - 20px);border-radius:13px}.reference-head{padding:18px}.reference-head h2{font-size:21px}.reference-tools{padding:12px 18px;gap:9px}.reference-search{flex-basis:100%}.reference-content{padding:18px}.reference-status{padding:12px 18px}.docs-layout{grid-template-columns:1fr}.docs-nav{display:flex;gap:6px;overflow-x:auto;overflow-y:hidden;border-right:0;border-bottom:1px solid var(--line);padding:10px}.docs-nav a{flex:none;margin:0;max-width:230px}.docs-nav a span{float:none}.docs-card{padding:15px}.reference-tools select{max-width:calc(100% - 100px)}}
 #toasts{position:fixed;right:14px;bottom:70px;display:flex;flex-direction:column;gap:8px;z-index:20}
 .toast{background:var(--panel2);border:1px solid var(--line);border-left:3px solid var(--acc);border-radius:8px;padding:9px 14px;max-width:340px;font-size:12px;box-shadow:0 6px 24px rgba(0,0,0,.5)}
 .toast.bad{border-left-color:var(--red)}.toast.good{border-left-color:var(--grn)}
@@ -1865,8 +1964,14 @@ button.tb:hover{color:var(--txt);border-color:var(--acc)}
 <button class="tb" id="sendbtn">send</button>
 </form>
 <div id="help" hidden></div>
-<div id="servercmdspanel" hidden style="position:fixed;inset:0;z-index:40;background:var(--bg);overflow:auto;padding:18px"><div style="max-width:1100px;margin:auto"><div class="ehead"><b>SERVER COMMANDS</b><select id="servercmdbot" aria-label="Command account"></select><input id="servercmdfilter" placeholder="filter server commands…" aria-label="Filter server commands"><button class="tb" id="servercmdrefresh" type="button">refresh</button><button class="tb" id="servercmdclose" type="button">close</button></div><p id="servercmdnote"></p><div id="servercmdbody"></div></div></div>
-<div id="docs" hidden style="position:fixed;inset:0;z-index:40;background:var(--bg);overflow:auto;padding:14px"><div id="docsbox" style="max-width:1100px;margin:0 auto"><div class="ehead"><b>DOCS</b><span class="enote">built-in documentation — type /doc in the command bar to open this panel</span><input id="docsfilter" placeholder="filter docs…" autocomplete="off" spellcheck="false"><button class="tb" id="docsclose" type="button">close</button></div><div id="docsbody">loading…</div></div></div>
+<div id="servercmdspanel" class="reference-overlay" hidden><section class="reference-panel" role="dialog" aria-modal="true" aria-labelledby="servercmdtitle">
+<div class="reference-head"><div><span class="reference-eyebrow">Account command browser</span><h2 id="servercmdtitle">Server commands</h2><p>Commands advertised by Minecraft to this account. Choose a command to prepare it in the console — nothing is sent until you press send.</p></div><button class="reference-close" id="servercmdclose" type="button" aria-label="Close server commands">×</button></div>
+<div class="reference-tools"><select id="servercmdbot" aria-label="Command account"></select><label class="reference-search"><span aria-hidden="true">⌕</span><input id="servercmdfilter" placeholder="Search commands or arguments…" aria-label="Filter server commands"></label><button class="tb" id="servercmdrefresh" type="button">↻ Refresh</button><span class="reference-count" id="servercmdcount" aria-live="polite"></span></div>
+<p class="reference-status" id="servercmdnote" role="status"></p><div id="servercmdbody" class="reference-content command-grid"></div></section></div>
+<div id="docs" class="reference-overlay" hidden><section id="docsbox" class="reference-panel" role="dialog" aria-modal="true" aria-labelledby="docstitle">
+<div class="reference-head"><div><span class="reference-eyebrow">Built-in knowledge base</span><h2 id="docstitle">Documentation</h2><p>Your guide to accounts, routines and fleet controls. Search a topic or jump to a section. Also available with /doc in the console.</p></div><button class="reference-close" id="docsclose" type="button" aria-label="Close documentation">×</button></div>
+<div class="reference-tools"><label class="reference-search"><span aria-hidden="true">⌕</span><input id="docsfilter" placeholder="Search topics, commands and examples…" aria-label="Search documentation" autocomplete="off" spellcheck="false"></label><span id="docscount" class="reference-count" aria-live="polite"></span></div>
+<div class="docs-layout"><nav id="docsnav" class="docs-nav" aria-label="Documentation sections"></nav><div id="docsbody" class="reference-content" aria-live="polite">Loading documentation…</div></div></section></div>
 <div id="envpanel" hidden><div id="envbox"><div class="ehead"><b>.ENV</b><span class="enote">temporary — applied to this running process only, and forgotten on the next restart (edit the file for a permanent change)</span><button class="tb" id="envresetall" type="button">reset all</button><button class="tb" id="envclose" type="button">close</button></div><div id="envbody">loading…</div></div></div>
 <div id="terminal" hidden><div class="terminal-head"><b>bash</b><button class="tb" id="terminalclose" type="button">close</button></div><div id="terminalout"></div><form id="terminalform"><span class="prompt">$</span><input id="terminalinput" autocomplete="off" spellcheck="false"><button class="tb" type="submit">run</button></form></div>
 </main>
@@ -2139,26 +2244,38 @@ releaseManualKey(control,document.querySelector('.mkey[data-control="'+control+'
 }
 var serverCommandRows=[],serverCommandBot=null,serverCommandVersion=null,serverCommandRequest=0
 function suggestionCommands(){var table=Object.assign({},cmds);if(serverCommandBot===view)serverCommandRows.forEach(function(row){if(!Object.keys(cmds).some(function(k){return k.split(' ')[0]===row.command}))table[row.command]='server — '+row.usages.slice(1,4).join(' | ')});return table}
+function referenceEmpty(body,title,detail){var box=document.createElement('div');box.className='reference-empty';var strong=document.createElement('strong');strong.textContent=title;var text=document.createElement('span');text.textContent=detail;box.appendChild(strong);box.appendChild(text);body.appendChild(box)}
+var referenceFocus=null
+function showReference(id,focus){referenceFocus=document.activeElement;el(id).hidden=false;el(focus).focus()}
+function closeReference(id){el(id).hidden=true;if(referenceFocus&&referenceFocus.focus)referenceFocus.focus()}
 function renderServerCommands(){
-var body=el('servercmdbody');body.innerHTML='';var filter=el('servercmdfilter').value.toLowerCase()
-serverCommandRows.filter(function(row){return row.usages.join(' ').toLowerCase().indexOf(filter)>=0}).forEach(function(row){
-var button=document.createElement('button');button.className='tb';button.style.cssText='display:block;width:100%;text-align:left;margin:5px 0;padding:9px;white-space:normal';button.textContent=row.usages.slice(0,5).join(' | ')
-button.onclick=function(){setView(serverCommandBot);cinput.value='/chat '+row.command+' ';el('servercmdspanel').hidden=true;cinput.focus()};body.appendChild(button)})
+var body=el('servercmdbody');body.innerHTML='';var filter=el('servercmdfilter').value.toLowerCase().trim()
+var rows=serverCommandRows.filter(function(row){return (row.command+' '+row.usages.join(' ')).toLowerCase().indexOf(filter)>=0})
+el('servercmdcount').textContent=rows.length+' / '+serverCommandRows.length+' commands'
+rows.forEach(function(row){
+var button=document.createElement('button');button.type='button';button.className='server-command-card';button.setAttribute('aria-label','Prepare '+row.command)
+var title=document.createElement('strong');title.textContent=row.command;button.appendChild(title)
+var usage=document.createElement('span');usage.className='command-usage';usage.textContent=row.usages.slice(0,5).join('\\n');button.appendChild(usage)
+var hint=document.createElement('span');hint.className='command-prepare';hint.textContent='Prepare command →';button.appendChild(hint)
+button.onclick=function(){setView(serverCommandBot);cinput.value='/chat '+row.command+' ';closeReference('servercmdspanel');cinput.focus()};body.appendChild(button)})
+if(!rows.length)referenceEmpty(body,filter?'No matching commands':'No commands advertised yet',filter?'Try a different command or argument.':'Choose an online account and refresh. The server may not expose a command tree.')
 }
 function loadServerCommands(id,refresh){
-if(!id)return
 var request=++serverCommandRequest
+serverCommandRows=[];serverCommandBot=null;renderServerCommands()
+if(!id){el('servercmdnote').textContent='No accounts available. Connect an account to browse its permitted commands.';return}
+el('servercmdnote').textContent='Loading commands for '+id+'…'
 fetch('/api/server-commands?bot='+encodeURIComponent(id),{method:refresh?'POST':'GET',credentials:'same-origin',cache:'no-store'}).then(function(r){return r.json().then(function(m){if(!r.ok)throw Error(m.error||'Could not load commands');return m})}).then(function(m){
 if(request!==serverCommandRequest)return
 serverCommandRows=m.commands||[];serverCommandBot=m.bot;serverCommandVersion=m.updatedAt
 el('servercmdnote').textContent=m.bot+': '+serverCommandRows.length+' commands ('+(m.source||'not advertised yet')+'). Only commands exposed to this account are available. Click to prepare a server command; nothing is sent automatically.';renderServerCommands()
 }).catch(function(e){if(request!==serverCommandRequest)return;serverCommandRows=[];el('servercmdnote').textContent=e.message;renderServerCommands()})
 }
-el('servercmdsbtn').onclick=function(){var select=el('servercmdbot');select.innerHTML='';lastBotSnapshot.filter(function(b){return !b.removed}).forEach(function(b){var option=document.createElement('option');option.value=b.id;option.textContent=b.id+(b.online?'':' (offline)');select.appendChild(option)});select.value=botStates[view]?view:(lastBotSnapshot.find(function(b){return b.online})||{}).id||select.value;el('servercmdspanel').hidden=false;loadServerCommands(select.value,false)}
+el('servercmdsbtn').onclick=function(){var select=el('servercmdbot');select.innerHTML='';lastBotSnapshot.filter(function(b){return !b.removed}).forEach(function(b){var option=document.createElement('option');option.value=b.id;option.textContent=b.id+(b.online?'':' (offline)');select.appendChild(option)});select.value=botStates[view]?view:(lastBotSnapshot.find(function(b){return b.online})||{}).id||select.value;showReference('servercmdspanel','servercmdfilter');loadServerCommands(select.value,false)}
 el('servercmdbot').onchange=function(){loadServerCommands(this.value,false)}
 el('servercmdfilter').oninput=renderServerCommands
 el('servercmdrefresh').onclick=function(){loadServerCommands(el('servercmdbot').value,true)}
-el('servercmdclose').onclick=function(){el('servercmdspanel').hidden=true}
+el('servercmdclose').onclick=function(){closeReference('servercmdspanel')}
 var lastBotSnapshot=[]
 try{var offlinePref=localStorage.getItem('afk.showOffline');if(offlinePref!==null)el('show-all-bots').checked=offlinePref==='true'}catch(_){}
 el('show-all-bots').onchange=function(){try{localStorage.setItem('afk.showOffline',String(this.checked))}catch(_){}renderBots(lastBotSnapshot)}
@@ -2333,28 +2450,37 @@ if(m.error)toast(m.error,'bad')
 else toast((m.ok?'fresh circuits on all '+rs.length+' Tor instance(s)':'new circuits on '+ok+' of '+rs.length+' Tor instance(s) — see the system log')+' · reconnecting '+(m.reconnected||0)+' bot(s) for '+(m.label||'every proxy'),m.ok?'good':'bad')
 b.disabled=false}).catch(function(){toast('could not request Tor circuits — see the system log','bad');b.disabled=false})}
 var docsData=null
-function renderDocs(){var body=el('docsbody');body.innerHTML='';if(!docsData){body.textContent='could not load the docs';return}
-var q=(el('docsfilter').value||'').toLowerCase(),shown=0
+function renderDocs(){var body=el('docsbody'),nav=el('docsnav');body.innerHTML='';nav.innerHTML='';if(!docsData){referenceEmpty(body,'Documentation unavailable','Close and reopen the panel to try again.');return}
+var q=(el('docsfilter').value||'').toLowerCase().trim(),shown=0,count=0
 for(var si=0;si<docsData.sections.length;si++){var sec=docsData.sections[si]
 var entries=(sec.entries||[]).filter(function(e){if(!q)return true
-return ((sec.title||'')+' '+(e.title||'')+' '+(e.desc||'')).toLowerCase().indexOf(q)>=0})
+return ((sec.title||'')+' '+(sec.summary||'')+' '+(e.title||'')+' '+(e.desc||'')+' '+(e.examples||[]).join(' ')).toLowerCase().indexOf(q)>=0})
 if(!entries.length)continue
-shown++
-var h=document.createElement('h3');h.textContent=sec.title;body.appendChild(h)
+shown++;count+=entries.length
+var section=document.createElement('section');section.className='docs-section';section.id='docs-section-'+si
+var link=document.createElement('a');link.href='#'+section.id;link.textContent=sec.title+' ';var badge=document.createElement('span');badge.textContent=entries.length;link.appendChild(badge);nav.appendChild(link)
+link.onclick=(function(target){return function(event){event.preventDefault();target.scrollIntoView({block:'start'})}})(section)
+var h=document.createElement('h3');h.textContent=sec.title;section.appendChild(h)
+var summary=document.createElement('p');summary.className='docs-summary';summary.textContent=sec.summary||'';section.appendChild(summary)
 for(var ei=0;ei<entries.length;ei++){var e=entries[ei]
-var row=document.createElement('div');row.className='hcmd'
-var b=document.createElement('b');b.textContent=e.title||''
-var sp=document.createElement('span');sp.textContent=e.desc||''
-row.appendChild(b);row.appendChild(sp);body.appendChild(row)
-for(var xi=0;xi<(e.examples||[]).length;xi++){var ex=document.createElement('div');ex.className='hcmd';ex.style.paddingLeft='16px'
-var code=document.createElement('code');code.textContent=e.examples[xi];ex.appendChild(code);body.appendChild(ex)}}}
-if(!shown)body.textContent='nothing matches that filter'}
+var row=document.createElement('article');row.className='docs-card'
+var title=document.createElement('h4');title.textContent=e.title||'';row.appendChild(title)
+var desc=document.createElement('p');desc.textContent=e.desc||'';row.appendChild(desc)
+if((e.examples||[]).length){var examples=document.createElement('div');examples.className='docs-examples'
+for(var xi=0;xi<e.examples.length;xi++){var ex=document.createElement('div');ex.className='docs-example';var prompt=document.createElement('span');prompt.textContent='❯';prompt.setAttribute('aria-hidden','true');var code=document.createElement('code');code.textContent=e.examples[xi];ex.appendChild(prompt);ex.appendChild(code);examples.appendChild(ex)}row.appendChild(examples)}section.appendChild(row)}body.appendChild(section)}
+el('docscount').textContent=count+' entries · '+shown+' sections'
+if(!shown)referenceEmpty(body,'No matching documentation','Try a command, routine name or a shorter search.')
+}
 function openDocs(topic){if(topic!=null)el('docsfilter').value=topic||''
-el('docs').hidden=false
+showReference('docs','docsfilter')
 if(docsData){renderDocs();return}
-fetch('/api/docs',{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.json()}).then(function(m){docsData=m;renderDocs()}).catch(function(){el('docsbody').textContent='could not load the docs'})}
+fetch('/api/docs',{credentials:'same-origin',cache:'no-store'}).then(function(r){if(!r.ok)throw Error('Could not load documentation');return r.json()}).then(function(m){docsData=m;renderDocs()}).catch(function(){el('docsbody').textContent='could not load the docs'})}
 el('docsbtn').onclick=function(){openDocs()}
-el('docsclose').onclick=function(){el('docs').hidden=true}
+el('docsclose').onclick=function(){closeReference('docs')}
+;['docs','servercmdspanel'].forEach(function(id){el(id).addEventListener('click',function(e){if(e.target===el(id))closeReference(id)})})
+document.addEventListener('keydown',function(e){var id=!el('docs').hidden?'docs':!el('servercmdspanel').hidden?'servercmdspanel':null;if(!id)return
+if(e.key==='Escape'){e.preventDefault();closeReference(id);return}
+if(e.key==='Tab'){var nodes=el(id).querySelectorAll('button:not(:disabled),input,select,a[href]');if(!nodes.length)return;var first=nodes[0],last=nodes[nodes.length-1];if(e.shiftKey&&document.activeElement===first){e.preventDefault();last.focus()}else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first.focus()}}})
 el('docsfilter').addEventListener('input',renderDocs)
 el('helpbtn').onclick=function(){el('help').hidden=!el('help').hidden}
 el('help').onclick=function(){el('help').hidden=true}
@@ -2609,24 +2735,37 @@ webAuth = { sessionValid, tokenFromReq }
 function loopbackHost(host) {
 return /^(127\.0\.0\.1|localhost|::1|\[::1\]|::ffff:127\.0\.0\.1|\[::ffff:127\.0\.0\.1\])$/i.test(String(host || ''))
 }
+// Browsers omit default ports from Origin, even when Host/forwarded Host keeps
+// :80 or :443. Parse authorities using the origin's scheme so only its default
+// port is removed; different nondefault ports must still fail the CSRF check.
+function originAuthority(host, protocol) {
+try {
+const url = new URL(`${protocol}//${String(host || '').trim()}`)
+if (url.username || url.password || url.pathname !== '/' || url.search || url.hash) return ''
+return url.host.toLowerCase()
+} catch (_) { return '' }
+}
 function sameOrigin(req) {
 const site = req.headers['sec-fetch-site']
 if (site === 'cross-site') return false
-// The browser asserts this request came from the page's own origin — the case
-// a Host-rewriting tunnel cannot express in the Host header.
-if (site === 'same-origin') return true
 const raw = req.headers.origin
 if (!raw) return true // CLI clients/scripts carry no cookie-based CSRF surface.
 if (raw === 'null') return false // opaque origin (sandbox/redirect) is never trusted
 let origin
 try { origin = new URL(raw) } catch (_) { return false }
-if (!['http:', 'https:'].includes(origin.protocol)) return false
-const originHost = String(origin.host).toLowerCase()
-const seenHosts = [req.headers.host, ...String(req.headers['x-forwarded-host'] || '').split(',')].map(h => String(h || '').trim().toLowerCase()).filter(Boolean)
+if (!['http:', 'https:'].includes(origin.protocol) || origin.username || origin.password || origin.pathname !== '/' || origin.search || origin.hash) return false
+// The browser asserts this request came from the page's own origin — the case
+// a Host-rewriting tunnel cannot express in the Host header.
+if (site === 'same-origin') return true
+const originHost = origin.host.toLowerCase()
+const seenHosts = [req.headers.host, ...String(req.headers['x-forwarded-host'] || '').split(',')].map(h => originAuthority(h, origin.protocol)).filter(Boolean)
 if (seenHosts.includes(originHost)) return true
 if (WEB_ALLOWED_ORIGINS.some(allowed => {
-const value = String(allowed).toLowerCase()
-return value === String(origin.origin).toLowerCase() || value === originHost
+if (!/^https?:\/\//i.test(allowed)) return originAuthority(allowed, origin.protocol) === originHost
+try {
+const url = new URL(allowed)
+return !url.username && !url.password && url.pathname === '/' && !url.search && !url.hash && url.origin === origin.origin
+} catch (_) { return false }
 })) return true
 // SSH tunnel / local port-forward: the connection reaches us over loopback and
 // the page itself is served from a loopback origin. An external attack page
@@ -2723,7 +2862,10 @@ if (p === '/api/internal/disconnect-slow' && req.method === 'POST') {
 
 if (p === '/login' && req.method === 'GET') {
 if (sessionValid(tokenFromReq(req, url))) { res.writeHead(303, { Location: '/' }); res.end(); return }
-res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' })
+// no-referrer turns a browser's form POST Origin into "null" (including
+// direct HTTP/DNS access), which our CSRF guard must reject. Keep same-origin
+// referrers for login only; external sites still receive no Referer.
+res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'Referrer-Policy': 'same-origin' })
 res.end(LOGIN_HTML.replace('__ERR__', url.searchParams.get('e') ? '<p class="err">wrong password</p>' : ''))
 return
 }
@@ -3321,6 +3463,7 @@ return null
 
 bots[id] = {
 id, bot, spawnTime: null, logs: existingLogs, host, port, version,
+torProxy: resolvedProxy(id) ? { host: resolvedProxy(id).host, port: resolvedProxy(id).port, type: resolvedProxy(id).type || 'socks5' } : null,
 reconnectAttempts: existingReconnectAttempts,
 everOnline: bots[id]?.everOnline || false,
 reconnectTimer: null,
@@ -3355,6 +3498,7 @@ lastPlayerChatAt: Date.now(), // chat activity watchdog — last time a player m
 lastPlayerChat: '', // latest player chat message
 }
 const entry = bots[id]
+pearlStasis.attach(bot, id)
 // Remember actual command traffic, so a crate warp never follows /shardshop
 // or another server command inside the server's shared command cooldown.
 let trackedChat = null
@@ -3420,6 +3564,26 @@ pushT(() => { if (bots[id] === entry && botOnline(entry)) robotLogin.setupReady(
 }
 }
 
+// One expiry-aware retry for a confirmed temporary ban, separate from normal
+// transport backoff. Chunk long waits because Node timers overflow after 24d.
+function scheduleBanRetry() {
+if (bots[id] !== entry || manualDisconnect || connectBlockReason(id)) return false
+clearAll()
+if (entry.reconnectTimer) return true
+const wake = () => {
+if (bots[id] !== entry || manualDisconnect || connectBlockReason(id)) return
+const remaining = entry.temporaryBanUntil - Date.now()
+if (remaining > 0) { entry.reconnectTimer = setTimeout(wake, Math.min(remaining, 2147483647)); return }
+entry.reconnectTimer = null
+entry.nextReconnectAt = null
+createBotInstance(id, host, port, version)
+}
+entry.nextReconnectAt = entry.temporaryBanUntil
+entry.reconnectTimer = setTimeout(wake, Math.min(Math.max(1000, entry.temporaryBanUntil - Date.now()), 2147483647))
+w(`Temporary ban — one retry scheduled for ${new Date(entry.temporaryBanUntil).toLocaleString()}; normal reconnects paused.`)
+notifyBotsChanged()
+return true
+}
 // Detect whether a disconnect was caused by a Velocity proxy transfer crash
 function isProxyCrash(reason) {
 if (!reason) return false
@@ -3428,6 +3592,8 @@ return PROXY_CRASH_PATTERNS.some(re => re.test(text))
 }
 
 const scheduleReconnect = (reason, rawError) => {
+if (handleTakenName(id, entry, rawError || reason)) return
+if (entry.temporaryBanUntil && scheduleBanRetry()) return
 if (robotLogin.fail(id, rawError || reason)) { clearAll(); return }
 clearAll()
 connected = false
@@ -3644,6 +3810,11 @@ if (requester && bots[id]?.tpautoEnabled) {
 // Auth prompts ("Please login using /login <password>") and the server's replies
 // to them. planAuthAction decides both: it recognises a rejection and remembers
 // it, so a wrong password is reported once instead of being retried into a ban.
+// A taken username reported in chat (name-claim/auth plugins speak here, not
+// always in a kick packet) retires the name before auth logic can mistake it
+// for a credential verdict. Player chat can fake the wording, so require
+// server chat.
+if (!detectPlayerChat(message) && handleTakenName(id, entry, message)) return
 if (robotLogin.onMessage(id, message)) return
 if (!detectPlayerChat(message) && /\b(?:successfully\s+(?:logged\s*in|registered|authenticated)|(?:login|authentication|registration)\s+(?:successful|success)|(?:logged\s*in|registered)\s+successfully)\b/i.test(message)) entry.authPending = false
 const authAction = planAuthAction(id, message)
@@ -3730,6 +3901,7 @@ if (bots[id]?.bot === bot) {
   bots[id].connectionState = 'online'
 }
 recordEvidence(id, 'connections', { state: 'online', connection: connectionDetails(id, entry) })
+entry.temporaryBanUntil = null
 // Getting back in means the ban is gone (a temporary ban expired, or somebody
 // lifted it), so clear the flag instead of reporting a stale ban forever.
 if (dataState.bots[id]?.banned) {
@@ -3900,9 +4072,12 @@ cancelPendingRtp(id)
 let text
 try { text = typeof reason === 'string' ? reason : JSON.stringify(reason) } catch (_) { text = 'unknown' }
 const banVerdict = classifyKick(text)
+// A taken username is neither a ban nor an auth failure: the name is owned by
+// a real player, so retire it and bring up a fresh generated one instead.
+if (!banVerdict.banned && handleTakenName(id, entry, text)) return
 // Admission failures normally close immediately, but permanent bans must be
 // persisted and removed first so /start-login cannot admit the account again.
-if (!banVerdict.permanent && robotLogin.fail(id, `Kicked during admission: ${text}`)) return
+if (!banVerdict.banned && robotLogin.fail(id, `Kicked during admission: ${text}`)) return
 if (bots[id]) {
 bots[id].lastKickReason = text
 bots[id].lastDisconnectReason = text
@@ -3922,17 +4097,19 @@ const alreadyBanned = Boolean(dataState.bots[id]?.banned)
 const previousBanKind = dataState.bots[id]?.banKind
 // The FIRST detection sets the clock. Later kicks from the same ban keep it, so a
 // reconnect attempt twenty minutes in cannot push the release time further out.
-const knownExpiry = Number(dataState.bots[id]?.banExpiresAt) || 0
+const recordedExpiry = Number(dataState.bots[id]?.banExpiresAt) || 0
+const knownExpiry = recordedExpiry > Date.now() ? recordedExpiry : 0
 // A permanent ban never expires. Everything else needs a real expiry or its
 // report flag would never clear: a stated length is authoritative, and when the server
 // says "temporary" (or only "possibly banned") without saying for how long, retry
 // after BAN_RETRY_MS rather than writing the account off.
 const unknownLength = !banVerdict.permanent && !banVerdict.durationMs && !banVerdict.expiresAt
 const expiresAt = banVerdict.permanent ? 0 : (knownExpiry || banVerdict.expiresAt ||
-  (banVerdict.durationMs ? Date.now() + banVerdict.durationMs : (unknownLength ? Date.now() + BAN_RETRY_MS : 0)))
+  (banVerdict.durationMs ? Date.now() + banVerdict.durationMs : (unknownLength ? Date.now() + Math.max(60000, BAN_RETRY_MS) : 0)))
 const banRow = {
 bot: id,
 banned: true,
+banTorProxy: entry.torProxy,
 // Keep the original ban time across the reconnect attempts that follow.
 bannedAt: dataState.bots[id]?.bannedAt || Date.now(),
 banKind: banVerdict.kind,
@@ -3955,10 +4132,17 @@ expiresAt,
 permanent: banVerdict.permanent
 })
 persistData()
+if (banVerdict.kind === 'temporary') {
+  entry.temporaryBanUntil = expiresAt > Date.now() ? expiresAt : Date.now() + Math.max(60000, BAN_RETRY_MS)
+  clearReconnectTimer(id) // a prior transport error must not bypass this wait
+  robotLogin.waitForBan(id)
+  scheduleBanRetry()
+}
 if (!alreadyBanned || previousBanKind !== banVerdict.kind) {
 const note = banVerdict.permanent ? '' : (expiresAt ? ` — flag clears ${new Date(expiresAt).toLocaleString()}` : '')
 logFor(id, `{red-fg}⛔ ${sanitize(id)} is ${banVerdict.kind === 'suspected' ? 'possibly ' : ''}banned${banVerdict.duration ? ' for ' + sanitize(banVerdict.duration) : ''} (${sanitize(banVerdict.kind)})${note}{/red-fg}`)
-if (!banVerdict.permanent) logFor(id, `{yellow-fg}   Recorded in the data file for reporting only — it does not stop ${sanitize(id)} from reconnecting; only ${REMOVED_BOTS_FILE} does.{/yellow-fg}`)
+if (banVerdict.kind === 'temporary') logFor(id, `{yellow-fg}   Automatic reconnects wait for the ban expiry; each retry that is still banned starts another wait.{/yellow-fg}`)
+else if (!banVerdict.permanent) logFor(id, `{yellow-fg}   Suspected ban only — normal reconnect backoff remains active.{/yellow-fg}`)
 if (banVerdict.reason && banVerdict.reason !== text) logFor(id, `{red-fg}   reason: ${sanitize(banVerdict.reason)}${banVerdict.caseId ? ' [case ' + sanitize(banVerdict.caseId) + ']' : ''}{/red-fg}`)
 }
 // Always enforce a permanent verdict, even if an earlier temporary/suspected
@@ -3970,6 +4154,10 @@ logFor(id, `{red-fg}   This ban does not expire — ${moved.added ? 'moved to' :
 logFor(id, `{yellow-fg}   Remove it from BOT_NAMES too, or it will just be skipped with a warning at every start. /removed lists them, /unban ${sanitize(id)} puts it back.{/yellow-fg}`)
 if (PERMANENT_BAN_ACTION === 'remove' && dropFromRoster(id)) logFor(id, `{yellow-fg}   Removed from the live roster (PERMANENT_BAN_ACTION=hold keeps it visible instead).{/yellow-fg}`)
 }
+}
+if (banVerdict.banned) {
+  if (banVerdict.kind !== 'temporary') robotLogin.fail(id, `Kicked during admission: ${text}`)
+  autoTorRotation.check().catch(err => logFor(SYSTEM_ID, `{red-fg}[Tor] Check failed: ${sanitize(err.message)}{/red-fg}`))
 }
 monitoring?.onKick(id, text)
 notifyBotsChanged()
@@ -3988,10 +4176,12 @@ if (err && typeof err === 'object') {
   if (seenConnectionErrors.has(err)) return
   seenConnectionErrors.add(err)
 }
+if (handleTakenName(id, entry, err?.message || String(err))) return
 if (robotLogin.fail(id, err?.message || 'Connection error')) return
 if (fatalConnectionError) return
 lastRawError = err
 entry.lastDisconnectReason = err?.message || String(err)
+if (entry.temporaryBanUntil) { scheduleBanRetry(); return }
 const transportFailure = isProxyCrash(err)
 if (!transportFailure) { e(`Connection error: ${sanitize(entry.lastDisconnectReason)}`); return }
 fatalConnectionError = true
@@ -4174,7 +4364,7 @@ else entry.bot?.emit('end', 'proxy-watchdog: forced')
 // ── Command registry (original + /stats) ──────────────────────────────────────
 const COMMANDS = {
 '/all [first-last|name:first..last] <cmd>': 'Optional inclusive displayed 1–N or exact-name range; a selector alone previews targets without changing selection. Run a local command on EVERY bot, or broadcast a server command to all. ALL_CHAT_GUARD (on by default) refuses plain chat so a typo like "/all .server lifesteal" cannot make every bot say it — prefix with "!" to send chat deliberately ( /all !hello )',
-'/start-login [--retry <name>]': 'Admit shuffled robot.txt accounts immediately, independent of .env startup; direct then valid proxy groups, 5 seconds between attempts. Explicit --retry restores one blocked name.',
+'/start-login [--retry <name>]': 'Admit shuffled robot.txt accounts immediately, independent of .env startup; direct then valid proxy groups, 5 seconds between connection attempts and globally between /login or /register sends (including fallback). Explicit --retry restores one blocked name.',
 '/stop-login': 'Cancel pending robot.txt connection attempts; in-flight admissions finish normally.',
 '/start-rtp [names|first-last|name:first..last|all]': 'Connect disconnected or new RTP accounts, then roam after setup; reuses existing connections. Arrivals append to rtp-locations.txt.',
 '/stop-rtp [names|range|all]': 'Stop roaming; bare command stops all roam sessions. Disconnect/death also stops roaming; restart explicitly.',
@@ -8588,6 +8778,10 @@ webHandle = startWebGUI()
 startTimeseriesSampler()
 startShardSampler()
 analyticsServer = startAnalyticsServer()
+const torBanTimer = setInterval(() => {
+  autoTorRotation.check().catch(err => logFor(SYSTEM_ID, `{red-fg}[Tor] Check failed: ${sanitize(err.message)}{/red-fg}`))
+}, 30000)
+if (torBanTimer.unref) torBanTimer.unref()
 
 if (tui || webHandle) {
 installConsolePlumbing()

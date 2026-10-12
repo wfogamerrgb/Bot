@@ -858,6 +858,37 @@ function isAuthBlocked(failure, now = Date.now()) {
   return failure.until == null || now < failure.until
 }
 
+// ── Taken-username detector ───────────────────────────────────────────────
+// A generated username can collide with a real Minecraft account; the server
+// or an auth plugin then refuses the login with wording like "this name is
+// already taken". Unlike an AuthMe "already logged in" (a verdict about THIS
+// account's session), a taken username is unfixable — the only recovery is a
+// fresh name — so it must never be treated like a password problem.
+//
+// The noun is required before "already registered": a bare "already
+// registered" is the account's own registration state and stays with the auth
+// classifier above.
+const NAME_TAKEN_PATTERNS = [
+  /\b(?:already|currently|now)\s+(?:taken|occupied|claimed|reserved|in\s+use)\b/i,
+  /\b(?:account|username|user\s*name|name|handle)\s+(?:is\s+|has\s+been\s+)?(?:already\s+)?(?:taken|occupied|claimed|reserved|unavailable|not\s+available|in\s+use)\b/i,
+  /\b(?:account|username|user\s*name|name|handle)\s+(?:is\s+)?already\s+(?:registered|exists|in\s+use)\b/i,
+  /\b(?:taken|occupied|claimed|reserved|unavailable|not\s+available|in\s+use)\s+(?:by\s+(?:a\s+)?(?:another|other|real|premium|existing)\s+(?:player|account|user)\b|username|account|name|handle)\b/i,
+  /\b(?:another|other|existing|premium|real)\s+(?:player|account|user)[^\n]{0,40}\b(?:this|that)\s+(?:name|username|account)\b/i,
+  /\bpremium\s+(?:account|name|username)\b/i
+]
+
+// Returns { reason } when the message reports a username that is already owned
+// by somebody else, or null for ordinary chat. The matched phrase is the
+// evidence that lands in the log and the removed list.
+function classifyNameTaken(message) {
+  const text = String(message || '').replace(/\u00a7./g, '')
+  for (const re of NAME_TAKEN_PATTERNS) {
+    const match = text.match(re)
+    if (match) return { reason: match[0].replace(/\s+/g, ' ').trim() }
+  }
+  return null
+}
+
 // True when a resolved proxy carries credentials worth sending.
 function hasProxyAuth(proxy) {
   return Boolean(proxy && (proxy.user || proxy.pass))
@@ -1630,6 +1661,7 @@ module.exports = {
   resolveFallbackPassword,
   parseBotPasswords,
   classifyAuthReply,
+  classifyNameTaken,
   nextAuthFailure,
   isAuthBlocked,
   parseSleepDuration,

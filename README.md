@@ -11,6 +11,36 @@ entry point, `bot.js`, provides both a browser dashboard and an optional
 terminal UI. `bot-rtp.js` is the exploration-oriented variant with RTP,
 base detection, survival helpers, and Discord alerts.
 
+## Verified Tor recovery and reference panels
+
+- `TOR_AUTO_ROTATE_BANNED=true` automatically checks local Tor SOCKS endpoints
+  when bans arrive and every 30 seconds. Only a nonempty cohort whose **every
+  assigned account is confirmed banned and offline** triggers rotation. Unknown,
+  pending, suspected or expired bans prevent it. Accounts removed from the live
+  roster retain their actual proxy route; direct/remote/HTTP routes are excluded.
+- Control uses the existing **SOCKS port + 1** convention. Auto-rotation performs
+  a bounded HTTPS exit-IP probe through that SOCKS endpoint before NEWNYM, waits
+  10 seconds, then probes again. Up to three attempts are allowed; failures retry
+  after a five-minute cooldown, and successful ban episodes rotate only once.
+  An acknowledgement or unchanged IP is **not** reported as a verified change.
+- A probe verifies the exit used for its HTTPS destination, not necessarily the
+  Minecraft destination: Tor can choose multiple circuits/exits per endpoint.
+  Existing TCP connections keep their paths, and an IP change does **not** lift
+  account bans. Auto-recovery never unbans or force-reconnects blocked accounts.
+  `curl` and an accessible unauthenticated local Tor control port are required;
+  missing probes/control access produce an explicit failure rather than a claim.
+- Docs and server-command panels use searchable, responsive cards with section
+  navigation, keyboard closing/focus containment, empty states and safe
+  click-to-prepare. Preparing a server command does not execute it.
+- Confirmed temporary bans pause automatic reconnects until the supplied expiry
+  (unknown duration: `BAN_RETRY_MS`, minimum one minute). Exactly one retry is
+  scheduled; another temporary-ban response starts another expiry wait, never
+  a fast backoff loop. A fresh session may make one initial attempt. Temporary
+  text-file admission bans wait in place rather than entering `removed.txt`.
+  Manual disconnect cancels the wait; long bans use safe chunked timers.
+- Shared logs/history retain secret masking but display `••••` instead of the
+  noisy `[redacted]` placeholder, including older persisted placeholders.
+
 ## Text-file admission, live configuration, and integrated roaming
 
 These features run in the main `bot.js`; neither `/start-login` nor `/start-rtp`
@@ -25,8 +55,12 @@ starts automatically. Do not run the standalone `bot-rtp.js` for the same accoun
   Case-insensitive `.env`/live duplicates, blocked names and invalid usernames
   consume neither a route slot nor a cooldown.
 - Only new text-file accounts try distinct `LOGIN_PASSWORD`, `LOGIN_PASSWORD_1`,
-  `LOGIN_PASSWORD_2` candidates, advancing **only on rejection**, 1.5 seconds
-  apart (`ROBOT_PASSWORD_DELAY_MS=1500`). Success cancels queued passwords;
+  `LOGIN_PASSWORD_2` candidates, advancing **only on rejection**. All admission
+  `/login` and `/register` sends share a global queue, at least **5 seconds apart**
+  across accounts, routes and fallback attempts (`ROBOT_AUTH_DELAY_MS=5000`).
+  This minimum cannot be lowered; `ROBOT_PASSWORD_DELAY_MS` can add a longer
+  fallback delay. Late event-loop callbacks are rechecked to prevent bursts.
+  Success cancels queued passwords;
   throttling stops immediately. Existing `.env` accounts keep credential priority.
 - Any admission failure closes the new account and appends `username # timestamp
   reason` to **`removed.txt`**, without passwords. Admission lasts through chat
@@ -93,10 +127,16 @@ starts automatically. Do not run the standalone `bot-rtp.js` for the same accoun
   The origin guard accepts a browser's `Sec-Fetch-Site: same-origin`, a matching
   `X-Forwarded-Host`, direct IP access, and SSH/loopback tunnels automatically,
   so login keeps working behind port-forwards and reverse proxies that rewrite
-  `Host`. For an older browser behind a non-loopback tunnel/proxy, list the public
+  `Host`. Host comparisons normalize the scheme's default port (`:80` for HTTP,
+  `:443` for HTTPS), including DNS names, forwarded hosts and configured origins;
+  nondefault ports must still match. For an older browser behind a non-loopback
+  tunnel/proxy, list the public
   origin in `WEB_ALLOWED_ORIGINS=https://bot.example.com` (comma-separated full
   origins or `host[:port]`). `Origin: null` and `Sec-Fetch-Site: cross-site` are
-  always refused, and a 403 names the mismatch plus that setting.
+  always refused, and a 403 names the mismatch plus that setting. The login page
+  uses `Referrer-Policy: same-origin` so browser form submissions retain their
+  real `Origin` instead of becoming `null`; other dashboard pages keep
+  `no-referrer`, and cross-origin destinations receive no login-page referrer.
   Closing the terminal clears its screen and closes only that SSH channel; it
   never injects `exit` into a nested bot TUI. Bootstrap dashboard passwords print
   only to local stderr, not shared logs. **The authenticated full SSH shell is
