@@ -1236,7 +1236,37 @@ const spawnerDrop = require(path.join(__dirname, 'spawner-drop')).createSpawnerD
   defaults: () => ({ durationMs: settings.get('SPAWNER_DROP_DURATION_MS'), cooldownMs: settings.get('SPAWNER_DROP_COOLDOWN_MS'), mode: settings.get('SPAWNER_DROP_MODE'), scope: settings.get('SPAWNER_DROP_SCOPE'), terms: [settings.get('SPAWNER_DROP_MATCH')] })
 })
 
-const LOCAL_COMMANDS = ['/server-commands', '/start-rtp', '/stop-rtp', '/evidence', '/connection', '/spawner-drop', '/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dump-spawners', '/dc', '/reconnect', '/crates', '/crates-loop', '/spawners', '/data', '/shardshop-loop', '/closeBot', '/bot-coinflip', '/bot-coinflip-all', '/ai-chat', '/repeat', '/use-book', '/enchanted-golden-apple-extract', '/ege', '/scripts', '/run-script']
+const LOCAL_COMMANDS = ['/server-commands', '/start-rtp', '/stop-rtp', '/evidence', '/connection', '/spawner-drop', '/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dump-spawners', '/dc', '/reconnect', '/crates', '/crates-loop', '/spawners', '/data', '/shardshop-loop', '/closeBot', '/bot-coinflip', '/bot-coinflip-all', '/ai-chat', '/repeat', '/use-book', '/enchanted-golden-apple-extract', '/ege', '/scripts', '/run-script', '/lifesteal-start', '/lifesteal-stop', '/lifesteal-status']
+
+// ── Lifesteal queue / arena / TPA automation (lifesteal-queue.js) ──────────
+// One random bot holds /duelsroomqueue, one holds /queue (replaced on death,
+// same bot allowed again), one non-queue bot loops /warp arena → wait 5s →
+// hold forward until collision, one bot spams /tpa round-robin until
+// deathban (parked 24h, can still join server just not /server lifesteal),
+// everyone else stays /warp afk. Roster tops up to LIFESTEAL_TARGET_BOTS
+// (default 25) via /new-gen semantics and never removes bots.
+const lifestealQueue = require(path.join(__dirname, 'lifesteal-queue')).createLifestealQueue({
+  getBots: () => bots,
+  isOnline: (entry) => botOnline(entry),
+  sendChat: (id, msg) => {
+    const entry = bots[id]
+    if (!entry || !entry.bot) return false
+    try { entry.bot.chat(msg); return true } catch (_) { return false }
+  },
+  log: (id, msg) => logFor(id || SYSTEM_ID, `{cyan-fg}[lifesteal] ${sanitize(msg)}{/cyan-fg}`),
+  getEnv: () => process.env,
+  ensureRoster: (missing) => {
+    try {
+      const result = persistGeneratedBots({ file: path.join(__dirname, '.env'), env: process.env, existing: Object.keys(bots), blocked: (removedBots.bots || []).map(row => row.bot), count: Number(missing) || 1, group: 'auto', io: fs })
+      refreshRuntimeConfig()
+      logFor(SYSTEM_ID, `{green-fg}✓ [lifesteal] Saved ${result.names.length} generated account(s) to .env before connecting.{/green-fg}`)
+      result.assignments.forEach(({ name }, index) => {
+        setTimeout(() => { if (!Object.hasOwn(bots, name) && !connectBlockReason(name)) createBotInstance(name) }, index * readDelayMs(process.env.ROBOT_CONNECT_DELAY_MS, 5000))
+      })
+      return { ok: true, names: result.names }
+    } catch (err) { return { ok: false, error: err && err.message ? err.message : String(err) } }
+  },
+})
 
 const logSubscribers = new Set()
 function subscribeLog(fn) { logSubscribers.add(fn); return () => logSubscribers.delete(fn) }
@@ -4055,8 +4085,10 @@ notifyBotsChanged()
 })
 
 bot.on('message', (jsonMsg) => { try { c(jsonMsg.toString()) } catch (_) {} })
+bot.on('messagestr', (text) => { try { lifestealQueue.onMessage(id, String(text || '')) } catch (_) {} })
 
 bot.on('death', () => {
+  try { lifestealQueue.onDeath(id) } catch (_) {}
   cancelPendingRtp(id)
   recordEvidence(id, 'deaths', { source: 'mineflayer:death', position: botLocation(bot), reason: 'Death observed; killer/cause unknown unless the server supplies a death message.', recentServerMessages: (bots[id]?.chatHistory || []).slice(-5) })
   spawnerDrop.stop(id, 'death')
@@ -4068,6 +4100,7 @@ if (bot._client) bot._client.on('death_combat_event', packet => {
 
 bot.on('kicked', (reason) => {
 if (bots[id]?.bot !== bot) return
+try { lifestealQueue.onKick(id, typeof reason === 'string' ? reason : JSON.stringify(reason)) } catch (_) {}
 cancelPendingRtp(id)
 let text
 try { text = typeof reason === 'string' ? reason : JSON.stringify(reason) } catch (_) { text = 'unknown' }
@@ -4416,6 +4449,9 @@ const COMMANDS = {
 '/reconnect-all-slow': 'Reconnect ALL bots (online or offline) with a 30s delay between each to avoid rate limits',
 '/new-bot <n> [host] [port] [ver]': 'Create and connect a new bot',
 '/new-gen [count] [group=auto|direct|N]': 'Generate unique Minecraft names, atomically save to .env and balanced proxy groups, then connect staggered (1–100).',
+'/lifesteal-start': 'Start lifesteal automation: random bot /duelsroomqueue + random bot /queue (replaced on death, same bot allowed), one non-queue bot loops /warp arena → 5s → forward-until-hit, one bot spams /tpa until deathban (24h park), rest /warp afk, roster tops up to LIFESTEAL_TARGET_BOTS=25 via /new-gen (never removes)',
+'/lifesteal-stop': 'Stop lifesteal automation and release held forward keys',
+'/lifesteal-status': 'Show lifesteal roles (duels/queue/arena/tpa), online/total counts and deathbanned bots',
 '/server-commands [filter] [--refresh]': 'List commands advertised by the Minecraft server to the selected account; refresh uses tab completion, never executes commands.',
 '/switch <id>': 'Switch view to a different bot by name or number',
 '/uptime': 'Show uptime for all bots',
@@ -4925,6 +4961,14 @@ case '/evidence': {
   return true
 }
 case '/spawner-drop': return spawnerDrop.route(id, String(cmd).slice('/spawner-drop'.length))
+case '/lifesteal-start': { const r = lifestealQueue.start(); logFor(id, r.ok ? '{green-fg}✓ Lifesteal automation started.{/green-fg}' : `{yellow-fg}⚠ ${sanitize(r.error || 'already running')}{/yellow-fg}`); return true }
+case '/lifesteal-stop': { const r = lifestealQueue.stop(); logFor(id, r.ok ? '{green-fg}✓ Lifesteal automation stopped.{/green-fg}' : `{yellow-fg}⚠ ${sanitize(r.error || 'not running')}{/yellow-fg}`); return true }
+case '/lifesteal-status': {
+  const s = lifestealQueue.status()
+  logFor(id, `{cyan-fg}› Lifesteal ${s.running ? 'RUNNING' : 'stopped'} — online ${s.online}/${s.total} (target ${s.cfg.targetBots}) | duels=${sanitize(s.roles.duels || '-') } queue=${sanitize(s.roles.queue || '-')} arena=${sanitize(s.roles.arena || '-')} tpa=${sanitize(s.roles.tpa || '-')}{/cyan-fg}`)
+  if (s.deathbanned.length) logFor(id, `{yellow-fg}⚠ Deathbanned (${s.deathbanned.length}): ${sanitize(s.deathbanned.map(d => d.bot).join(', '))}{/yellow-fg}`)
+  return true
+}
 case '/status': {
 logFor(id, `{cyan-fg}› State: ${botOnline(entry) ? 'online' : dataState.bots[id]?.banned ? 'banned' : entry.connectionState || 'disconnected'}${entry.lastDisconnectReason ? ' — ' + sanitize(entry.lastDisconnectReason) : ''}{/cyan-fg}`)
 logFor(id, ` Connection: ${sanitize(JSON.stringify(connectionDetails(id, entry)))}`)

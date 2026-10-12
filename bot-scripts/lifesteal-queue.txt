@@ -1,0 +1,22 @@
+# lifesteal-queue — run with: /lifesteal-start (not /run-script lifesteal-queue)
+# This file documents the JS automation in lifesteal-queue.js. The .txt runner
+# cannot do random picks / death replacement / collision / deathban loops, so
+# the real automation is the /lifesteal-start command wired in bot.js.
+#
+# What /lifesteal-start does:
+#   - random bot sends /duelsroomqueue (on death a new random bot is picked,
+#     same bot allowed again — no blacklist)
+#   - random bot sends /queue (same replacement rule)
+#   - random bot that is NOT duels/queue does /warp arena, waits 5s, holds
+#     forward until it hits something (solid block ahead or stuck), repeats
+#   - one bot spams /tpa <player> round-robin over every visible player until
+#     deathban (~24h: can still join server, just not /server lifesteal),
+#     then a fresh random bot takes over and the banned one is parked
+#   - every other bot stays /warp afk (sent once)
+#   - roster tops up to LIFESTEAL_TARGET_BOTS=25 via /new-gen, never removes
+#
+# Commands:
+#   /lifesteal-start | /lifesteal-stop | /lifesteal-status
+#
+# Manual fallback (if you insist on plain scripts):
+#   * /warp afk
