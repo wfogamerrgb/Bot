@@ -1,5 +1,9 @@
 # lifesteal-queue — run with: /lifesteal-start (not /run-script lifesteal-queue)
-# /lifesteal-start restarts Tor FIRST: brew services restart tor
+# /lifesteal-start restarts Tor FIRST: scripts/restart-tor.sh --tor-only
+# (the ONLY thing that brings up control ports 9051/9151/9251 this repo
+# signals; `brew services restart tor` has no ControlPort 9051 -> NEWNYM
+# gets ECONNREFUSED and no new circuit is requested). Then it sends NEWNYM
+# on every local control port so reconnecting bots leave on fresh paths.
 # This file documents the JS automation in lifesteal-queue.js. The .txt runner
 # cannot do random picks / death replacement / collision / deathban loops, so
 # the real automation is the /lifesteal-start command wired in bot.js.

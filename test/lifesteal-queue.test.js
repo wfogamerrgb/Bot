@@ -151,8 +151,11 @@ test('onBan drops the role, orders one replacement, and refills immediately', ()
   h.q.stop()
 })
 
-test('lifestealTorRestartCmd defaults to brew services restart tor', () => {
-  assert.equal(LQ.lifestealTorRestartCmd({}), 'brew services restart tor')
+test('lifestealTorRestartCmd defaults to restart-tor.sh --tor-only (brew has no ControlPort 9051)', () => {
+  const expected = 'sudo -n bash ./scripts/restart-tor.sh --tor-only'
+  assert.equal(LQ.lifestealTorRestartCmd({}), expected)
   assert.equal(LQ.lifestealTorRestartCmd({ LIFESTEAL_TOR_RESTART_CMD: 'systemctl restart tor' }), 'systemctl restart tor')
-  assert.equal(LQ.lifestealTorRestartCmd({ LIFESTEAL_TOR_RESTART_CMD: '  ' }), 'brew services restart tor')
+  assert.equal(LQ.lifestealTorRestartCmd({ LIFESTEAL_TOR_RESTART_CMD: '  ' }), expected)
+  // Homebrew's Tor is explicitly NOT the fleet: no control port -> ECONNREFUSED.
+  assert.notEqual(LQ.lifestealTorRestartCmd({}), 'brew services restart tor')
 })

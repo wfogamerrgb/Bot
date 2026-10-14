@@ -17,9 +17,15 @@
 //            bots. Server-banned bots count as missing, so a ban wave is
 //            replaced with fresh /new-gen names and the loop continues like
 //            nothing happened.
-// Tor     — /lifesteal-start restarts Tor FIRST via
-//            `brew services restart tor` (LIFESTEAL_TOR_RESTART_CMD override).
-//            Nothing else about Tor is touched (no NEWNYM/proxy changes).
+// Tor     — /lifesteal-start restarts Tor FIRST via scripts/restart-tor.sh
+//            --tor-only (LIFESTEAL_TOR_RESTART_CMD override). This is the
+//            ONLY thing that brings up the per-instance Tor fleet this repo
+//            actually talks to (SocksPort 9050/9150/9250, ControlPort =
+//            Socks+1). `brew services restart tor` is NOT it: Homebrew's
+//            service has no ControlPort 9051, so a NEWNYM signal gets
+//            ECONNREFUSED and no new circuit is ever requested. After the
+//            restart the manager requests NEWNYM on every local control port
+//            so the reconnecting bots leave on fresh paths.
 //
 // Deathban note: a lifesteal deathban (~24h) still lets the account join the
 // server, it just cannot `/server lifesteal`. Deathbanned bots are therefore
@@ -82,12 +88,14 @@ function readConfig (env) {
 }
 
 // Tor restart command used ONLY by /lifesteal-start (runs first, before any
-// role assignment). Deliberately separate from PROXY_RESTART_CMD and the
-// NEWNYM machinery so no other Tor behavior changes.
+// role assignment). Deliberately separate from PROXY_RESTART_CMD so no other
+// Tor behavior changes. Default is the repo's own Tor supervisor — the only
+// thing that (re)creates the control ports this fleet signals:
+//   scripts/restart-tor.sh --tor-only   (needs root on the box)
 function lifestealTorRestartCmd (env) {
   const e = env || {}
   const custom = String(e.LIFESTEAL_TOR_RESTART_CMD || '').trim()
-  return custom || 'brew services restart tor'
+  return custom || 'sudo -n bash ./scripts/restart-tor.sh --tor-only'
 }
 
 // Deathban wording seen on lifesteal servers: "deathban", "death banned",

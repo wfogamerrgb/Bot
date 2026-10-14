@@ -4452,7 +4452,7 @@ const COMMANDS = {
 '/reconnect-all-slow': 'Reconnect ALL bots (online or offline) with a 30s delay between each to avoid rate limits',
 '/new-bot <n> [host] [port] [ver]': 'Create and connect a new bot',
 '/new-gen [count] [group=auto|direct|N]': 'Generate unique Minecraft names, atomically save to .env and balanced proxy groups, then connect staggered (1–100).',
-'/lifesteal-start': 'Restarts Tor first (brew services restart tor, LIFESTEAL_TOR_RESTART_CMD override — nothing else Tor-related changes), then: random bot /duelsroomqueue + random bot /queue (replaced on death, same bot allowed), one non-queue bot loops /warp arena → 5s → forward-until-hit, one bot spams /tpa until deathban (24h park), rest /warp afk. Banned bots are replaced via /new-gen so the loop continues; roster tops up to LIFESTEAL_TARGET_BOTS=20 (never removes)',
+'/lifesteal-start': 'Restarts Tor first (scripts/restart-tor.sh --tor-only, LIFESTEAL_TOR_RESTART_CMD override — brew services restart tor is NOT this repo\'s Tor and has no control port 9051), then requests NEWNYM on every local control port so reconnecting bots get fresh circuits, then: random bot /duelsroomqueue + random bot /queue (replaced on death, same bot allowed), one non-queue bot loops /warp arena → 5s → forward-until-hit, one bot spams /tpa until deathban (24h park), rest /warp afk. Banned bots are replaced via /new-gen so the loop continues; roster tops up to LIFESTEAL_TARGET_BOTS=20 (never removes)',
 '/lifesteal-stop': 'Stop lifesteal automation and release held forward keys',
 '/lifesteal-status': 'Show lifesteal roles (duels/queue/arena/tpa), online/total counts and deathbanned bots',
 '/server-commands [filter] [--refresh]': 'List commands advertised by the Minecraft server to the selected account; refresh uses tab completion, never executes commands.',
@@ -4965,16 +4965,29 @@ case '/evidence': {
 }
 case '/spawner-drop': return spawnerDrop.route(id, String(cmd).slice('/spawner-drop'.length))
 case '/lifesteal-start': {
-  // Tor-first: restart the local Tor service before assigning any roles.
-  // Scoped to this command only — PROXY_RESTART_CMD / NEWNYM / watchdog paths are untouched.
-  const lifestealTorCmd = (process.env.LIFESTEAL_TOR_RESTART_CMD || '').trim() || 'brew services restart tor'
+  // Tor-first: restart the local Tor fleet before assigning any roles.
+  // Scoped to this command only — PROXY_RESTART_CMD / watchdog paths are untouched.
+  // Default is scripts/restart-tor.sh --tor-only: the ONLY thing that brings up
+  // the per-instance Tor this repo signals (ControlPort = Socks+1).
+  // `brew services restart tor` is NOT it: Homebrew's service has no
+  // ControlPort 9051, so NEWNYM hits ECONNREFUSED and no circuit ever changes.
+  const lifestealTorCmd = (process.env.LIFESTEAL_TOR_RESTART_CMD || '').trim() || 'sudo -n bash ./scripts/restart-tor.sh --tor-only'
   logFor(id, `{cyan-fg}[lifesteal] Restarting Tor first: ${sanitize(lifestealTorCmd)}…{/cyan-fg}`)
+  const afterTorRestart = () => {
+    // Ask every local control port for fresh circuits NOW and reconnect the
+    // bots staggered so they leave on new paths. This is the exact code path
+    // behind /tor-newnym (per-port ✓/✗ is logged by requestTorCircuits).
+    try {
+      torRotate('all', { reconnect: true }).catch(err => logFor(id, `{yellow-fg}⚠ [lifesteal] NEWNYM after Tor restart failed: ${sanitize(err.message)}{/yellow-fg}`))
+    } catch (err) { logFor(id, `{yellow-fg}⚠ [lifesteal] NEWNYM after Tor restart failed: ${sanitize(err.message)}{/yellow-fg}`) }
+  }
   try {
     exec(lifestealTorCmd, { timeout: 120000 }, (err, stdout, stderr) => {
       if (err) logFor(id, `{yellow-fg}⚠ [lifesteal] Tor restart exited with an error (continuing anyway): ${sanitize(err.message)}${stderr ? ' — ' + sanitize(String(stderr).slice(0, 200)) : ''}{/yellow-fg}`)
       else logFor(id, `{green-fg}✓ [lifesteal] Tor restart done${stdout ? ': ' + sanitize(String(stdout).slice(0, 200)) : ''}. Continuing.{/green-fg}`)
+      afterTorRestart()
     })
-  } catch (err) { logFor(id, `{yellow-fg}⚠ [lifesteal] Tor restart failed to launch (continuing anyway): ${sanitize(err.message)}{/yellow-fg}`) }
+  } catch (err) { logFor(id, `{yellow-fg}⚠ [lifesteal] Tor restart failed to launch (continuing anyway): ${sanitize(err.message)}{/yellow-fg}`); afterTorRestart() }
   const r = lifestealQueue.start()
   logFor(id, r.ok ? '{green-fg}✓ Lifesteal automation started.{/green-fg}' : `{yellow-fg}⚠ ${sanitize(r.error || 'already running')}{/yellow-fg}`)
   return true
