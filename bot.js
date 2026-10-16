@@ -3410,16 +3410,23 @@ return realStderr(chunk, encoding, cb)
 }
 
 // ── Bot creation (original, with consolidated packet listener + log throttling) ──
-// Recognize "<name>: message" player chat lines. The server may inject odd
-// unicode just before the username, so strip § codes + non-ASCII first.
+// Recognize player chat lines in the usual shapes -- "name: message",
+// "<name> message", each with optional rank tags ("[rank] name: message").
+// The server may inject odd unicode just before the username, so strip
+// section codes + non-ASCII first. Players can type any server wording
+// ("Kicked: {...}", "You are deathbanned...") into chat; matching those
+// shapes here is what keeps typed fakes out of the ban/auth/taken-name
+// handlers that gate on this.
 function detectPlayerChat (text) {
   const clean = String(text || '')
     .replace(/\u00a7./g, '')
+    .replace(/\s*[»›]\s*/g, ': ') // "Name » msg" style chat separators
     .replace(/[^\x20-\x7e]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
-  const m = clean.match(/^([A-Za-z0-9_]{1,16}):\s*(.+)$/)
-  return m ? { name: m[1], message: m[2] } : null
+  const stripped = clean.replace(/^(?:\[[^\]]{1,24}\]\s*)+/, '')
+  const m = stripped.match(/^(?:<([A-Za-z0-9_]{1,16})>|([A-Za-z0-9_]{1,16}):)\s*(.+)$/)
+  return m ? { name: m[1] || m[2], message: m[3] } : null
 }
 
 function detectTpaRequester (text) {

@@ -57,6 +57,10 @@ const DEFAULTS = {
   rosterTickMs: 60000,
   deathbanMs: 24 * 60 * 60 * 1000,
   resendCooldownMs: 15000,
+  // Chat-based ban/deathban detection is spoofable (players can type any
+  // wording), so it is only believed inside these trust windows.
+  trustWindowMs: 10 * 60 * 1000, // first minutes of a session
+  deathTrustMs: 2 * 60 * 1000, // right after a real death/kick event
 }
 
 function readConfig (env) {
@@ -84,6 +88,8 @@ function readConfig (env) {
     rosterTickMs: num('LIFESTEAL_ROSTER_TICK_MS', DEFAULTS.rosterTickMs, 15000),
     deathbanMs: num('LIFESTEAL_DEATHBAN_MS', DEFAULTS.deathbanMs, 60000),
     resendCooldownMs: num('LIFESTEAL_RESEND_MS', DEFAULTS.resendCooldownMs, 5000),
+    trustWindowMs: num('LIFESTEAL_TRUST_WINDOW_MS', DEFAULTS.trustWindowMs, 1000),
+    deathTrustMs: num('LIFESTEAL_DEATH_TRUST_MS', DEFAULTS.deathTrustMs, 1000),
   }
 }
 
@@ -105,6 +111,24 @@ const DEATHBAN_RE = /death[\s-]*ban|banned for\s+24\s*hour|you (are|have been) (
 function isDeathbanText (text) {
   if (!text) return false
   return DEATHBAN_RE.test(String(text))
+}
+
+// Player chat always carries the sender ("name: msg", "<name> msg", with
+// optional rank tags). Any line shaped like that is somebody typing in chat —
+// they can write "You are deathbanned…" or "Kicked: {…}" verbatim and it must
+// never be believed as a server notice. System lines (real deathban/kick
+// screens) have no name-shaped prefix. Mirrors the detectPlayerChat filter
+// bot.js applies to its own ban/auth handlers, kept local so this module stays
+// dependency-free.
+function looksLikePlayerChat (text) {
+  const clean = String(text || '')
+    .replace(/\u00a7./g, '')
+    .replace(/\s*[»›]\s*/g, ': ') // "Name » msg" style chat separators
+    .replace(/[^\x20-\x7e]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  const stripped = clean.replace(/^(?:\[[^\]]{1,24}\]\s*)+/, '')
+  return /^(?:<[A-Za-z0-9_]{1,16}>|[A-Za-z0-9_]{1,16}:)\s*\S/.test(stripped)
 }
 
 function pickRandom (arr, rand) {
@@ -176,6 +200,8 @@ function createLifestealQueue (deps) {
     cfg: readConfig(getEnv()),
     roles: { duels: null, queue: null, arena: null, tpa: null },
     deathbanned: new Map(), // id -> expiryMs
+    activeSince: new Map(), // id -> when first seen online (chat trust window)
+    lastRealEventAt: new Map(), // id -> last real death/kick (reopens trust window)
     afkSent: new Set(), // bots already parked at /warp afk (avoid chat spam)
     lastSent: new Map(), // `${id}:${cmd}` -> timestamp (resend cooldown)
     arena: { phase: 'idle', waitUntil: 0, forwardSince: 0, lastPos: null, stuckSince: 0, timeoutAt: 0 },
@@ -216,6 +242,39 @@ function createLifestealQueue (deps) {
     releaseRole(id, true)
     try { stopForward(id) } catch (_) {}
     log(id, `deathbanned (${reason || 'detected'}) — parked for 24h, excluded from lifesteal roles`)
+  }
+
+  // Session bookkeeping for the chat trust window: each bot's clock starts
+  // when it is first seen online and resets when it drops off (a reconnect is
+  // a fresh session). Real death/kick events reopen the window — that is when
+  // a genuine deathban notice actually arrives.
+  function noteSessions () {
+    const bots = getBots() || {}
+    for (const id of Object.keys(bots)) {
+      let on = false
+      try { on = isOnline(bots[id]) } catch (_) { on = false }
+      if (on) {
+        if (!state.activeSince.has(id)) state.activeSince.set(id, now())
+      } else {
+        state.activeSince.delete(id)
+      }
+    }
+  }
+
+  function noteRealEvent (id) {
+    state.lastRealEventAt.set(id, now())
+  }
+
+  // Chat-based deathban text is only believed inside a trust window: the first
+  // few minutes a bot is active, or the minutes right after a real death/kick.
+  // Outside those windows a matching line is treated as somebody typing server
+  // wording in chat — which anyone can do — and ignored. Real kick packets
+  // (onKick) never need a window; players cannot forge those.
+  function messageTrusted (id) {
+    const since = state.activeSince.get(id)
+    if (since != null && now() - since <= state.cfg.trustWindowMs) return true
+    const ev = state.lastRealEventAt.get(id) || 0
+    return ev > 0 && now() - ev <= state.cfg.deathTrustMs
   }
 
   function roleTaken () {
@@ -526,6 +585,7 @@ function createLifestealQueue (deps) {
   function tick () {
     if (!state.running) return
     state.cfg = readConfig(getEnv())
+    noteSessions()
     maintainQueueRoles()
     maintainArena()
     maintainTpa()
@@ -612,6 +672,7 @@ function createLifestealQueue (deps) {
 
   function onDeath (id) {
     if (!state.running) return
+    noteRealEvent(id)
     if (isDeathbanned(id)) return
     const r = roleOf(id)
     try { stopForward(id) } catch (_) {}
@@ -627,6 +688,9 @@ function createLifestealQueue (deps) {
 
   function onKick (id, reason) {
     if (!state.running) return
+    noteRealEvent(id)
+    // A kick is a real server packet — nobody can type one into chat — so its
+    // wording is always believed, with no trust window.
     const text = String(reason || '')
     if (isDeathbanText(text)) { markDeathbanned(id, 'kick: ' + text.slice(0, 120)); try { tick() } catch (_) {}; return }
     // Any other kick/disconnect of a role holder triggers replacement.
@@ -642,14 +706,20 @@ function createLifestealQueue (deps) {
 
   function onMessage (id, text) {
     if (!state.running) return
+    // Typed chat can imitate any server wording — "You are deathbanned…",
+    // "Kicked: {\"color\":…}" — so two independent gates apply before a
+    // message is believed: (1) a line shaped like player chat (name-prefixed,
+    // optional rank tag) is never trusted, and (2) plain-looking lines are only
+    // trusted inside the message trust window (first minutes of the session, or
+    // right after a real death/kick). See looksLikePlayerChat/messageTrusted.
+    if (looksLikePlayerChat(text)) return
+    if (!messageTrusted(id)) return
     if (isDeathbanText(text)) {
-      // Only the tpa spammer is expected to deathban, but any lifesteal role
-      // holder showing the message is parked the same way.
-      const r = roleOf(id)
-      if (r || id === state.roles.tpa) {
-        markDeathbanned(id, 'deathban message')
-        try { tick() } catch (_) {}
-      }
+      // A trusted deathban notice means the account is out for 24h even if it
+      // already lost its role to the death event — park it so it is not
+      // re-picked while deathbanned.
+      markDeathbanned(id, 'deathban message')
+      try { tick() } catch (_) {}
     }
   }
 
@@ -663,6 +733,7 @@ function createLifestealQueue (deps) {
 
 module.exports = {
   createLifestealQueue,
+  looksLikePlayerChat,
   lifestealTorRestartCmd,
   readConfig,
   isDeathbanText,

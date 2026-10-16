@@ -91,6 +91,14 @@ const PERM_WORD_RE = /permanent(?:ly)?[\s-]+bann?ed|permanent ban|permaban|banne
 // length makes the bot log "temporary" and then hold it forever anyway.
 const PERM_EXPIRES_IN_RE = /expires?\s+in\s*:?\s*(permanent(?:ly)?|forever|never|indefinite|eternal)/i
 const SUSPECT_RE = /alt (?:account )?detected|anti-?bot|bot detected|automatic(?:ally)? banned|suspicious (?:activity|connection)/i
+// A kick that reports a dead Minecraft session: "You are not logged into your
+// Minecraft account. If you are logged into your Minecraft account, try
+// restarting your Minecraft client." The account's session is gone, so every
+// reconnect gets the exact same kick — there is nothing to retry and no expiry
+// to wait for. It is classified as a permanent ban below (disconnect, no auto
+// reconnect), and classifyKick only ever runs on real kick packets
+// (bot.on('kicked')), so typed chat cannot fake this path.
+const AUTH_FAIL_RE = /not\s+logged\s+into\s+your\s+(?:minecraft|premium|mojang|msa)?\s*account/i
 var BAN_DURATION_RE = /\bfor\s+(\d+\s*(?:second|minute|hour|day|week|month|year)s?)/i
 var BAN_EXPIRES_IN_RE = /expires?\s+in\s*:?\s*([0-9][^\n]*)/i
 var BAN_EXPIRES_AT_RE = /expires?\s+(?:at|on|until)?\s*:?\s*(\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?)/i
@@ -136,6 +144,22 @@ function classifyKick (message) {
   const text = normalizeKickText(message)
   const empty = { banned: false, permanent: false, kind: '', duration: '', durationMs: 0, expiresAt: 0, reason: text || '', caseId: '', text: text || '' }
   if (!text || !text.trim()) return empty
+
+  // Dead session handling first: it carries no ban wording at all, so it would
+  // otherwise fall through as "not a ban" and be retried into a reconnect loop.
+  if (AUTH_FAIL_RE.test(text)) {
+    return {
+      banned: true,
+      permanent: true,
+      kind: 'permanent',
+      duration: '',
+      durationMs: 0,
+      expiresAt: 0,
+      reason: text,
+      caseId: '',
+      text
+    }
+  }
 
   const blacklist = BLACKLIST_RE.test(text)
   const suspect = !blacklist && SUSPECT_RE.test(text)

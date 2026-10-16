@@ -282,3 +282,23 @@ test('an ordinary kick still uses the plain kick alert', async () => {
     assert.equal(sent[0].content, '', 'a normal kick is not critical')
   })
 })
+
+// The "not logged into your Minecraft account" kick is a dead session: every
+// reconnect gets the same kick. It carries no ban wording, but acting on it
+// like a permanent ban (disconnect, no auto reconnect) is what stops the
+// reconnect loop. classifyKick only runs on real kick packets, so this wording
+// typed into chat cannot trigger it.
+test('classifyKick treats a dead Minecraft session as a permanent ban', () => {
+  const AUTH_KICK = '{"color":"red","text":"You are not logged into your Minecraft account. If you are logged into your Minecraft account, try restarting your Minecraft client."}'
+  const verdict = classifyKick(AUTH_KICK)
+  assert.equal(verdict.banned, true)
+  assert.equal(verdict.permanent, true)
+  assert.equal(verdict.kind, 'permanent')
+  assert.equal(verdict.durationMs, 0)
+  assert.equal(verdict.expiresAt, 0)
+  // plain-text variant of the same notice
+  assert.equal(classifyKick('You are not logged into your Minecraft account.').permanent, true)
+  // ordinary non-ban kicks must not be caught by it
+  assert.equal(classifyKick('You are not logged into the queue').banned, false)
+  assert.equal(classifyKick('Outdated client!').banned, false)
+})
