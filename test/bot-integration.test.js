@@ -442,6 +442,15 @@ test('new-gen saves generated roster and proxy groups before staggered connectio
   timer.fn()
   assert.equal(r.createdBots.length, 1)
   assert.equal(r.run('PROXY_GROUPS[0].index'), 2)
+  // Generated connects use the default connect delay (1.75x faster than the old
+  // 39.5s) — the same pacing as bots normally connect with at startup — and not
+  // the 5s ROBOT_CONNECT_DELAY_MS admission burst.
+  assert.equal(r.run('CONNECT_DELAY_MS'), 22571)
+  const genDelays = [...r.timers.keys()]
+    .filter(t => String(t.fn).includes('Object.hasOwn(bots, name)'))
+    .map(t => t.delay)
+    .sort((a, b) => a - b)
+  assert.deepEqual(genDelays, [0, 22571, 45142], 'generated connects pace on the default connect delay')
 })
 test('all-slow dispatches crates-solo once per target and refuses nested fleet commands', async () => {
   const r = runtime()
@@ -2989,4 +2998,27 @@ test('/doc lists the built-in docs and opens a topic', async () => {
   assert.match(text, /DUMP_HIDDEN_CONCURRENT/)
   r.run(`handleCommand('/doc no-such-topic-xyz')`)
   assert.match(logsText(r), /No docs topic matches "no-such-topic-xyz"/)
+})
+
+
+// Standalone lifesteal routines: the exact console commands a user types.
+// They must route through the local-command dispatcher, honour [count|all],
+// refuse a bad argument with usage, show up in /lifesteal-status, and stop on
+// demand — without any roster top-up.
+test('standalone lifesteal routines route from the console and stop on demand', () => {
+  const r = runtime({ TEST_CREATE_BOTS: true, LIFESTEAL_SOLO_REPEAT_MS: '5000' })
+  r.run("handleCommand('/tpa-roundrobin 2')")
+  assert.match(logsText(r), /Standalone tpa routine started on 2 bot\(s\)/)
+
+  r.run("handleCommand('/tpa-roundrobin banana')")
+  assert.match(logsText(r), /Usage: \/tpa-roundrobin \[count\|all\] \[stop\]/)
+
+  r.run("handleCommand('/lifesteal-status')")
+  assert.match(logsText(r), /Lifesteal SOLO tpa —/)
+  assert.match(logsText(r), /role counts \(live\): duels=1 queue=1 arena=1 tpa=1/)
+
+  r.run("handleCommand('/tpa-roundrobin stop')")
+  assert.match(logsText(r), /Standalone routine stopped/)
+  r.run("handleCommand('/tpa-roundrobin stop')")
+  assert.match(logsText(r), /no standalone routine running/)
 })

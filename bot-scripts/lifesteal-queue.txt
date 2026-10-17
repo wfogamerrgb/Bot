@@ -8,15 +8,19 @@
 # cannot do random picks / death replacement / collision / deathban loops, so
 # the real automation is the /lifesteal-start command wired in bot.js.
 #
-# What /lifesteal-start does:
-#   - random bot sends /duelsroomqueue (on death a new random bot is picked,
-#     same bot allowed again — no blacklist)
-#   - random bot sends /queue (same replacement rule)
-#   - random bot that is NOT duels/queue does /warp arena, waits 5s, holds
-#     forward until it hits something (solid block ahead or stuck), repeats
-#   - one bot spams /tpa <player> round-robin over every visible player until
-#     deathban (~24h: can still join server, just not /server lifesteal),
-#     then a fresh random bot takes over and the banned one is parked
+# What /lifesteal-start does (role sizes are configurable — LIFESTEAL_DUELS_BOTS,
+# LIFESTEAL_QUEUE_BOTS, LIFESTEAL_ARENA_BOTS, LIFESTEAL_TPA_BOTS, default 1
+# each, 0 disables the role; live in the .ENV tab / /env set):
+#   - LIFESTEAL_DUELS_BOTS random bots send /duelsroomqueue (on death a new
+#     random bot is picked, same bot allowed again — no blacklist)
+#   - LIFESTEAL_QUEUE_BOTS random bots send /queue (same replacement rule)
+#   - LIFESTEAL_ARENA_BOTS random bots, never duels/queue/tpa holders, do
+#     /warp arena, wait 5s, hold forward until they hit something (solid
+#     block ahead or stuck), repeat
+#   - LIFESTEAL_TPA_BOTS bots spam /tpa <player> round-robin over every
+#     visible player until deathban (~24h: can still join server, just not
+#     /server lifesteal), then a fresh random bot takes over and the banned
+#     one is parked
 #   - every other bot stays /warp afk (sent once)
 #   - roster tops up to LIFESTEAL_TARGET_BOTS=20 via /new-gen, never removes
 #   - banned bots count as missing: replaced with fresh /new-gen names so the
@@ -24,6 +28,16 @@
 #
 # Commands:
 #   /lifesteal-start | /lifesteal-stop | /lifesteal-status
+#
+# Standalone routines — each role on its own, no roster top-up, no /new-gen,
+# no Tor restart (they just run on the bots that are already online):
+#   /tpa-roundrobin [count|all] [stop]   the /tpa round-robin spam
+#   /duelsroomspam [count|all] [stop]    the duels-room spam (re-sends every
+#                                        LIFESTEAL_SOLO_REPEAT_MS, default 15s)
+#   /queuespam [count|all] [stop]        the /queue spam (same cadence)
+#   /warp-arena [count|all] [stop]       the warp → walk-until-hit loop
+#   /afk-park [count|all] [stop]         park bots at the AFK warp (once)
+# [count] limits the routine to that many bots (default: every online bot).
 #
 # Manual fallback (if you insist on plain scripts):
 #   * /warp afk

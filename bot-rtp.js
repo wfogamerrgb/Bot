@@ -17,7 +17,7 @@ const LOGIN_PASSWORD   = process.env.LOGIN_PASSWORD   || '123456'
 // Custom env variable for RTP bot names, with fallback defaults
 const DEFAULT_BOTS     = 'S3gF4ult_0x00, Hypr_P4ck3t_X, Nul1_P01nt3r, H3adl3ss_T1ck, F1shyShellArch'
 const BOT_NAMES        = (process.env.BOT_RTP_BOTS || DEFAULT_BOTS).split(',').map(n => n.trim()).filter(Boolean)
-const CONNECT_DELAY_MS = parseInt(process.env.CONNECT_DELAY_MS || '39500', 10)
+const CONNECT_DELAY_MS = parseInt(process.env.CONNECT_DELAY_MS || '22571', 10)
 const GUI_SLOT         = parseInt(process.env.GUI_SLOT         || '11', 10)
 
 // ── Outbound proxy config ──────────────────────────────────────────────────────
