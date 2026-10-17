@@ -151,8 +151,69 @@ test('onBan drops the role, orders one replacement, and refills immediately', ()
   h.q.stop()
 })
 
-test('lifestealTorRestartCmd defaults to brew services restart tor', () => {
-  assert.equal(LQ.lifestealTorRestartCmd({}), 'brew services restart tor')
+test('lifestealTorRestartCmd defaults to restart-tor.sh --tor-only (brew has no ControlPort 9051)', () => {
+  const expected = 'sudo -n bash ./scripts/restart-tor.sh --tor-only'
+  assert.equal(LQ.lifestealTorRestartCmd({}), expected)
   assert.equal(LQ.lifestealTorRestartCmd({ LIFESTEAL_TOR_RESTART_CMD: 'systemctl restart tor' }), 'systemctl restart tor')
-  assert.equal(LQ.lifestealTorRestartCmd({ LIFESTEAL_TOR_RESTART_CMD: '  ' }), 'brew services restart tor')
+  assert.equal(LQ.lifestealTorRestartCmd({ LIFESTEAL_TOR_RESTART_CMD: '  ' }), expected)
+  // Homebrew's Tor is explicitly NOT the fleet: no control port -> ECONNREFUSED.
+  assert.notEqual(LQ.lifestealTorRestartCmd({}), 'brew services restart tor')
+})
+
+// Chat-based ban/deathban detection is spoofable: any player can type the exact
+// server wording. Two gates defend against that — name-shaped lines are never
+// believed, and plain-looking lines are only believed inside a trust window
+// (first minutes of a session, or right after a real death/kick).
+test('looksLikePlayerChat flags every chat shape players can type', () => {
+  assert.equal(LQ.looksLikePlayerChat('Steve: You are deathbanned for 24 hours!'), true)
+  assert.equal(LQ.looksLikePlayerChat('<Steve> You are deathbanned for 24 hours!'), true)
+  assert.equal(LQ.looksLikePlayerChat('[MVP+] Steve: Kicked: {"color":"red"}'), true)
+  assert.equal(LQ.looksLikePlayerChat('[VIP] <Steve> Kicked: {"color":"red","text":"x"}'), true)
+  assert.equal(LQ.looksLikePlayerChat('Steve » Kicked: whatever'), true)
+  // real server notices carry no sender prefix
+  assert.equal(LQ.looksLikePlayerChat('You are deathbanned for 24 hours! You can join but not /server lifesteal'), false)
+  // even a bare "Kicked: {…}" line is name-shaped ("Kicked" reads as a sender)
+  // and must never be believed from chat — real kicks arrive as kick packets,
+  // which onKick always trusts.
+  assert.equal(LQ.looksLikePlayerChat('Kicked: {"color":"red","text":"You are not logged into your Minecraft account."}'), true)
+})
+
+test('typed chat cannot fake a deathban, and plain text is only believed in the trust window', () => {
+  const h = makeHarness(['A', 'B', 'C', 'D', 'E'])
+  h.q.start()
+  const first = h.q.status().roles.tpa
+  assert.ok(first)
+  // Player-shaped chat is never believed, even moments after start (the widest
+  // trust window) — this is the spoof the filter exists for.
+  h.q.onMessage(first, 'MVPSteve: You are deathbanned for 24 hours! You can join but not /server lifesteal')
+  assert.equal(h.q.isDeathbanned(first), false, 'typed chat must never deathban')
+  h.q.onMessage(first, '<MVPSteve> You are deathbanned for 24 hours! You can join but not /server lifesteal')
+  assert.equal(h.q.isDeathbanned(first), false, 'angle-bracket chat must never deathban')
+  // Plain-looking text is believed right after start (trust window open).
+  h.q.onMessage(first, 'You are deathbanned for 24 hours! You can join but not /server lifesteal')
+  assert.equal(h.q.isDeathbanned(first), true, 'genuine notice inside the trust window is believed')
+  // A different bot far past its trust window with no real event: the same
+  // plain text is ignored — after the window only real death/kick packets
+  // reopen belief.
+  const second = h.q.status().roles.queue
+  assert.ok(second)
+  h.advance(h.env.LIFESTEAL_TRUST_WINDOW_MS ? Number(h.env.LIFESTEAL_TRUST_WINDOW_MS) + 1000 : 11 * 60 * 1000)
+  h.q.onMessage(second, 'You are deathbanned for 24 hours! You can join but not /server lifesteal')
+  assert.equal(h.q.isDeathbanned(second), false, 'stale plain text outside the trust window is ignored')
+  // A real death reopens the window: the deathban notice that follows counts.
+  h.q.onDeath(second)
+  h.q.onMessage(second, 'You are deathbanned for 24 hours! You can join but not /server lifesteal')
+  assert.equal(h.q.isDeathbanned(second), true, 'notice right after a real death is believed')
+  h.q.stop()
+})
+
+test('a real kick packet always counts, with no trust window', () => {
+  const h = makeHarness(['A', 'B', 'C', 'D', 'E'])
+  h.q.start()
+  const first = h.q.status().roles.duels
+  assert.ok(first)
+  h.advance(60 * 60 * 1000) // an hour in — far past any window
+  h.q.onKick(first, 'You are deathbanned for 24 hours! You can join but not /server lifesteal')
+  assert.equal(h.q.isDeathbanned(first), true, 'kick packets are unspoofable and always believed')
+  h.q.stop()
 })
