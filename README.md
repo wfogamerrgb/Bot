@@ -111,7 +111,8 @@ starts automatically. Do not run the standalone `bot-rtp.js` for the same accoun
   is everything advertised to that account, not an administrative command list.
 - **`/new-gen [count] [group=auto|direct|N]`** generates 1–100 unique Minecraft
   usernames (default 1), atomically saves `BOT_NAMES` and proxy `_BOTS` lists in
-  `.env`, then connects staggered. `auto` balances valid existing proxy groups;
+  `.env`, then connects with the default startup connect delay (`CONNECT_DELAY_MS`,
+  the same pacing as bots normally connect with). `auto` balances valid existing proxy groups;
   without groups it uses the default route. `direct` explicitly bypasses a global
   proxy; `N` selects an existing valid group. Unrelated secrets/comments remain
   unchanged, `.env` is saved owner-only, and save failures create no connections.
@@ -911,7 +912,7 @@ check logs before retrying to avoid accidentally executing a command twice.
 | `AUTH_ALREADY_MS` | `60000` | Pause after "already logged in"/"already registered" |
 | `AUTH_MAX_THROTTLED_RETRIES` | `2` | Throttled replies tolerated before it is treated as a wrong password |
 | `BOT_NAMES` | required | Comma-separated bot usernames |
-| `CONNECT_DELAY_MS` | `39500` | Delay between initial bot connections |
+| `CONNECT_DELAY_MS` | `22571` | Delay between bot connects (startup, `/new-gen`, lifesteal top-up); 1.75x faster than the old 39.5s default |
 | `CONNECT_DELAY_RANDOM_MS` | `0` | Additional random delay range |
 | `MAX_RECONNECT` | `17` | Maximum normal reconnect attempts |
 | `SERVER_COMMAND` | empty | Command sent after spawn instead of compass navigation |

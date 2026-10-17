@@ -14,6 +14,7 @@ function makeHarness (names, opts) {
   let t = 1000000
   const env = { LIFESTEAL_TARGET_BOTS: '20', ...(opts.env || {}) }
   const banned = new Set(opts.banned || [])
+  let generated = 0
   const q = LQ.createLifestealQueue({
     getBots: () => bots,
     isOnline: (e) => !!e?.bot?.entity,
@@ -22,12 +23,20 @@ function makeHarness (names, opts) {
     now: () => t,
     getEnv: () => env,
     isBanned: (id) => banned.has(id),
-    ensureRoster: (missing) => { harness.rosterAsked.push(missing); return { ok: true } },
+    ensureRoster: (missing) => {
+      harness.rosterAsked.push(missing)
+      // Mirror the real hook: names are saved to BOT_NAMES immediately, long
+      // before their staggered connects land in the bots map.
+      const names = []
+      for (let i = 0; i < missing; i++) names.push(`Gen${++generated}`)
+      env.BOT_NAMES = [env.BOT_NAMES, ...names].filter(Boolean).join(',')
+      return { ok: true, names }
+    },
     rand: (n) => 0, // deterministic: always first of pool
     setTimer: () => ({}),
     clearTimer: () => {},
   })
-  const harness = { q, bots, sent, rosterAsked: [], advance (ms) { t += ms }, env, setOnline (id, on) { if (!on) bots[id].bot.entity = null; else if (!bots[id].bot.entity) bots[id].bot.entity = { position: { x: 0, y: 64, z: 0 }, yaw: 0 } } }
+  const harness = { q, bots, banned, sent, rosterAsked: [], advance (ms) { t += ms }, env, setOnline (id, on) { if (!on) bots[id].bot.entity = null; else if (!bots[id].bot.entity) bots[id].bot.entity = { position: { x: 0, y: 64, z: 0 }, yaw: 0 } } }
   return harness
 }
 
@@ -134,6 +143,30 @@ test('banned bots are excluded from roles and replaced via /new-gen', () => {
   h.q.tick()
   // 6 total - 2 banned = 4 effective < 20 target -> top-up asked
   assert.ok(h.rosterAsked.length >= 1, 'banned bots should count as missing')
+  h.q.stop()
+})
+
+test('saved-but-unconnected names count toward the target — a pending wave is never duplicated', () => {
+  const h = makeHarness(['A', 'B'], { env: { LIFESTEAL_TARGET_BOTS: '5', LIFESTEAL_ROSTER_TICK_MS: '0' } })
+  h.q.start()
+  h.q.tick()
+  h.advance(70000)
+  h.q.tick()
+  h.advance(70000)
+  h.q.tick()
+  assert.deepEqual(h.rosterAsked, [3], 'later roster ticks must see names already saved to BOT_NAMES')
+  h.q.stop()
+})
+
+test('a ban orders exactly one replacement even when the roster tick is due', () => {
+  const h = makeHarness(['A', 'B', 'C', 'D', 'E'], { env: { LIFESTEAL_TARGET_BOTS: '5', LIFESTEAL_ROSTER_TICK_MS: '0' } })
+  h.q.start()
+  h.banned.add('A')
+  h.q.onBan('A', 'banned: test wave')
+  h.q.tick()
+  h.advance(70000)
+  h.q.tick()
+  assert.deepEqual(h.rosterAsked, [1], 'the fresh name from onBan satisfies the roster — exactly one /new-gen order')
   h.q.stop()
 })
 

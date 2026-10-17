@@ -13,10 +13,13 @@
 //   idle   — every other bot stays `/warp afk` (sent once, not spammed).
 // Roster  — every ROSTER_TICK_MS the manager tops the fleet back up to
 //            TARGET_BOTS (default 20) via /new-gen semantics
-//            (persistGeneratedBots + staggered connects). It NEVER removes
-//            bots. Server-banned bots count as missing, so a ban wave is
-//            replaced with fresh /new-gen names and the loop continues like
-//            nothing happened.
+//            (persistGeneratedBots + default-paced connects). It NEVER removes
+//            bots. The count includes names already saved in BOT_NAMES that
+//            are still connecting, so a pending wave is never generated twice
+//            (that runaway is what created and connected far more bots than
+//            the target). Server-banned bots count as missing, so a ban wave
+//            is replaced with fresh /new-gen names — exactly one per ban — and
+//            the loop continues like nothing happened.
 // Tor     — /lifesteal-start restarts Tor FIRST via scripts/restart-tor.sh
 //            --tor-only (LIFESTEAL_TOR_RESTART_CMD override). This is the
 //            ONLY thing that brings up the per-instance Tor fleet this repo
@@ -228,6 +231,20 @@ function createLifestealQueue (deps) {
 
   function allIds () {
     return Object.keys(getBots() || {})
+  }
+
+  // Every configured account: the live roster plus the names already saved in
+  // BOT_NAMES. /new-gen writes names to .env BEFORE their staggered connects
+  // fire, so counting only the live map made every roster tick re-generate the
+  // still-pending wave — creating and connecting far more bots than the target.
+  function configuredIds () {
+    const ids = new Set(allIds())
+    const env = getEnv() || {}
+    for (const raw of String(env.BOT_NAMES || '').split(',')) {
+      const name = raw.trim()
+      if (name) ids.add(name)
+    }
+    return [...ids]
   }
 
   function isDeathbanned (id) {
@@ -571,11 +588,19 @@ function createLifestealQueue (deps) {
     if (t - state.lastRosterCheck < state.cfg.rosterTickMs) return
     state.lastRosterCheck = t
     state.cfg = readConfig(getEnv())
-    // Banned bots are dead weight for lifesteal: count them as missing so the
-    // fleet is topped back up to a full set of usable bots.
-    const total = allIds().length
-    const banned = bannedIds().length
-    const effective = total - banned
+    // Count CONFIGURED accounts (live bots plus names already saved in
+    // BOT_NAMES), not just connected ones — a generated name is saved before
+    // its connect fires, and counting only the live map re-generated the whole
+    // pending wave on every tick ("creates and connect bots TOO MUCH").
+    // Banned bots still count as missing so a ban is replaced, but the fresh
+    // name lands in BOT_NAMES immediately, so onBan's order plus this check
+    // can never produce two replacements for one ban.
+    const roster = configuredIds()
+    let banned = 0
+    for (const id of roster) {
+      try { if (isBanned(id)) banned++ } catch (_) {}
+    }
+    const effective = roster.length - banned
     const missing = state.cfg.targetBots - effective
     if (missing > 0) {
       requestTopUp(missing, `${effective}/${state.cfg.targetBots} usable (${banned} banned)`)

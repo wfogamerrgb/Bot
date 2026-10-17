@@ -189,7 +189,9 @@ function planAuthAction(id, message, now = Date.now()) {
 }
 
 const BOT_NAMES = (process.env.BOT_NAMES || '').split(',').map(n => n.trim()).filter(Boolean)
-const CONNECT_DELAY_MS = readDelayMs(process.env.CONNECT_DELAY_MS, 39500)
+// Default is 1.75x faster than the old 39.5s (39500 / 1.75 ~= 22571): the
+// startup sequence, /new-gen and lifesteal top-up connects all pace on this.
+const CONNECT_DELAY_MS = readDelayMs(process.env.CONNECT_DELAY_MS, 22571)
 const CONNECT_DELAY_RANDOM_MS = readDelayMs(process.env.CONNECT_DELAY_RANDOM_MS, 0)
 const ALL_SLOW_DELAY_MS = readDelayMs(process.env.ALL_SLOW_DELAY_MS, 15000)
 const RANDOMIZE_BOT_ORDER = !/^(0|false|no|off)$/i.test((process.env.RANDOMIZE_BOT_ORDER || '').trim())
@@ -1126,7 +1128,7 @@ cfDefine('HOST', { type: 'string', def: 'play.fatalmc.org', group: 'Server', des
 cfDefine('PORT', { type: 'int', def: 25565, min: 1, max: 65535, group: 'Server', desc: 'Port used for future new connections; live sockets unchanged' })
 cfDefine('VERSION', { type: 'string', def: '1.21.2', group: 'Server', desc: 'Version used for future new connections; live sockets unchanged' })
 cfDefine('BOT_NAMES', { type: 'list', group: 'Server', live: false, desc: 'The roster (startup-only — edit the file and restart to change it)' })
-cfDefine('CONNECT_DELAY_MS', { type: 'ms', def: 39500, min: 0, group: 'Timing', live: false, desc: 'Gap between initial bot connects (startup-only)' })
+cfDefine('CONNECT_DELAY_MS', { type: 'ms', def: 22571, min: 0, group: 'Timing', live: false, desc: 'Gap between bot connects (startup, /new-gen, lifesteal top-up)' })
 // Routine defaults refresh on file changes and temporary overrides. Only
 // roster/listener wiring remains restart-only; per-run flags still take priority.
 cfDefine('CRATES_ALL_DUMP', { type: 'string', def: 'tpa', group: 'Crates', desc: 'Live default dump step for /crates-all (off|tpa|home|hidden|player:<name>)' })
@@ -1262,8 +1264,14 @@ const lifestealQueue = require(path.join(__dirname, 'lifesteal-queue')).createLi
       const result = persistGeneratedBots({ file: path.join(__dirname, '.env'), env: process.env, existing: Object.keys(bots), blocked: (removedBots.bots || []).map(row => row.bot), count: Number(missing) || 1, group: 'auto', io: fs })
       refreshRuntimeConfig()
       logFor(SYSTEM_ID, `{green-fg}✓ [lifesteal] Saved ${result.names.length} generated account(s) to .env before connecting.{/green-fg}`)
-      result.assignments.forEach(({ name }, index) => {
-        setTimeout(() => { if (!Object.hasOwn(bots, name) && !connectBlockReason(name)) createBotInstance(name) }, index * readDelayMs(process.env.ROBOT_CONNECT_DELAY_MS, 5000))
+      // Generated connects use the default connect delay — the same pacing as
+      // a normal startup connect ("just the default one") — not the
+      // robot-admission ROBOT_CONNECT_DELAY_MS burst.
+      let connectAt = 0
+      result.assignments.forEach(({ name }) => {
+        const at = connectAt
+        connectAt += CONNECT_DELAY_MS + Math.floor(Math.random() * (CONNECT_DELAY_RANDOM_MS + 1))
+        setTimeout(() => { if (!Object.hasOwn(bots, name) && !connectBlockReason(name)) createBotInstance(name) }, at)
       })
       return { ok: true, names: result.names }
     } catch (err) { return { ok: false, error: err && err.message ? err.message : String(err) } }
@@ -4458,8 +4466,8 @@ const COMMANDS = {
 '/reconnect-all': 'Reconnect every currently disconnected bot',
 '/reconnect-all-slow': 'Reconnect ALL bots (online or offline) with a 30s delay between each to avoid rate limits',
 '/new-bot <n> [host] [port] [ver]': 'Create and connect a new bot',
-'/new-gen [count] [group=auto|direct|N]': 'Generate unique Minecraft names, atomically save to .env and balanced proxy groups, then connect staggered (1–100).',
-'/lifesteal-start': 'Restarts Tor first (scripts/restart-tor.sh --tor-only, LIFESTEAL_TOR_RESTART_CMD override — brew services restart tor is NOT this repo\'s Tor and has no control port 9051), then requests NEWNYM on every local control port so reconnecting bots get fresh circuits, then: random bot /duelsroomqueue + random bot /queue (replaced on death, same bot allowed), one non-queue bot loops /warp arena → 5s → forward-until-hit, one bot spams /tpa until deathban (24h park), rest /warp afk. Banned bots are replaced via /new-gen so the loop continues; roster tops up to LIFESTEAL_TARGET_BOTS=20 (never removes)',
+'/new-gen [count] [group=auto|direct|N]': 'Generate unique Minecraft names, atomically save to .env and balanced proxy groups, then connect with the default startup connect delay (1–100).',
+'/lifesteal-start': 'Restarts Tor first (scripts/restart-tor.sh --tor-only, LIFESTEAL_TOR_RESTART_CMD override — brew services restart tor is NOT this repo\'s Tor and has no control port 9051), then requests NEWNYM on every local control port so reconnecting bots get fresh circuits, then: random bot /duelsroomqueue + random bot /queue (replaced on death, same bot allowed), one non-queue bot loops /warp arena → 5s → forward-until-hit, one bot spams /tpa until deathban (24h park), rest /warp afk. Banned bots are replaced via /new-gen so the loop continues; roster tops up to LIFESTEAL_TARGET_BOTS=20 (never removes; counts saved names so a pending connect wave is never duplicated)',
 '/lifesteal-stop': 'Stop lifesteal automation and release held forward keys',
 '/lifesteal-status': 'Show lifesteal roles (duels/queue/arena/tpa), online/total counts and deathbanned bots',
 '/server-commands [filter] [--refresh]': 'List commands advertised by the Minecraft server to the selected account; refresh uses tab completion, never executes commands.',
@@ -8089,9 +8097,15 @@ try {
 const result = persistGeneratedBots({ file: path.join(__dirname, '.env'), env: process.env, existing: Object.keys(bots), blocked: (removedBots.bots || []).map(row => row.bot), count: Number(match[1] || 1), group: (match[2] || 'auto').toLowerCase(), io: fs })
 refreshRuntimeConfig()
 logSuccess(`Saved ${result.names.length} generated account(s) to .env before connecting.`)
-result.assignments.forEach(({ name, group }, index) => {
-logInfo(`${name}: ${group == null ? 'default/direct route' : `proxy group ${group}`}`)
-setTimeout(() => { if (!Object.hasOwn(bots, name) && !connectBlockReason(name)) createBotInstance(name) }, index * readDelayMs(process.env.ROBOT_CONNECT_DELAY_MS, 5000))
+// "Just the default one": generated connects use the default connect delay —
+// the same pacing as bots normally connect with at startup — not the
+// robot-admission ROBOT_CONNECT_DELAY_MS burst.
+let connectAt = 0
+result.assignments.forEach(({ name, group }) => {
+const at = connectAt
+connectAt += CONNECT_DELAY_MS + Math.floor(Math.random() * (CONNECT_DELAY_RANDOM_MS + 1))
+logInfo(`${name}: ${group == null ? 'default/direct route' : `proxy group ${group}`} — connecting in ${(at / 1000).toFixed(1)}s`)
+setTimeout(() => { if (!Object.hasOwn(bots, name) && !connectBlockReason(name)) createBotInstance(name) }, at)
 })
 return result
 } catch (err) { logError(`No accounts connected: generation/save failed (${sanitize(err.code || err.message)}).`); return }
