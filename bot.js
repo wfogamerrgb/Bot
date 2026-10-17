@@ -1127,6 +1127,15 @@ cfDefine('LOGIN_PASSWORD', { type: 'string', def: '123456', group: 'Auth', desc:
 cfDefine('HOST', { type: 'string', def: 'play.fatalmc.org', group: 'Server', desc: 'Host used for future new connections; live sockets unchanged' })
 cfDefine('PORT', { type: 'int', def: 25565, min: 1, max: 65535, group: 'Server', desc: 'Port used for future new connections; live sockets unchanged' })
 cfDefine('VERSION', { type: 'string', def: '1.21.2', group: 'Server', desc: 'Version used for future new connections; live sockets unchanged' })
+// Lifesteal role sizing. All live: lifesteal-queue.js re-reads the env on every
+// tick, so changing one here reshapes the running loop — lowering a count
+// releases the extra bots back to /warp afk, raising one fills from the pool.
+cfDefine('LIFESTEAL_TARGET_BOTS', { type: 'int', def: 20, min: 1, group: 'Lifesteal', desc: 'Fleet size /lifesteal-start tops up to via /new-gen; bots are never removed (live)' })
+cfDefine('LIFESTEAL_DUELS_BOTS', { type: 'int', def: 1, min: 0, group: 'Lifesteal', desc: 'How many bots hold the duels-room role (live; 0 disables the role)' })
+cfDefine('LIFESTEAL_QUEUE_BOTS', { type: 'int', def: 1, min: 0, group: 'Lifesteal', desc: 'How many bots hold the /queue role (live; 0 disables the role)' })
+cfDefine('LIFESTEAL_ARENA_BOTS', { type: 'int', def: 1, min: 0, group: 'Lifesteal', desc: 'How many bots loop /warp arena → walk-until-hit (live; 0 disables the role)' })
+cfDefine('LIFESTEAL_TPA_BOTS', { type: 'int', def: 1, min: 0, group: 'Lifesteal', desc: 'How many bots spam /tpa round-robin — raise this for more /tpa bots (live; 0 disables the role)' })
+cfDefine('LIFESTEAL_SOLO_REPEAT_MS', { type: 'ms', def: 15000, min: 1000, group: 'Lifesteal', desc: 'Re-send cadence for standalone /duelsroomspam and /queuespam (live)' })
 cfDefine('BOT_NAMES', { type: 'list', group: 'Server', live: false, desc: 'The roster (startup-only — edit the file and restart to change it)' })
 cfDefine('CONNECT_DELAY_MS', { type: 'ms', def: 22571, min: 0, group: 'Timing', live: false, desc: 'Gap between bot connects (startup, /new-gen, lifesteal top-up)' })
 // Routine defaults refresh on file changes and temporary overrides. Only
@@ -1238,16 +1247,21 @@ const spawnerDrop = require(path.join(__dirname, 'spawner-drop')).createSpawnerD
   defaults: () => ({ durationMs: settings.get('SPAWNER_DROP_DURATION_MS'), cooldownMs: settings.get('SPAWNER_DROP_COOLDOWN_MS'), mode: settings.get('SPAWNER_DROP_MODE'), scope: settings.get('SPAWNER_DROP_SCOPE'), terms: [settings.get('SPAWNER_DROP_MATCH')] })
 })
 
-const LOCAL_COMMANDS = ['/server-commands', '/start-rtp', '/stop-rtp', '/evidence', '/connection', '/spawner-drop', '/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dump-spawners', '/dc', '/reconnect', '/crates', '/crates-loop', '/spawners', '/data', '/shardshop-loop', '/closeBot', '/bot-coinflip', '/bot-coinflip-all', '/ai-chat', '/repeat', '/use-book', '/enchanted-golden-apple-extract', '/ege', '/scripts', '/run-script', '/lifesteal-start', '/lifesteal-stop', '/lifesteal-status']
+const LOCAL_COMMANDS = ['/server-commands', '/start-rtp', '/stop-rtp', '/evidence', '/connection', '/spawner-drop', '/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dump-spawners', '/dc', '/reconnect', '/crates', '/crates-loop', '/spawners', '/data', '/shardshop-loop', '/closeBot', '/bot-coinflip', '/bot-coinflip-all', '/ai-chat', '/repeat', '/use-book', '/enchanted-golden-apple-extract', '/ege', '/scripts', '/run-script', '/lifesteal-start', '/lifesteal-stop', '/lifesteal-status', '/tpa-roundrobin', '/duelsroomspam', '/queuespam', '/warp-arena', '/afk-park']
 
 // ── Lifesteal queue / arena / TPA automation (lifesteal-queue.js) ──────────
-// One random bot holds /duelsroomqueue, one holds /queue (replaced on death,
-// same bot allowed again), one non-queue bot loops /warp arena → wait 5s →
-// hold forward until collision, one bot spams /tpa round-robin until
-// deathban (parked 24h, can still join server just not /server lifesteal),
-// everyone else stays /warp afk. Roster tops up to LIFESTEAL_TARGET_BOTS
+// How many bots hold each role is configuration (live via the .ENV tab):
+// LIFESTEAL_DUELS_BOTS / LIFESTEAL_QUEUE_BOTS / LIFESTEAL_ARENA_BOTS /
+// LIFESTEAL_TPA_BOTS, default 1 each, 0 disables the role. Role holders are
+// always distinct bots; anyone left over stays /warp afk. Replaced on death,
+// same bot allowed again; deathbanned bots are parked 24h (can still join
+// server just not /server lifesteal). Roster tops up to LIFESTEAL_TARGET_BOTS
 // (default 20) via /new-gen semantics and never removes bots. Server-banned
 // bots count as missing so they are replaced with fresh names.
+// The roles are also available STANDALONE — /tpa-roundrobin, /duelsroomspam,
+// /queuespam, /warp-arena, /afk-park [count|all] [stop] — each runs just its
+// own routine on [count] online bots (default all), with no roster top-up,
+// no /new-gen and no Tor restart.
 const lifestealQueue = require(path.join(__dirname, 'lifesteal-queue')).createLifestealQueue({
   getBots: () => bots,
   isOnline: (entry) => botOnline(entry),
@@ -1277,6 +1291,31 @@ const lifestealQueue = require(path.join(__dirname, 'lifesteal-queue')).createLi
     } catch (err) { return { ok: false, error: err && err.message ? err.message : String(err) } }
   },
 })
+
+// Standalone lifesteal routines (/tpa-roundrobin, /duelsroomspam, /queuespam,
+// /warp-arena, /afk-park): run ONE role on the bots already online — no roster
+// top-up, no /new-gen, no Tor restart. `[count|all]` limits the routine to
+// that many bots (default: every online bot); `stop` ends it.
+function lifestealSoloCommand (id, role, parts, name) {
+  const arg = String(parts[1] || '').toLowerCase()
+  if (arg === 'stop' || arg === 'off') {
+    const r = lifestealQueue.stopSolo()
+    logFor(id, r.ok ? '{green-fg}✓ Standalone routine stopped.{/green-fg}' : `{yellow-fg}⚠ ${sanitize(r.error || 'no standalone routine running')}{/yellow-fg}`)
+    return true
+  }
+  let count = 0
+  if (arg && arg !== 'all') {
+    count = Number.parseInt(arg, 10)
+    if (!Number.isFinite(count) || count < 1) {
+      logFor(id, `{yellow-fg}⚠ Usage: ${name} [count|all] [stop]{/yellow-fg}`)
+      return true
+    }
+  }
+  const r = lifestealQueue.startSolo(role, count)
+  if (!r.ok) { logFor(id, `{yellow-fg}⚠ ${sanitize(r.error || 'could not start')}{/yellow-fg}`); return true }
+  logFor(id, `{green-fg}✓ Standalone ${sanitize(role)} routine started on ${count > 0 ? `${count} bot(s)` : 'all online bots'} — stop with ${name} stop.{/green-fg}`)
+  return true
+}
 
 const logSubscribers = new Set()
 function subscribeLog(fn) { logSubscribers.add(fn); return () => logSubscribers.delete(fn) }
@@ -4467,9 +4506,14 @@ const COMMANDS = {
 '/reconnect-all-slow': 'Reconnect ALL bots (online or offline) with a 30s delay between each to avoid rate limits',
 '/new-bot <n> [host] [port] [ver]': 'Create and connect a new bot',
 '/new-gen [count] [group=auto|direct|N]': 'Generate unique Minecraft names, atomically save to .env and balanced proxy groups, then connect with the default startup connect delay (1–100).',
-'/lifesteal-start': 'Restarts Tor first (scripts/restart-tor.sh --tor-only, LIFESTEAL_TOR_RESTART_CMD override — brew services restart tor is NOT this repo\'s Tor and has no control port 9051), then requests NEWNYM on every local control port so reconnecting bots get fresh circuits, then: random bot /duelsroomqueue + random bot /queue (replaced on death, same bot allowed), one non-queue bot loops /warp arena → 5s → forward-until-hit, one bot spams /tpa until deathban (24h park), rest /warp afk. Banned bots are replaced via /new-gen so the loop continues; roster tops up to LIFESTEAL_TARGET_BOTS=20 (never removes; counts saved names so a pending connect wave is never duplicated)',
+'/lifesteal-start': 'Restarts Tor first (scripts/restart-tor.sh --tor-only, LIFESTEAL_TOR_RESTART_CMD override — brew services restart tor is NOT this repo\'s Tor and has no control port 9051), then requests NEWNYM on every local control port so reconnecting bots get fresh circuits, then: random bot /duelsroomqueue + random bot /queue (replaced on death, same bot allowed), one non-queue bot loops /warp arena → 5s → forward-until-hit, one bot spams /tpa until deathban (24h park), rest /warp afk (role sizes are configurable: LIFESTEAL_DUELS_BOTS / LIFESTEAL_QUEUE_BOTS / LIFESTEAL_ARENA_BOTS / LIFESTEAL_TPA_BOTS, default 1 each, 0 disables). Banned bots are replaced via /new-gen so the loop continues; roster tops up to LIFESTEAL_TARGET_BOTS=20 (never removes; counts saved names so a pending connect wave is never duplicated)',
 '/lifesteal-stop': 'Stop lifesteal automation and release held forward keys',
-'/lifesteal-status': 'Show lifesteal roles (duels/queue/arena/tpa), online/total counts and deathbanned bots',
+'/lifesteal-status': 'Show lifesteal roles (duels/queue/arena/tpa holders), role counts, online/total counts and deathbanned bots',
+'/tpa-roundrobin [count|all] [stop]': 'Standalone: spam /tpa <player> round-robin on [count] online bots (default all) — just the tpa routine, no roster top-up, no /new-gen, no Tor restart. LIFESTEAL_TPA_INTERVAL_MS paces it; "stop" ends it',
+'/duelsroomspam [count|all] [stop]': 'Standalone: spam the duels-room command (LIFESTEAL_DUELSROOM_CMD) on [count] online bots (default all), re-sending every LIFESTEAL_SOLO_REPEAT_MS. "stop" ends it',
+'/queuespam [count|all] [stop]': 'Standalone: spam /queue on [count] online bots (default all), re-sending every LIFESTEAL_SOLO_REPEAT_MS. "stop" ends it',
+'/warp-arena [count|all] [stop]': 'Standalone: loop /warp arena → wait 5s → hold forward until collision on [count] online bots (default all). "stop" ends it',
+'/afk-park [count|all] [stop]': 'Standalone: park [count] online bots (default all) at the AFK warp — sent once per bot, never spammed. "stop" ends it',
 '/server-commands [filter] [--refresh]': 'List commands advertised by the Minecraft server to the selected account; refresh uses tab completion, never executes commands.',
 '/switch <id>': 'Switch view to a different bot by name or number',
 '/uptime': 'Show uptime for all bots',
@@ -5010,10 +5054,18 @@ case '/lifesteal-start': {
 case '/lifesteal-stop': { const r = lifestealQueue.stop(); logFor(id, r.ok ? '{green-fg}✓ Lifesteal automation stopped.{/green-fg}' : `{yellow-fg}⚠ ${sanitize(r.error || 'not running')}{/yellow-fg}`); return true }
 case '/lifesteal-status': {
   const s = lifestealQueue.status()
-  logFor(id, `{cyan-fg}› Lifesteal ${s.running ? 'RUNNING' : 'stopped'} — online ${s.online}/${s.total} (target ${s.cfg.targetBots}) | duels=${sanitize(s.roles.duels || '-') } queue=${sanitize(s.roles.queue || '-')} arena=${sanitize(s.roles.arena || '-')} tpa=${sanitize(s.roles.tpa || '-')}{/cyan-fg}`)
+  const fmtRole = (role) => (s.roles[role] && s.roles[role].length) ? s.roles[role].join(',') : '-'
+  const mode = s.running ? (s.solo ? `SOLO ${s.solo.role}` : 'RUNNING') : 'stopped'
+  logFor(id, `{cyan-fg}› Lifesteal ${mode} — online ${s.online}/${s.total} (target ${s.cfg.targetBots}) | duels=${sanitize(fmtRole('duels'))} queue=${sanitize(fmtRole('queue'))} arena=${sanitize(fmtRole('arena'))} tpa=${sanitize(fmtRole('tpa'))}{/cyan-fg}`)
+  logFor(id, `{cyan-fg}  role counts (live): duels=${s.cfg.duelsBots} queue=${s.cfg.queueBots} arena=${s.cfg.arenaBots} tpa=${s.cfg.tpaBots} — LIFESTEAL_*_BOTS, 0 disables{/cyan-fg}`)
   if (s.deathbanned.length) logFor(id, `{yellow-fg}⚠ Deathbanned (${s.deathbanned.length}): ${sanitize(s.deathbanned.map(d => d.bot).join(', '))}{/yellow-fg}`)
   return true
 }
+case '/tpa-roundrobin': return lifestealSoloCommand(id, 'tpa', parts, '/tpa-roundrobin')
+case '/duelsroomspam': return lifestealSoloCommand(id, 'duels', parts, '/duelsroomspam')
+case '/queuespam': return lifestealSoloCommand(id, 'queue', parts, '/queuespam')
+case '/warp-arena': return lifestealSoloCommand(id, 'arena', parts, '/warp-arena')
+case '/afk-park': return lifestealSoloCommand(id, 'afk', parts, '/afk-park')
 case '/status': {
 logFor(id, `{cyan-fg}› State: ${botOnline(entry) ? 'online' : dataState.bots[id]?.banned ? 'banned' : entry.connectionState || 'disconnected'}${entry.lastDisconnectReason ? ' — ' + sanitize(entry.lastDisconnectReason) : ''}{/cyan-fg}`)
 logFor(id, ` Connection: ${sanitize(JSON.stringify(connectionDetails(id, entry)))}`)

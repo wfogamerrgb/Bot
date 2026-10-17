@@ -9,6 +9,16 @@
 
 const SECTIONS = [
   {
+    id: 'lifesteal',
+    title: 'Lifesteal automation and standalone routines',
+    summary: 'Configurable role counts for /lifesteal-start, and every role as its own standalone command',
+    entries: [
+      { title: '/lifesteal-start | /lifesteal-stop | /lifesteal-status', desc: 'Restarts Tor first (scripts/restart-tor.sh --tor-only), requests NEWNYM on every local control port, then runs the lifesteal roles: LIFESTEAL_DUELS_BOTS bots send /duelsroomqueue, LIFESTEAL_QUEUE_BOTS send /queue (both replaced on death — same bot allowed again), LIFESTEAL_ARENA_BOTS bots loop /warp arena → 5s → forward-until-hit, LIFESTEAL_TPA_BOTS bots spam /tpa <player> round-robin until deathban (24h park), everyone else stays /warp afk. The roster tops up to LIFESTEAL_TARGET_BOTS via /new-gen and never removes bots; banned bots are replaced with fresh names. /lifesteal-status shows the holders, the counts and the deathbanned.', examples: ['/lifesteal-start', '/lifesteal-status', '/lifesteal-stop'] },
+      { title: 'Role counts — LIFESTEAL_DUELS_BOTS / LIFESTEAL_QUEUE_BOTS / LIFESTEAL_ARENA_BOTS / LIFESTEAL_TPA_BOTS', desc: 'How many bots hold each role. Default 1 each, 0 disables the role. All live: the .ENV tab and /env set reshape a running loop immediately — lowering a count releases the extra bots back to /warp afk, raising one fills from the online pool. Role holders are always distinct bots. LIFESTEAL_SOLO_REPEAT_MS (15000) is the re-send cadence for the standalone duels/queue spams.', examples: ['/env set LIFESTEAL_TPA_BOTS 5', '/env set LIFESTEAL_QUEUE_BOTS 0'] },
+      { title: 'Standalone routines: /tpa-roundrobin, /duelsroomspam, /queuespam, /warp-arena, /afk-park', desc: 'Run one lifesteal role on its own — no roster top-up, no /new-gen, no Tor restart, just the routine on the bots that are already online. [count|all] limits the routine to that many bots (default: every online bot); stop ends it. /tpa-roundrobin spams /tpa <player> round-robin, /duelsroomspam and /queuespam re-send their command every LIFESTEAL_SOLO_REPEAT_MS, /warp-arena loops /warp arena → 5s → forward-until-hit, /afk-park parks bots at the AFK warp once each. A standalone routine and /lifesteal-start are mutually exclusive.', examples: ['/tpa-roundrobin', '/tpa-roundrobin 5', '/duelsroomspam 2', '/warp-arena stop'] }
+    ]
+  },
+  {
     id: 'admission-roaming',
     title: 'Text-file admission and managed roaming',
     summary: 'New accounts without editing the boot roster; roaming without duplicate connections',

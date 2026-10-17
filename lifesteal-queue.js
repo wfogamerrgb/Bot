@@ -11,6 +11,22 @@
 //   tpa    — one bot spams `/tpa <player>` round-robin over every visible
 //            player until deathban, then a fresh random bot takes over.
 //   idle   — every other bot stays `/warp afk` (sent once, not spammed).
+// How many bots hold each role is configuration, not a constant:
+//   LIFESTEAL_DUELS_BOTS / LIFESTEAL_QUEUE_BOTS / LIFESTEAL_ARENA_BOTS /
+//   LIFESTEAL_TPA_BOTS (default 1 each, 0 disables the role). Role holders
+//   are always distinct bots; when the counts outnumber the fleet the later
+//   roles go short rather than sharing a bot. Counts are reread every tick,
+//   so lowering one releases the extra bots back to idle live.
+//
+// Standalone routines (no roster, no /new-gen, no Tor restart — just the
+// routine on the bots that are already online):
+//   /tpa-roundrobin [count]   /duelsroomspam [count]   /queuespam [count]
+//   /warp-arena [count]       /afk-park [count]        …each with `stop`
+// They run ONE role across up to [count] bots (default: every online bot) via
+// startSolo(role, count); duels/queue re-send their command every
+// SOLO_REPEAT_MS because a standalone "spam" is the whole point. A standalone
+// routine and /lifesteal-start are mutually exclusive (both drive the same
+// roles), and a standalone routine never creates or replaces accounts.
 // Roster  — every ROSTER_TICK_MS the manager tops the fleet back up to
 //            TARGET_BOTS (default 20) via /new-gen semantics
 //            (persistGeneratedBots + default-paced connects). It NEVER removes
@@ -44,6 +60,12 @@
 
 const DEFAULTS = {
   targetBots: 20,
+  // Role sizes. 0 disables the role entirely; the numbers are exact — extra
+  // bots (beyond the sum of the counts) stay idle at the AFK warp.
+  duelsBots: 1,
+  queueBots: 1,
+  arenaBots: 1,
+  tpaBots: 1,
   duelsCmd: '/duelsroomqueue',
   queueCmd: '/queue',
   arenaWarp: '/warp arena',
@@ -56,6 +78,9 @@ const DEFAULTS = {
   arenaRepeatDelayMs: 2000,
   tpaIntervalMs: 5000,
   tpaCooldownMs: 1200,
+  // Standalone /duelsroomspam and /queuespam re-send cadence (managed roles
+  // still send once per assignment; a solo "spam" repeats).
+  soloRepeatMs: 15000,
   tickMs: 3000,
   rosterTickMs: 60000,
   deathbanMs: 24 * 60 * 60 * 1000,
@@ -75,6 +100,10 @@ function readConfig (env) {
   }
   return {
     targetBots: num('LIFESTEAL_TARGET_BOTS', DEFAULTS.targetBots, 1),
+    duelsBots: num('LIFESTEAL_DUELS_BOTS', DEFAULTS.duelsBots, 0),
+    queueBots: num('LIFESTEAL_QUEUE_BOTS', DEFAULTS.queueBots, 0),
+    arenaBots: num('LIFESTEAL_ARENA_BOTS', DEFAULTS.arenaBots, 0),
+    tpaBots: num('LIFESTEAL_TPA_BOTS', DEFAULTS.tpaBots, 0),
     duelsCmd: (e.LIFESTEAL_DUELSROOM_CMD || DEFAULTS.duelsCmd).trim() || DEFAULTS.duelsCmd,
     queueCmd: (e.LIFESTEAL_QUEUE_CMD || DEFAULTS.queueCmd).trim() || DEFAULTS.queueCmd,
     arenaWarp: (e.LIFESTEAL_ARENA_WARP || DEFAULTS.arenaWarp).trim() || DEFAULTS.arenaWarp,
@@ -87,6 +116,7 @@ function readConfig (env) {
     arenaRepeatDelayMs: num('LIFESTEAL_ARENA_REPEAT_MS', DEFAULTS.arenaRepeatDelayMs, 0),
     tpaIntervalMs: num('LIFESTEAL_TPA_INTERVAL_MS', DEFAULTS.tpaIntervalMs, 1000),
     tpaCooldownMs: num('LIFESTEAL_TPA_COOLDOWN_MS', DEFAULTS.tpaCooldownMs, 0),
+    soloRepeatMs: num('LIFESTEAL_SOLO_REPEAT_MS', DEFAULTS.soloRepeatMs, 1000),
     tickMs: num('LIFESTEAL_TICK_MS', DEFAULTS.tickMs, 1000),
     rosterTickMs: num('LIFESTEAL_ROSTER_TICK_MS', DEFAULTS.rosterTickMs, 15000),
     deathbanMs: num('LIFESTEAL_DEATHBAN_MS', DEFAULTS.deathbanMs, 60000),
@@ -189,6 +219,10 @@ function createLifestealQueue (deps) {
   const now = deps.now || (() => Date.now())
   const setTimer = deps.setTimer || setTimeout
   const clearTimer = deps.clearTimer || clearTimeout
+  // The steady tick / fast arena poll pulses. Tests stub these (they drive
+  // tick() manually with a fake clock) so no real-time interval interferes.
+  const setPulse = deps.setPulse || setInterval
+  const clearPulse = deps.clearPulse || clearInterval
   // ensureRoster(missing) -> called when fleet is below target; bot.js wires
   // this to persistGeneratedBots + staggered createBotInstance. Never removes.
   const ensureRoster = deps.ensureRoster || (() => ({ ok: false, error: 'no roster hook' }))
@@ -201,17 +235,23 @@ function createLifestealQueue (deps) {
   const state = {
     running: false,
     cfg: readConfig(getEnv()),
-    roles: { duels: null, queue: null, arena: null, tpa: null },
+    // Role holders are ARRAYS: LIFESTEAL_*_BOTS decides how many bots run each
+    // role (default 1 each, matching the old single-holder behavior).
+    roles: { duels: [], queue: [], arena: [], tpa: [] },
     deathbanned: new Map(), // id -> expiryMs
     activeSince: new Map(), // id -> when first seen online (chat trust window)
     lastRealEventAt: new Map(), // id -> last real death/kick (reopens trust window)
     afkSent: new Set(), // bots already parked at /warp afk (avoid chat spam)
     lastSent: new Map(), // `${id}:${cmd}` -> timestamp (resend cooldown)
-    arena: { phase: 'idle', waitUntil: 0, forwardSince: 0, lastPos: null, stuckSince: 0, timeoutAt: 0 },
-    tpa: { index: 0, nextAt: 0, lastTarget: null },
+    arenaRun: new Map(), // id -> per-bot walk state (phase/waitUntil/…)
+    tpaRun: new Map(), // id -> per-bot round-robin cursor (index/nextAt/…)
+    solo: null, // { role, count, lastRepeat } while a standalone routine runs
     timers: [],
     lastRosterCheck: 0,
   }
+
+  const ROLE_ORDER = ['duels', 'queue', 'arena', 'tpa']
+  const SOLO_ROLES = new Set([...ROLE_ORDER, 'afk'])
 
   function onlineIds () {
     const bots = getBots() || {}
@@ -295,7 +335,9 @@ function createLifestealQueue (deps) {
   }
 
   function roleTaken () {
-    return new Set(Object.values(state.roles).filter(Boolean))
+    const taken = new Set()
+    for (const ids of Object.values(state.roles)) for (const id of ids) taken.add(id)
+    return taken
   }
 
   function say (id, cmd) {
@@ -318,8 +360,10 @@ function createLifestealQueue (deps) {
   }
 
   function assignRole (role, id, cmd) {
-    state.roles[role] = id
+    state.roles[role].push(id)
     state.afkSent.delete(id)
+    if (role === 'arena') startArenaRun(id)
+    if (role === 'tpa') state.tpaRun.set(id, { index: 0, nextAt: 0, lastTarget: null })
     // Role assignment must always (re-)send the command, even if the same bot
     // is picked again within the resend cooldown (per spec: replacement
     // "could be the same bot, don't restrict it like that").
@@ -330,25 +374,24 @@ function createLifestealQueue (deps) {
     log(null, `${role} → ${id} (${cmd || 'assigned'})`)
   }
 
-  function releaseRole (id, silent) {
-    let releasedArena = false
-    for (const role of Object.keys(state.roles)) {
-      if (state.roles[role] === id) {
-        state.roles[role] = null
-        if (role === 'arena') releasedArena = true
-        if (!silent) log(null, `${role} released from ${id}`)
-      }
-    }
-    if (releasedArena) resetArena()
+  function dropHolder (role, id, silent) {
+    const holders = state.roles[role]
+    const at = holders.indexOf(id)
+    if (at === -1) return false
+    holders.splice(at, 1)
+    if (role === 'arena') { try { stopForward(id) } catch (_) {} state.arenaRun.delete(id) }
+    if (role === 'tpa') state.tpaRun.delete(id)
+    if (!silent) log(null, `${role} released from ${id}`)
+    return true
   }
 
-  function resetArena () {
-    state.arena = { phase: 'idle', waitUntil: 0, forwardSince: 0, lastPos: null, stuckSince: 0, timeoutAt: 0 }
+  function releaseRole (id, silent) {
+    for (const role of ROLE_ORDER) dropHolder(role, id, silent)
   }
 
   function roleOf (id) {
-    for (const [role, holder] of Object.entries(state.roles)) {
-      if (holder === id) return role
+    for (const role of ROLE_ORDER) {
+      if (state.roles[role].includes(id)) return role
     }
     return null
   }
@@ -390,69 +433,59 @@ function createLifestealQueue (deps) {
   }
 
   // ── per-role maintenance (called on tick) ──────────────────────────────
-  function maintainQueueRoles () {
-    // /duelsroomqueue slot
-    if (!state.roles.duels || !onlineIds().includes(state.roles.duels)) {
-      const prev = state.roles.duels
-      // Allow the same bot again: only exclude the OTHER exclusive roles.
-      const exclude = new Set([state.roles.queue, state.roles.arena, state.roles.tpa].filter(Boolean))
-      const next = pickOnline(exclude)
-      if (next) {
-        if (prev && prev !== next) parkAfk(prev)
-        assignRole('duels', next, state.cfg.duelsCmd)
-      } else if (prev) {
-        state.roles.duels = null
+  // How many bots a role wants: the configured count in managed mode, and the
+  // standalone [count] (0 = every online bot) for a solo routine. Any role the
+  // solo run did not ask for wants nothing.
+  function wantedCount (role) {
+    if (state.solo) return role === state.solo.role ? (state.solo.count || Infinity) : 0
+    if (role === 'duels') return state.cfg.duelsBots
+    if (role === 'queue') return state.cfg.queueBots
+    if (role === 'arena') return state.cfg.arenaBots
+    return state.cfg.tpaBots
+  }
+
+  function maintainRoles () {
+    const onlineSet = new Set(onlineIds())
+    // 1. Drop holders that are gone (offline, deathbanned or banned — the
+    //    onlineIds filter covers all three). A refill below may pick the very
+    //    same bot again once it is usable: replacements are never restricted.
+    for (const role of ROLE_ORDER) {
+      for (const id of [...state.roles[role]]) {
+        if (!onlineSet.has(id)) dropHolder(role, id, true)
       }
     }
-    // /queue slot
-    if (!state.roles.queue || !onlineIds().includes(state.roles.queue)) {
-      const prev = state.roles.queue
-      const exclude = new Set([state.roles.duels, state.roles.arena, state.roles.tpa].filter(Boolean))
-      const next = pickOnline(exclude)
-      if (next) {
-        if (prev && prev !== next) parkAfk(prev)
-        assignRole('queue', next, state.cfg.queueCmd)
-      } else if (prev) {
-        state.roles.queue = null
+    // 2. Shrink when a count was lowered live — the extras go back to idle.
+    for (const role of ROLE_ORDER) {
+      const want = wantedCount(role)
+      while (state.roles[role].length > want) {
+        const id = state.roles[role][state.roles[role].length - 1]
+        dropHolder(role, id)
+        parkAfk(id)
       }
     }
-    // arena runner — must NOT be the duels or queue bot (nor tpa).
-    if (!state.roles.arena || !onlineIds().includes(state.roles.arena)) {
-      const prev = state.roles.arena
-      if (prev) { try { stopForward(prev) } catch (_) {} }
-      const exclude = new Set([state.roles.duels, state.roles.queue, state.roles.tpa].filter(Boolean))
-      const next = pickOnline(exclude)
-      if (next) {
-        if (prev && prev !== next) parkAfk(prev)
-        state.roles.arena = next
-        state.afkSent.delete(next)
-        resetArena()
-        // Phase 1: warp, then wait 5s before walking.
-        say(next, state.cfg.arenaWarp)
-        state.arena.phase = 'wait'
-        state.arena.waitUntil = now() + state.cfg.arenaWaitMs
-        log(null, `arena → ${next} (${state.cfg.arenaWarp}, walking in 5s)`)
-      } else if (prev) {
-        state.roles.arena = null
-        resetArena()
+    // 3. Fill every short role from the online pool. A bot holds at most one
+    //    role, so each round of filling excludes everyone already holding.
+    for (const role of ROLE_ORDER) {
+      const want = wantedCount(role)
+      const cmd = role === 'duels' ? state.cfg.duelsCmd : role === 'queue' ? state.cfg.queueCmd : null
+      while (state.roles[role].length < want) {
+        const next = pickOnline(roleTaken())
+        if (!next) break
+        assignRole(role, next, cmd)
       }
     }
-    // tpa spammer — distinct bot, never deathbanned.
-    if (!state.roles.tpa || !onlineIds().includes(state.roles.tpa)) {
-      const prev = state.roles.tpa
-      const exclude = new Set([state.roles.duels, state.roles.queue, state.roles.arena].filter(Boolean))
-      const next = pickOnline(exclude)
-      if (next) {
-        if (prev && prev !== next) parkAfk(prev)
-        state.roles.tpa = next
-        state.afkSent.delete(next)
-        state.tpa.index = 0
-        state.tpa.nextAt = 0
-        log(null, `tpa → ${next} (spamming /tpa until deathban)`)
-      } else if (prev) {
-        state.roles.tpa = null
-      }
-    }
+  }
+
+  function startArenaRun (id) {
+    state.afkSent.delete(id)
+    state.arenaRun.set(id, { phase: 'wait', waitUntil: 0, forwardSince: 0, lastPos: null, stuckSince: 0, timeoutAt: 0 })
+    // Phase 1: warp, then wait 5s before walking.
+    state.lastSent.delete(`${id}:${state.cfg.arenaWarp}`)
+    say(id, state.cfg.arenaWarp)
+    const run = state.arenaRun.get(id)
+    run.phase = 'wait'
+    run.waitUntil = now() + state.cfg.arenaWaitMs
+    log(null, `arena → ${id} (${state.cfg.arenaWarp}, walking in 5s)`)
   }
 
   function parkAfk (id) {
@@ -470,108 +503,117 @@ function createLifestealQueue (deps) {
 
   function maintainIdle () {
     const taken = roleTaken()
+    // Standalone /afk-park parks at most [count] bots (0 = everyone).
+    let budget = state.solo && state.solo.role === 'afk' ? (state.solo.count || Infinity) : Infinity
     for (const id of onlineIds()) {
+      if (budget <= 0) break
       if (taken.has(id)) continue
+      budget--
       parkAfk(id)
     }
   }
 
   function maintainArena () {
-    const id = state.roles.arena
-    if (!id) return
-    const bots = getBots() || {}
-    const entry = bots[id]
-    if (!entry || !isOnline(entry)) return // replacement handled by maintainQueueRoles
-    const bot = entry.bot
-    if (!bot || !bot.entity) return
-    const t = now()
-    const a = state.arena
-    if (a.phase === 'wait') {
-      if (t >= a.waitUntil) {
-        if (startForward(id)) {
-          a.phase = 'forward'
-          a.forwardSince = t
-          a.lastPos = botPos(id)
-          a.stuckSince = t
-          a.timeoutAt = t + state.cfg.arenaTimeoutMs
-          log(id, 'arena: holding forward until collision')
-        } else {
-          a.waitUntil = t + 2000 // retry shortly
+    // Each arena holder walks its own loop; runs map keeps per-bot phase.
+    for (const id of [...state.arenaRun.keys()]) {
+      if (!state.roles.arena.includes(id)) { state.arenaRun.delete(id); continue }
+      const bots = getBots() || {}
+      const entry = bots[id]
+      if (!entry || !isOnline(entry)) continue // replacement handled by maintainRoles
+      const bot = entry.bot
+      if (!bot || !bot.entity) continue
+      const t = now()
+      const a = state.arenaRun.get(id)
+      if (a.phase === 'wait') {
+        if (t >= a.waitUntil) {
+          if (startForward(id)) {
+            a.phase = 'forward'
+            a.forwardSince = t
+            a.lastPos = botPos(id)
+            a.stuckSince = t
+            a.timeoutAt = t + state.cfg.arenaTimeoutMs
+            log(id, 'arena: holding forward until collision')
+          } else {
+            a.waitUntil = t + 2000 // retry shortly
+          }
         }
+        continue
       }
-      return
-    }
-    if (a.phase === 'forward') {
-      const pos = botPos(id)
-      // Hit something? Solid block directly ahead counts immediately.
-      let blocked = false
-      try { blocked = isBlockedAhead(bot) } catch (_) { blocked = false }
-      if (blocked) {
-        stopForward(id)
-        log(id, 'arena: hit something — stopping, re-warping')
-        a.phase = 'cooldown'
-        a.waitUntil = t + state.cfg.arenaRepeatDelayMs
-        return
-      }
-      // Stuck in place while holding forward counts as "hit something".
-      if (pos && a.lastPos) {
-        if (dist3(pos, a.lastPos) >= state.cfg.arenaStuckDist) {
-          a.lastPos = pos
-          a.stuckSince = t
-        } else if (t - a.stuckSince >= state.cfg.arenaStuckMs) {
+      if (a.phase === 'forward') {
+        const pos = botPos(id)
+        // Hit something? Solid block directly ahead counts immediately.
+        let blocked = false
+        try { blocked = isBlockedAhead(bot) } catch (_) { blocked = false }
+        if (blocked) {
           stopForward(id)
-          log(id, 'arena: stuck (no movement) — stopping, re-warping')
+          log(id, 'arena: hit something — stopping, re-warping')
           a.phase = 'cooldown'
           a.waitUntil = t + state.cfg.arenaRepeatDelayMs
-          return
+          continue
         }
-      } else if (pos) {
-        a.lastPos = pos
+        // Stuck in place while holding forward counts as "hit something".
+        if (pos && a.lastPos) {
+          if (dist3(pos, a.lastPos) >= state.cfg.arenaStuckDist) {
+            a.lastPos = pos
+            a.stuckSince = t
+          } else if (t - a.stuckSince >= state.cfg.arenaStuckMs) {
+            stopForward(id)
+            log(id, 'arena: stuck (no movement) — stopping, re-warping')
+            a.phase = 'cooldown'
+            a.waitUntil = t + state.cfg.arenaRepeatDelayMs
+            continue
+          }
+        } else if (pos) {
+          a.lastPos = pos
+        }
+        if (t >= a.timeoutAt) {
+          stopForward(id)
+          log(id, 'arena: walk timeout — re-warping')
+          a.phase = 'cooldown'
+          a.waitUntil = t + state.cfg.arenaRepeatDelayMs
+        }
+        continue
       }
-      if (t >= a.timeoutAt) {
-        stopForward(id)
-        log(id, 'arena: walk timeout — re-warping')
-        a.phase = 'cooldown'
-        a.waitUntil = t + state.cfg.arenaRepeatDelayMs
+      if (a.phase === 'cooldown') {
+        if (t >= a.waitUntil) {
+          state.lastSent.delete(`${id}:${state.cfg.arenaWarp}`)
+          say(id, state.cfg.arenaWarp)
+          a.phase = 'wait'
+          a.waitUntil = t + state.cfg.arenaWaitMs
+        }
+        continue
       }
-      return
-    }
-    if (a.phase === 'cooldown') {
-      if (t >= a.waitUntil) {
+      if (a.phase === 'idle') {
         state.lastSent.delete(`${id}:${state.cfg.arenaWarp}`)
         say(id, state.cfg.arenaWarp)
         a.phase = 'wait'
         a.waitUntil = t + state.cfg.arenaWaitMs
       }
     }
-    if (a.phase === 'idle') {
-      state.lastSent.delete(`${id}:${state.cfg.arenaWarp}`)
-      say(id, state.cfg.arenaWarp)
-      a.phase = 'wait'
-      a.waitUntil = t + state.cfg.arenaWaitMs
-    }
   }
 
   function maintainTpa () {
-    const id = state.roles.tpa
-    if (!id) return
     const t = now()
-    if (t < state.tpa.nextAt) return
-    const bots = getBots() || {}
-    const entry = bots[id]
-    if (!entry || !isOnline(entry)) return
-    const bot = entry.bot
-    if (!bot) return
-    const names = visiblePlayers(bot, allIds())
-    if (!names.length) {
-      state.tpa.nextAt = t + state.cfg.tpaIntervalMs
-      return
+    for (const id of [...state.roles.tpa]) {
+      const run = state.tpaRun.get(id) || { index: 0, nextAt: 0, lastTarget: null }
+      state.tpaRun.set(id, run)
+      if (t < run.nextAt) continue
+      const bots = getBots() || {}
+      const entry = bots[id]
+      if (!entry || !isOnline(entry)) continue
+      const bot = entry.bot
+      if (!bot) continue
+      const names = visiblePlayers(bot, allIds())
+      if (!names.length) {
+        run.nextAt = t + state.cfg.tpaIntervalMs
+        continue
+      }
+      const target = names[run.index % names.length]
+      run.index += 1
+      run.lastTarget = target
+      say(id, `/tpa ${target}`)
+      run.nextAt = t + state.cfg.tpaCooldownMs + Math.floor(Math.random() * Math.max(0, state.cfg.tpaIntervalMs - state.cfg.tpaCooldownMs))
     }
-    const target = names[state.tpa.index % names.length]
-    state.tpa.index += 1
-    state.tpa.lastTarget = target
-    say(id, `/tpa ${target}`)
-    state.tpa.nextAt = t + state.cfg.tpaCooldownMs + Math.floor(Math.random() * Math.max(0, state.cfg.tpaIntervalMs - state.cfg.tpaCooldownMs))
   }
 
   function requestTopUp (missing, why) {
@@ -611,53 +653,92 @@ function createLifestealQueue (deps) {
     if (!state.running) return
     state.cfg = readConfig(getEnv())
     noteSessions()
-    maintainQueueRoles()
+    maintainRoles()
+    if (state.solo && (state.solo.role === 'duels' || state.solo.role === 'queue')) maintainSoloRepeat()
     maintainArena()
     maintainTpa()
     maintainIdle()
-    maintainRoster()
+    // A standalone routine runs the routine only — no roster top-up (that
+    // would call /new-gen and create accounts the user never asked for).
+    if (!state.solo) maintainRoster()
   }
 
-  function start () {
-    state.cfg = readConfig(getEnv())
-    if (state.running) return { ok: false, error: 'already running' }
-    state.running = true
-    state.lastRosterCheck = 0
-    state.afkSent.clear()
-    tick()
+  // Standalone /duelsroomspam and /queuespam re-send their command on a
+  // cadence (managed roles still send once per assignment — there the
+  // replacement events do the re-sending).
+  function maintainSoloRepeat () {
+    const t = now()
+    if (t - state.solo.lastRepeat < state.cfg.soloRepeatMs) return
+    state.solo.lastRepeat = t
+    const cmd = state.solo.role === 'duels' ? state.cfg.duelsCmd : state.cfg.queueCmd
+    for (const id of state.roles[state.solo.role]) {
+      state.lastSent.delete(`${id}:${cmd}`)
+      say(id, cmd)
+    }
+  }
+
+  function armLoops () {
     const loop = () => {
       if (!state.running) return
       try { tick() } catch (_) {}
     }
-    const h = setTimer(loop, state.cfg.tickMs)
-    // Re-arm via unref'd interval semantics: store a repeating timer when
-    // setTimer supports intervals, else fall back to single-shot re-arm.
-    if (h && typeof h.unref === 'function') { try { h.unref() } catch (_) {} }
-    // Use a real interval for the steady loop; keep handle for stop().
-    try { clearTimer(h) } catch (_) {}
-    const iv = setInterval(loop, state.cfg.tickMs)
+    // Steady loop; keep handles for stop().
+    const iv = setPulse(loop, state.cfg.tickMs)
     if (iv && typeof iv.unref === 'function') { try { iv.unref() } catch (_) {} }
     state.timers.push(iv)
     // Fast arena poll (collision/stuck needs <1s granularity).
-    const arenaIv = setInterval(() => { if (state.running) { try { maintainArena() } catch (_) {} } }, 250)
+    const arenaIv = setPulse(() => { if (state.running) { try { maintainArena() } catch (_) {} } }, 250)
     if (arenaIv && typeof arenaIv.unref === 'function') { try { arenaIv.unref() } catch (_) {} }
     state.timers.push(arenaIv)
-    log(null, `lifesteal automation started (target ${state.cfg.targetBots} bots; duels=${state.cfg.duelsCmd} queue=${state.cfg.queueCmd} arena=${state.cfg.arenaWarp})`)
+  }
+
+  function start () {
+    state.cfg = readConfig(getEnv())
+    if (state.solo) return { ok: false, error: 'a standalone routine is running — stop it first' }
+    if (state.running) return { ok: false, error: 'already running' }
+    state.running = true
+    state.lastRosterCheck = 0
+    state.afkSent.clear()
+    armLoops()
+    tick()
+    log(null, `lifesteal automation started (target ${state.cfg.targetBots} bots; duels=${state.cfg.duelsBots}×${state.cfg.duelsCmd} queue=${state.cfg.queueBots}×${state.cfg.queueCmd} arena=${state.cfg.arenaBots}×${state.cfg.arenaWarp} tpa=${state.cfg.tpaBots})`)
     return { ok: true }
+  }
+
+  // Standalone routines: run ONE role on the bots already online — no roster
+  // top-up, no /new-gen, no Tor restart. count 0 = every online bot.
+  function startSolo (role, count) {
+    if (!SOLO_ROLES.has(role)) return { ok: false, error: `unknown routine: ${role}` }
+    if (state.running) return { ok: false, error: state.solo ? 'a standalone routine is already running — stop it first' : 'stop /lifesteal-start first' }
+    const n = Number.isFinite(count) && count > 0 ? Math.floor(count) : 0
+    state.cfg = readConfig(getEnv())
+    state.solo = { role, count: n, lastRepeat: now() }
+    state.running = true
+    state.afkSent.clear()
+    armLoops()
+    tick()
+    log(null, `standalone ${role} routine started (${n > 0 ? `${n} bot(s)` : 'all online bots'}${role === 'duels' || role === 'queue' ? `, re-sending every ${state.cfg.soloRepeatMs}ms` : ''})`)
+    return { ok: true, role, count: n }
+  }
+
+  function stopSolo () {
+    if (!state.solo) return { ok: false, error: 'no standalone routine running' }
+    return stop()
   }
 
   function stop () {
     if (!state.running) return { ok: false, error: 'not running' }
     state.running = false
-    for (const t of state.timers) { try { clearInterval(t); clearTimer(t) } catch (_) {} }
+    for (const t of state.timers) { try { clearPulse(t) } catch (_) {} }
     state.timers.length = 0
-    // Release held forward keys.
-    for (const id of Object.values(state.roles).filter(Boolean)) { try { stopForward(id) } catch (_) {} }
-    state.roles.duels = null
-    state.roles.queue = null
-    state.roles.arena = null
-    state.roles.tpa = null
-    resetArena()
+    // Release held forward keys and every role slot.
+    for (const ids of Object.values(state.roles)) {
+      for (const id of ids) { try { stopForward(id) } catch (_) {} }
+    }
+    for (const role of ROLE_ORDER) state.roles[role].length = 0
+    state.arenaRun.clear()
+    state.tpaRun.clear()
+    state.solo = null
     log(null, 'lifesteal automation stopped')
     return { ok: true }
   }
@@ -665,13 +746,19 @@ function createLifestealQueue (deps) {
   function status () {
     return {
       running: state.running,
+      solo: state.solo ? { role: state.solo.role, count: state.solo.count } : null,
       cfg: { ...state.cfg },
-      roles: { ...state.roles },
+      roles: {
+        duels: [...state.roles.duels],
+        queue: [...state.roles.queue],
+        arena: [...state.roles.arena],
+        tpa: [...state.roles.tpa],
+      },
       online: onlineIds().length,
       total: allIds().length,
       deathbanned: [...state.deathbanned.entries()].map(([bot, exp]) => ({ bot, expiresInMs: Math.max(0, exp - now()) })),
-      arena: { ...state.arena, lastPos: undefined },
-      tpa: { ...state.tpa },
+      arena: [...state.arenaRun.entries()].map(([bot, run]) => ({ bot, phase: run.phase })),
+      tpa: [...state.tpaRun.entries()].map(([bot, run]) => ({ bot, lastTarget: run.lastTarget })),
     }
   }
 
@@ -683,15 +770,17 @@ function createLifestealQueue (deps) {
     if (!state.running) return
     const r = roleOf(id)
     try { stopForward(id) } catch (_) {}
-    if (r === 'arena') resetArena()
+    const nextStep = state.solo ? 'dropping the role' : 'replacing via /new-gen and picking a new random bot'
     if (r) {
-      state.roles[r] = null
-      log(null, `${r} bot ${id} banned (${reason || 'ban detected'}) — replacing via /new-gen and picking a new random bot`)
+      dropHolder(r, id, true)
+      log(null, `${r} bot ${id} banned (${reason || 'ban detected'}) — ${nextStep}`)
     } else {
-      log(null, `bot ${id} banned (${reason || 'ban detected'}) — replacing via /new-gen`)
+      log(null, `bot ${id} banned (${reason || 'ban detected'}) — ${state.solo ? 'no role held' : 'replacing via /new-gen'}`)
     }
     state.afkSent.delete(id)
-    requestTopUp(1, `ban replacement for ${id}`)
+    // Standalone routines never create accounts — only the managed loop
+    // orders a /new-gen replacement for a banned bot.
+    if (!state.solo) requestTopUp(1, `ban replacement for ${id}`)
     try { tick() } catch (_) {}
   }
 
@@ -701,10 +790,9 @@ function createLifestealQueue (deps) {
     if (isDeathbanned(id)) return
     const r = roleOf(id)
     try { stopForward(id) } catch (_) {}
-    if (r === 'arena') resetArena()
     if (r) {
       // Clear immediately; next tick picks a fresh random bot (possibly same).
-      state.roles[r] = null
+      dropHolder(r, id, true)
       state.afkSent.delete(id)
       log(null, `${r} bot ${id} died — picking a new random bot`)
       try { tick() } catch (_) {}
@@ -722,8 +810,7 @@ function createLifestealQueue (deps) {
     const r = roleOf(id)
     if (r) {
       try { stopForward(id) } catch (_) {}
-      if (r === 'arena') resetArena()
-      state.roles[r] = null
+      dropHolder(r, id, true)
       log(null, `${r} bot ${id} disconnected — picking a new random bot`)
       try { tick() } catch (_) {}
     }
@@ -750,6 +837,7 @@ function createLifestealQueue (deps) {
 
   return {
     start, stop, status, tick,
+    startSolo, stopSolo,
     onDeath, onKick, onBan, onMessage,
     isDeathbanned, roleOf, bannedIds,
     _state: state, _readConfig: readConfig,

@@ -919,6 +919,24 @@ check logs before retrying to avoid accidentally executing a command twice.
 | `CLICK_COMPASS` | empty | Set to enable compass activation after spawn |
 | `RANDOMIZE_BOT_ORDER` | `true` | Shuffle the initial connection order (Fisher-Yates); `false`/`0`/`no`/`off` keep the configured order |
 
+### Lifesteal automation
+
+`/lifesteal-start` runs the lifesteal roles (duels-room queue, `/queue`, the
+arena walk loop, `/tpa` round-robin — everyone else parked at the AFK warp).
+How many bots hold each role is configuration, all **live** (`.ENV` tab or
+`/env set KEY VALUE` — a running loop reshapes immediately: lowering a count
+releases the extra bots back to `/warp afk`, raising one fills from the online
+pool). Every role is also available **standalone** — see the command table.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `LIFESTEAL_TARGET_BOTS` | `20` | Fleet size the roster tops up to via `/new-gen`; bots are never removed |
+| `LIFESTEAL_DUELS_BOTS` | `1` | Bots spamming the duels-room command (`0` disables the role) |
+| `LIFESTEAL_QUEUE_BOTS` | `1` | Bots holding `/queue` (`0` disables the role) |
+| `LIFESTEAL_ARENA_BOTS` | `1` | Bots looping `/warp arena` → wait → forward-until-hit (`0` disables) |
+| `LIFESTEAL_TPA_BOTS` | `1` | Bots spamming `/tpa <player>` round-robin — raise for more `/tpa` bots (`0` disables) |
+| `LIFESTEAL_SOLO_REPEAT_MS` | `15000` | Re-send cadence for standalone `/duelsroomspam` and `/queuespam` |
+
 ### GUI and crate automation
 
 | Variable | Default | Purpose |
@@ -1414,6 +1432,12 @@ Any unrecognized input is sent as a Minecraft chat message or command.
 | `/crates-loop [n] [color]` | Repeat crate collection |
 | `/crates-all [n] [color] [dump=…] [afk=…] ["term" …] [shulker|chest] [color]` | Run shardshop, crates, and dump across bots; `dump=`/`afk=` override the sequence defaults, quoted terms filter the dump |
 | `/crates-solo [bot] [color] [dump=…] [afk=…] ["term" …] [shulker|chest] [color]` | Run that sequence for one bot, with the same flags and dump filters |
+| `/lifesteal-start` / `-stop` / `-status` | Lifesteal role automation with configurable role counts (`LIFESTEAL_*_BOTS`) |
+| `/tpa-roundrobin [count\|all] [stop]` | Standalone: spam `/tpa <player>` round-robin on up to `count` bots (default all) |
+| `/duelsroomspam [count\|all] [stop]` | Standalone: spam the duels-room command on up to `count` bots |
+| `/queuespam [count\|all] [stop]` | Standalone: spam `/queue` on up to `count` bots |
+| `/warp-arena [count\|all] [stop]` | Standalone: loop `/warp arena` → walk-until-hit on up to `count` bots |
+| `/afk-park [count\|all] [stop]` | Standalone: park up to `count` bots at the AFK warp (once each) |
 | `/drop [count]` | Drop the held stack (or `count` items from it) |
 | `/pickup [all]` | Pathfind to the nearest dropped item and collect it (`all` = sweep the area) |
 | `/gui <server command>` | Open a server GUI and manage it manually (no auto-click/auto-warp) |
