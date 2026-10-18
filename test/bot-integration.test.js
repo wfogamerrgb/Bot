@@ -40,6 +40,7 @@ function runtime(env = {}) {
   const stateEnv = {
     DATA_FILE: path.join(stateDir, 'spawner-data.json'),
     REMOVED_BOTS_FILE: path.join(stateDir, 'removed-bots.json'),
+    DEATHBANNED_BOTS_FILE: path.join(stateDir, 'deathbanned-bots.json'),
     EVIDENCE_FILE: path.join(stateDir, 'evidence.json'),
     TIMESERIES_FILE: path.join(stateDir, 'timeseries.jsonl'),
     TIMESERIES_SUMMARY_FILE: path.join(stateDir, 'timeseries-summary.json')
@@ -753,6 +754,20 @@ test('/repeat repeats the previous command, never /repeat itself', () => {
   assert.deepEqual(plain(r.context.chats), [['A', 'hello there']])
   const t = [...r.timers.keys()][0]; r.timers.delete(t); t.fn()
   assert.deepEqual(plain(r.context.chats), [['A', 'hello there'], ['A', 'hello there']])
+})
+
+test('/repeat-cancel stops every pending /repeat run in every context', () => {
+  const r = runtime()
+  r.timers.clear()
+  r.run(`handleCommand('/repeat 5 hello', { selectedId: 'A' })`)
+  r.run(`handleCommand('/repeat 5 world', { selectedId: 'B' })`)
+  assert.equal(r.timers.size, 2, 'each context schedules its own pending runs')
+  r.run(`handleCommand('/repeat-cancel')`)
+  assert.equal(r.timers.size, 0, 'every context is cancelled — not just the caller\'s')
+  assert.deepEqual(plain(r.context.chats), [['A', 'hello'], ['B', 'world']], 'only the immediate first runs happened')
+  assert.match(logsText(r), /Cancelled 2 pending \/repeat run\(s\)/)
+  r.run(`handleCommand('/repeat-cancel')`)
+  assert.match(logsText(r), /No \/repeat runs are pending/)
 })
 
 // ── /use-book: book → hotbar slot 1 → /use && /use ──────────────────────────
@@ -2920,6 +2935,70 @@ test('/dump term filters match names and NBT, and never teleport when nothing ma
   assert.deepEqual(plain(r.context.chats), [['A', '/tpa Main'], ['A', '/warp afk']])
 })
 
+test('/dump-gui-look filters inventory terms, accepts comma container types, and never teleports', async () => {
+  const r = runtime()
+  r.timers.clear()
+  r.run(`
+    scans = []
+    bots.A.bot.entity = { position: { x: 0, y: 0, z: 0, clone: () => ({ x: 0, y: 0, z: 0, distanceTo: () => 0 }), distanceTo: () => 0 } }
+    bots.A.bot.on = () => {}
+    bots.A.bot.removeListener = () => {}
+    bots.A.bot.registry = { blocksByName: { chest: { id: 54 }, trapped_chest: { id: 146 }, shulker_box: { id: 241 }, yellow_shulker_box: { id: 242 } } }
+    bots.A.bot.findBlocks = opts => { scans.push(opts.matching.slice()); return [] }
+    bots.A.bot.inventory = { items: () => [
+      { name: 'diamond_sword', displayName: 'Diamond Sword', count: 1, slot: 1 },
+      // Netherite only as a material tag — the /dump matching extracted 1:1.
+      { name: 'iron_chestplate', displayName: 'Fatal Chestplate', count: 1, slot: 2, nbt: { value: { Material: { value: 'netherite' } } } }
+    ] }
+  `)
+  await driveSequence(r, r.run(`handleCommand('/dump-gui-look "netherite" shulker,chest')`))
+  const text = logsText(r)
+  assert.match(text, /looking for containers near the bot/)
+  assert.match(text, /1 stack\(s\) match "netherite"/)
+  assert.match(text, /1 stack\(s\) stay behind/)
+  assert.match(text, /No matching containers found/)
+  assert.deepEqual(plain(r.run('scans[0]')), [54, 146, 241, 242], 'shulker,chest scans both families')
+  assert.deepEqual(plain(r.context.chats), [], '/dump-gui-look never sends /tpa or a warp')
+  // No term = everything; no type = any storage container.
+  r.run('scans = []')
+  await driveSequence(r, r.run(`handleCommand('/dump-gui-look')`))
+  assert.deepEqual(plain(r.run('scans[0]')), [54, 146, 241, 242], 'no type = any storage container')
+  assert.deepEqual(plain(r.context.chats), [], 'still no /tpa and no warp')
+})
+
+test('/dump-gui-look walks to the found container and deposits matching stacks into it', async () => {
+  const r = runtime()
+  r.timers.clear()
+  r.run(`
+    controls = []
+    clicks = []
+    bots.A.bot.entity = { position: { x: 0, y: 64, z: 0, clone: () => ({ x: 0, y: 64, z: 0, distanceTo: () => 0 }), distanceTo: () => 0 } }
+    bots.A.bot.on = () => {}
+    bots.A.bot.removeListener = () => {}
+    bots.A.bot.setControlState = (key, value) => controls.push([key, value])
+    bots.A.bot.clearControlStates = () => {}
+    bots.A.bot.registry = { blocksByName: { chest: { id: 54 }, trapped_chest: { id: 146 } } }
+    bots.A.bot.findBlocks = () => [{ x: 1, y: 64, z: 0 }]
+    bots.A.bot.blockAt = () => ({ name: 'chest', position: { x: 1, y: 64, z: 0 } })
+    __win = { id: 1, inventoryStart: 1, inventoryEnd: 3, close: async () => {}, slots: [
+      null,
+      { name: 'diamond_sword', displayName: 'Diamond Sword', count: 2, slot: 1 },
+      { name: 'stone', displayName: 'Stone', count: 1, slot: 2 }
+    ] }
+    bots.A.bot.openContainer = async () => __win
+    bots.A.bot.clickWindow = async (slot, button, mode) => { clicks.push([slot, button, mode]); __win.slots[slot] = null }
+    bots.A.bot.inventory = { items: () => __win.slots.slice(1).filter(Boolean) }
+  `)
+  // No term = the whole inventory; no type = any storage container.
+  await driveSequence(r, r.run(`handleCommand('/dump-gui-look')`))
+  const text = logsText(r)
+  assert.deepEqual(plain(r.run('controls[0]')), ['forward', true], 'walks up to the container before opening it')
+  assert.deepEqual(plain(r.run('clicks')), [[1, 0, 1], [2, 0, 1]], 'every stack is shift-clicked into the chest')
+  assert.match(text, /deposited 2 stack\(s\) into the chest/)
+  assert.match(text, /all items successfully dumped \(2 stack\(s\) across 1 usable container\(s\)\)/)
+  assert.deepEqual(plain(r.context.chats), [], 'no /tpa and no AFK warp — the bot stays put')
+})
+
 test('/dump hidden keeps at most DUMP_HIDDEN_CONCURRENT bots at the spot and resets each one', async () => {
   const r = runtime({ TPA_MAIN_PLAYER: 'Main', DUMP_HIDDEN_CONCURRENT: '2', DUMP_HIDDEN_MIN_GAP_MS: '1000', DUMP_HIDDEN_MAX_GAP_MS: '1000' })
   r.timers.clear()
@@ -3022,3 +3101,92 @@ test('standalone lifesteal routines route from the console and stop on demand', 
   r.run("handleCommand('/tpa-roundrobin stop')")
   assert.match(logsText(r), /no standalone routine running/)
 })
+
+test('/tpauto on|off routes locally instead of being sent to the server', () => {
+  const r = runtime()
+  r.context.chats.length = 0
+  r.run("handleCommand('/tpauto on')")
+  assert.equal(r.run('bots.A.tpautoEnabled'), true)
+  assert.deepEqual(plain(r.context.chats), [], '/tpauto on must never be sent as server chat')
+  assert.match(logsText(r), /TPA auto enabled/)
+
+  r.run("handleCommand('/all /tpauto off')")
+  assert.equal(r.run('bots.A.tpautoEnabled'), false)
+  assert.equal(r.run('bots.B.tpautoEnabled'), false)
+  assert.equal(r.run('bots.C.tpautoEnabled'), false)
+  assert.deepEqual(plain(r.context.chats), [], '/all /tpauto off must never be broadcast as server chat')
+})
+
+test('/freeforall aims and hits with the best weapon, never shields, and never moves or breaks blocks', async () => {
+  const r = runtime()
+  r.run(`
+    globalThis.ffaActions = { equipped: [], unequipped: [], looked: [], attacked: [], deactivated: 0, cleared: 0, pathStopped: 0, digStopped: 0 }
+    bots.A.bot.entity = { position: { x: 0, y: 64, z: 0 } }
+    bots.A.bot.targetDigBlock = { name: 'stone' }
+    bots.A.bot.stopDigging = () => { ffaActions.digStopped++ }
+    bots.A.bot.pathfinder = { stop: () => { ffaActions.pathStopped++ } }
+    bots.A.bot.clearControlStates = () => { ffaActions.cleared++ }
+    bots.A.bot.deactivateItem = () => { ffaActions.deactivated++ }
+    bots.A.bot.inventory = {
+      slots: { 45: { name: 'shield', slot: 45, type: 99 } },
+      items: () => [
+        { name: 'shield', slot: 40, type: 99 },
+        { name: 'iron_sword', slot: 36, type: 10 },
+        { name: 'netherite_sword', slot: 37, type: 20, enchants: [{ name: 'sharpness', lvl: 5 }] }
+      ]
+    }
+    bots.A.bot.equip = (item, dest) => { ffaActions.equipped.push([item.name, dest]); bots.A.bot.heldItem = item }
+    bots.A.bot.unequip = (dest) => { ffaActions.unequipped.push(dest) }
+    bots.A.bot.lookAt = (pos) => { ffaActions.looked.push(pos) }
+    bots.A.bot.attack = (ent) => { ffaActions.attacked.push(ent.username || ent.name) }
+    bots.A.bot.players = { EnemyPlayer: { entity: { username: 'EnemyPlayer', height: 1.8, position: { x: 2, y: 64, z: 1 } } } }
+  `)
+  r.run("handleCommand('/freeforall')")
+  await Promise.resolve()
+  await Promise.resolve()
+  await Promise.resolve()
+  const act = plain(r.run('ffaActions'))
+  assert.deepEqual(act.equipped, [['netherite_sword', 'hand']], 'equips the best weapon, never a shield')
+  assert.deepEqual(act.unequipped, ['off-hand'], 'unequips shield from off-hand')
+  assert.ok(act.deactivated >= 1, 'deactivates any active shield/item')
+  assert.ok(act.cleared >= 1, 'clears movement controls')
+  assert.ok(act.pathStopped >= 1, 'stops pathfinder movement')
+  assert.ok(act.digStopped >= 1, 'stops block breaking')
+  assert.equal(act.looked.length, 1, 'turns/aims at the target')
+  assert.deepEqual(act.attacked, ['EnemyPlayer'], 'hits the target')
+
+  r.run("handleCommand('/freeforall stop')")
+  assert.equal(r.run('bots.A.freeForAllRunning'), false)
+})
+
+test('/new-gen-maintain maintains the requested bot count via /new-gen', () => {
+  const r = runtime({ TEST_CREATE_BOTS: true, LOGIN_PASSWORD: 'pw' })
+  r.run("handleCommand('/new-gen-maintain 6')")
+  assert.match(logsText(r), /\/new-gen-maintain active: maintaining 6 usable bots/)
+  const saved = require('dotenv').parse(r.fakeFiles.get('.env'))
+  const names = saved.BOT_NAMES.split(',').map(s => s.trim()).filter(Boolean)
+  assert.equal(names.length, 6, 'tops up from 3 to 6 configured bots')
+  r.run("handleCommand('/new-gen-maintain stop')")
+  assert.match(logsText(r), /\/new-gen-maintain stopped/)
+})
+
+test('deathbanned bots are closed (/closeBot), blocked from reconnecting, and kept in a separate offline deathbanned section', () => {
+  const r = runtime({ TEST_CREATE_BOTS: true })
+  r.run("createBotInstance('A')")
+  const botA = r.createdBots[0]
+  botA.emit('kicked', 'You are deathbanned for 24 hours!')
+  botA.emit('end', 'socketClosed')
+
+  assert.equal(r.run('Object.hasOwn(bots, "A")'), false, 'deathbanned bot is closed and removed from live bots map')
+  assert.match(String(r.run('connectBlockReason("A")')), /deathbanned/, 'deathbanned bot is blocked from reconnecting')
+  const snap = plain(r.run('botSnapshot()'))
+  const dbEntry = snap.find(b => b.id === 'A')
+  assert.ok(dbEntry, 'deathbanned bot remains visible in snapshot')
+  assert.equal(dbEntry.online, false)
+  assert.equal(dbEntry.deathbanned, true)
+  assert.equal(dbEntry.state, 'deathbanned')
+
+  r.run("handleCommand('/list')")
+  assert.match(logsText(r), /Offline Death Banned Bots \(1\)/)
+})
+

@@ -6,7 +6,7 @@ const { Vec3 } = require('vec3')
 const fs = require('node:fs')
 const path = require('node:path')
 const os = require('node:os')
-const { parseBroadcastTargets } = require('../bot-controls')
+const { parseBroadcastTargets, parseDumpArgs } = require('../bot-controls')
 const { createEvidenceStore } = require('../evidence')
 const createManual = require('../bot-manual')
 const { parseOptions, createSpawnerDrop } = require('../spawner-drop')
@@ -193,4 +193,39 @@ test('spawner options override defaults and refuse invalid pacing or modes', () 
   assert.throws(() => parseOptions('mode=forever', defaults))
   assert.throws(() => parseOptions('', { ...defaults, terms: [''] }), /empty item filter/)
   assert.throws(() => parseOptions('""', defaults), /empty item filter/)
+})
+
+test('dump filters accept comma-separated container types and no args at all', () => {
+  assert.deepEqual(parseDumpArgs('"netherite" shulker,chest'), { mode: 'tpa', terms: ['netherite'], types: ['shulker', 'chest'], colors: [], unknown: [] })
+  assert.deepEqual(parseDumpArgs('"netherite" shulker').types, ['shulker'])
+  // No args: dump everything into any storage container.
+  assert.deepEqual(parseDumpArgs(''), { mode: 'tpa', terms: [], types: [], colors: [], unknown: [] })
+})
+
+test('/gui-tui works with no window open by showing the player inventory', () => {
+  const logs = []
+  const bot = {
+    entity: { position: new Vec3(0, 64, 0), yaw: 0, pitch: 0 },
+    currentWindow: null,
+    inventory: { slots: [null, { name: 'diamond', displayName: 'Diamond', count: 3, slot: 1 }] }
+  }
+  const bots = { A: { bot } }
+  const manual = createManual({ bots, logFor: (_, text) => logs.push(text), sanitize: String, notifyBotsChanged() {}, SYSTEM_ID: 'system', loadViewerFactory() { throw Error('Must not start viewer') } })
+  assert.equal(manual.routeCommand('/gui-tui', 'A'), true)
+  assert.equal(bots.A.guiTui, true)
+  assert.match(logs.join('\n'), /player inventory/)
+  const snap = manual.snapshotFor(bots.A)
+  assert.equal(snap.guiTui, true)
+  assert.equal(snap.window.isInventory, true)
+  assert.equal(snap.window.title, 'Inventory')
+  assert.match(snap.window.slots[1].item, /3x Diamond/)
+  // Toggling off hides it again — and an open window still wins over the inventory.
+  assert.equal(manual.routeCommand('/gui-tui', 'A'), true)
+  assert.equal(bots.A.guiTui, false)
+  assert.equal(manual.snapshotFor(bots.A), null)
+  bot.currentWindow = { id: 7, slots: [{ name: 'stone', displayName: 'Stone', count: 1, slot: 0 }], title: 'Chest' }
+  assert.equal(manual.routeCommand('/gui-tui', 'A'), true)
+  const winSnap = manual.snapshotFor(bots.A)
+  assert.equal(winSnap.window.isInventory, false)
+  assert.equal(winSnap.window.title, 'Chest')
 })

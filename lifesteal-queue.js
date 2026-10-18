@@ -46,9 +46,8 @@
 //            restart the manager requests NEWNYM on every local control port
 //            so the reconnecting bots leave on fresh paths.
 //
-// Deathban note: a lifesteal deathban (~24h) still lets the account join the
-// server, it just cannot `/server lifesteal`. Deathbanned bots are therefore
-// parked (excluded from lifesteal roles) for DEATHBAN_MS instead of removed.
+// Deathban note: deathbanned bots are closed (/closeBot), not reconnected,
+// and kept in a separate offline death-banned bots section.
 //
 // Wiring (see the bot.js patch in this PR):
 //   const lifestealQueue = require('./lifesteal-queue').createLifestealQueue({...})
@@ -139,7 +138,9 @@ function lifestealTorRestartCmd (env) {
 
 // Deathban wording seen on lifesteal servers: "deathban", "death banned",
 // "banned for 24 hours", "you are deathbanned until ...".
-const DEATHBAN_RE = /death[\s-]*ban|banned for\s+24\s*hour|you (are|have been) (temporarily )?banned/i
+// Plain "You are temporarily banned for 10 minutes" is a general server tempban
+// (handled by monitoring.js), NOT a lifesteal deathban.
+const DEATHBAN_RE = /death[\s-]*ban|banned for\s+24\s*hour/i
 
 function isDeathbanText (text) {
   if (!text) return false
@@ -230,15 +231,22 @@ function createLifestealQueue (deps) {
   // to the persisted dataStore ban flag). Banned bots are excluded from roles
   // and counted as missing so /new-gen replaces them.
   const isBanned = deps.isBanned || (() => false)
+  // onDeathban(id, reason, expiresAt) -> called when a bot is confirmed deathbanned
+  // so bot.js can close it (/closeBot), block reconnects, and list it in the
+  // offline deathbanned section.
+  const onDeathban = deps.onDeathban || null
   const getEnv = deps.getEnv || (() => ({}))
 
   const state = {
     running: false,
+    maintainRunning: false,
+    maintainTarget: 0,
+    maintainTimers: [],
     cfg: readConfig(getEnv()),
     // Role holders are ARRAYS: LIFESTEAL_*_BOTS decides how many bots run each
     // role (default 1 each, matching the old single-holder behavior).
     roles: { duels: [], queue: [], arena: [], tpa: [] },
-    deathbanned: new Map(), // id -> expiryMs
+    deathbanned: new Map(), // id -> { expiresAt, reason, addedAt }
     activeSince: new Map(), // id -> when first seen online (chat trust window)
     lastRealEventAt: new Map(), // id -> last real death/kick (reopens trust window)
     afkSent: new Set(), // bots already parked at /warp afk (avoid chat spam)
@@ -288,17 +296,26 @@ function createLifestealQueue (deps) {
   }
 
   function isDeathbanned (id) {
-    const exp = state.deathbanned.get(id)
-    if (!exp) return false
-    if (exp <= now()) { state.deathbanned.delete(id); return false }
+    const row = state.deathbanned.get(id)
+    if (!row) return false
+    const exp = typeof row === 'number' ? row : row.expiresAt
+    if (exp && exp <= now()) { state.deathbanned.delete(id); return false }
     return true
   }
 
   function markDeathbanned (id, reason) {
-    state.deathbanned.set(id, now() + state.cfg.deathbanMs)
+    const expiresAt = now() + state.cfg.deathbanMs
+    const cleanReason = reason || 'deathban detected'
+    state.deathbanned.set(id, { expiresAt, reason: cleanReason, addedAt: now() })
     releaseRole(id, true)
     try { stopForward(id) } catch (_) {}
-    log(id, `deathbanned (${reason || 'detected'}) — parked for 24h, excluded from lifesteal roles`)
+    log(id, `deathbanned (${cleanReason}) — closing bot and moving to offline death-banned section`)
+    if (typeof onDeathban === 'function') {
+      try { onDeathban(id, cleanReason, expiresAt) } catch (_) {}
+    }
+    if ((state.running && !state.solo) || state.maintainRunning) {
+      requestTopUp(1, `deathban replacement for ${id}`)
+    }
   }
 
   // Session bookkeeping for the chat trust window: each bot's clock starts
@@ -638,15 +655,50 @@ function createLifestealQueue (deps) {
     // name lands in BOT_NAMES immediately, so onBan's order plus this check
     // can never produce two replacements for one ban.
     const roster = configuredIds()
-    let banned = 0
+    let unavailable = 0
     for (const id of roster) {
-      try { if (isBanned(id)) banned++ } catch (_) {}
+      let bad = false
+      try { if (isBanned(id)) bad = true } catch (_) {}
+      if (!bad && isDeathbanned(id)) bad = true
+      if (bad) unavailable++
     }
-    const effective = roster.length - banned
-    const missing = state.cfg.targetBots - effective
+    const effective = roster.length - unavailable
+    const target = state.maintainRunning && state.maintainTarget > 0 ? state.maintainTarget : state.cfg.targetBots
+    const missing = target - effective
     if (missing > 0) {
-      requestTopUp(missing, `${effective}/${state.cfg.targetBots} usable (${banned} banned)`)
+      requestTopUp(missing, `${effective}/${target} usable (${unavailable} banned/deathbanned)`)
     }
+  }
+
+  function startMaintain (targetCount) {
+    state.cfg = readConfig(getEnv())
+    const n = Number.isFinite(Number(targetCount)) && Number(targetCount) > 0
+      ? Math.floor(Number(targetCount))
+      : state.cfg.targetBots
+    state.maintainTarget = n
+    state.lastRosterCheck = 0
+    if (!state.maintainRunning) {
+      state.maintainRunning = true
+      const iv = setPulse(() => {
+        if (!state.maintainRunning) return
+        try { maintainRoster() } catch (_) {}
+      }, state.cfg.tickMs)
+      if (iv && typeof iv.unref === 'function') { try { iv.unref() } catch (_) {} }
+      state.maintainTimers.push(iv)
+    }
+    maintainRoster()
+    log(null, `new-gen-maintain active (target ${n} bots)`)
+    return { ok: true, targetBots: n }
+  }
+
+  function stopMaintain () {
+    if (!state.maintainRunning) return { ok: false, error: 'new-gen-maintain is not running' }
+    state.maintainRunning = false
+    state.maintainTarget = 0
+    for (const t of state.maintainTimers) { try { clearPulse(t) } catch (_) {} }
+    state.maintainTimers.length = 0
+    log(null, 'new-gen-maintain stopped')
+    return { ok: true }
   }
 
   function tick () {
@@ -756,7 +808,18 @@ function createLifestealQueue (deps) {
       },
       online: onlineIds().length,
       total: allIds().length,
-      deathbanned: [...state.deathbanned.entries()].map(([bot, exp]) => ({ bot, expiresInMs: Math.max(0, exp - now()) })),
+      maintainRunning: state.maintainRunning,
+      maintainTarget: state.maintainRunning ? state.maintainTarget : state.cfg.targetBots,
+      deathbanned: [...state.deathbanned.entries()].map(([bot, row]) => {
+        const exp = typeof row === 'number' ? row : row.expiresAt
+        return {
+          bot,
+          reason: typeof row === 'object' && row ? row.reason : 'deathbanned',
+          addedAt: typeof row === 'object' && row ? row.addedAt : 0,
+          expiresAt: exp || 0,
+          expiresInMs: Math.max(0, (exp || 0) - now()),
+        }
+      }),
       arena: [...state.arenaRun.entries()].map(([bot, run]) => ({ bot, phase: run.phase })),
       tpa: [...state.tpaRun.entries()].map(([bot, run]) => ({ bot, lastTarget: run.lastTarget })),
     }
@@ -767,26 +830,27 @@ function createLifestealQueue (deps) {
   // /new-gen replacement for the lost bot, and refill the role from whoever
   // is still usable. The banned account itself is left alone (never removed).
   function onBan (id, reason) {
-    if (!state.running) return
+    if (!state.running && !state.maintainRunning) return
     const r = roleOf(id)
     try { stopForward(id) } catch (_) {}
-    const nextStep = state.solo ? 'dropping the role' : 'replacing via /new-gen and picking a new random bot'
+    const canReplace = (state.running && !state.solo) || state.maintainRunning
+    const nextStep = !canReplace ? 'dropping the role' : 'replacing via /new-gen and picking a new random bot'
     if (r) {
       dropHolder(r, id, true)
       log(null, `${r} bot ${id} banned (${reason || 'ban detected'}) — ${nextStep}`)
     } else {
-      log(null, `bot ${id} banned (${reason || 'ban detected'}) — ${state.solo ? 'no role held' : 'replacing via /new-gen'}`)
+      log(null, `bot ${id} banned (${reason || 'ban detected'}) — ${!canReplace ? 'no role held' : 'replacing via /new-gen'}`)
     }
     state.afkSent.delete(id)
     // Standalone routines never create accounts — only the managed loop
-    // orders a /new-gen replacement for a banned bot.
-    if (!state.solo) requestTopUp(1, `ban replacement for ${id}`)
-    try { tick() } catch (_) {}
+    // or /new-gen-maintain orders a /new-gen replacement for a banned bot.
+    if (canReplace) requestTopUp(1, `ban replacement for ${id}`)
+    if (state.running) { try { tick() } catch (_) {} }
   }
 
   function onDeath (id) {
-    if (!state.running) return
     noteRealEvent(id)
+    if (!state.running) return
     if (isDeathbanned(id)) return
     const r = roleOf(id)
     try { stopForward(id) } catch (_) {}
@@ -800,12 +864,12 @@ function createLifestealQueue (deps) {
   }
 
   function onKick (id, reason) {
-    if (!state.running) return
     noteRealEvent(id)
     // A kick is a real server packet — nobody can type one into chat — so its
     // wording is always believed, with no trust window.
     const text = String(reason || '')
-    if (isDeathbanText(text)) { markDeathbanned(id, 'kick: ' + text.slice(0, 120)); try { tick() } catch (_) {}; return }
+    if (isDeathbanText(text)) { markDeathbanned(id, 'kick: ' + text.slice(0, 120)); if (state.running) { try { tick() } catch (_) {} } return }
+    if (!state.running) return
     // Any other kick/disconnect of a role holder triggers replacement.
     const r = roleOf(id)
     if (r) {
@@ -817,7 +881,9 @@ function createLifestealQueue (deps) {
   }
 
   function onMessage (id, text) {
-    if (!state.running) return
+    // Ensure activeSince is populated even when lifesteal roles aren't running
+    // so deathban messages in the session trust window or after death are caught.
+    noteSessions()
     // Typed chat can imitate any server wording — "You are deathbanned…",
     // "Kicked: {\"color\":…}" — so two independent gates apply before a
     // message is believed: (1) a line shaped like player chat (name-prefixed,
@@ -827,17 +893,17 @@ function createLifestealQueue (deps) {
     if (looksLikePlayerChat(text)) return
     if (!messageTrusted(id)) return
     if (isDeathbanText(text)) {
-      // A trusted deathban notice means the account is out for 24h even if it
-      // already lost its role to the death event — park it so it is not
-      // re-picked while deathbanned.
+      // A trusted deathban notice means the account is out for 24h — close it
+      // and park it in the offline deathbanned section.
       markDeathbanned(id, 'deathban message')
-      try { tick() } catch (_) {}
+      if (state.running) { try { tick() } catch (_) {} }
     }
   }
 
   return {
     start, stop, status, tick,
     startSolo, stopSolo,
+    startMaintain, stopMaintain, maintainRoster,
     onDeath, onKick, onBan, onMessage,
     isDeathbanned, roleOf, bannedIds,
     _state: state, _readConfig: readConfig,

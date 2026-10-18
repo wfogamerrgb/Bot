@@ -15,7 +15,9 @@ const SECTIONS = [
     entries: [
       { title: '/lifesteal-start | /lifesteal-stop | /lifesteal-status', desc: 'Restarts Tor first (scripts/restart-tor.sh --tor-only), requests NEWNYM on every local control port, then runs the lifesteal roles: LIFESTEAL_DUELS_BOTS bots send /duelsroomqueue, LIFESTEAL_QUEUE_BOTS send /queue (both replaced on death — same bot allowed again), LIFESTEAL_ARENA_BOTS bots loop /warp arena → 5s → forward-until-hit, LIFESTEAL_TPA_BOTS bots spam /tpa <player> round-robin until deathban (24h park), everyone else stays /warp afk. The roster tops up to LIFESTEAL_TARGET_BOTS via /new-gen and never removes bots; banned bots are replaced with fresh names. /lifesteal-status shows the holders, the counts and the deathbanned.', examples: ['/lifesteal-start', '/lifesteal-status', '/lifesteal-stop'] },
       { title: 'Role counts — LIFESTEAL_DUELS_BOTS / LIFESTEAL_QUEUE_BOTS / LIFESTEAL_ARENA_BOTS / LIFESTEAL_TPA_BOTS', desc: 'How many bots hold each role. Default 1 each, 0 disables the role. All live: the .ENV tab and /env set reshape a running loop immediately — lowering a count releases the extra bots back to /warp afk, raising one fills from the online pool. Role holders are always distinct bots. LIFESTEAL_SOLO_REPEAT_MS (15000) is the re-send cadence for the standalone duels/queue spams.', examples: ['/env set LIFESTEAL_TPA_BOTS 5', '/env set LIFESTEAL_QUEUE_BOTS 0'] },
-      { title: 'Standalone routines: /tpa-roundrobin, /duelsroomspam, /queuespam, /warp-arena, /afk-park', desc: 'Run one lifesteal role on its own — no roster top-up, no /new-gen, no Tor restart, just the routine on the bots that are already online. [count|all] limits the routine to that many bots (default: every online bot); stop ends it. /tpa-roundrobin spams /tpa <player> round-robin, /duelsroomspam and /queuespam re-send their command every LIFESTEAL_SOLO_REPEAT_MS, /warp-arena loops /warp arena → 5s → forward-until-hit, /afk-park parks bots at the AFK warp once each. A standalone routine and /lifesteal-start are mutually exclusive.', examples: ['/tpa-roundrobin', '/tpa-roundrobin 5', '/duelsroomspam 2', '/warp-arena stop'] }
+      { title: 'Standalone routines: /tpa-roundrobin, /duelsroomspam, /queuespam, /warp-arena, /afk-park', desc: 'Run one lifesteal role on its own — no roster top-up, no /new-gen, no Tor restart, just the routine on the bots that are already online. [count|all] limits the routine to that many bots (default: every online bot); stop ends it. /tpa-roundrobin spams /tpa <player> round-robin, /duelsroomspam and /queuespam re-send their command every LIFESTEAL_SOLO_REPEAT_MS, /warp-arena loops /warp arena → 5s → forward-until-hit, /afk-park parks bots at the AFK warp once each. A standalone routine and /lifesteal-start are mutually exclusive.', examples: ['/tpa-roundrobin', '/tpa-roundrobin 5', '/duelsroomspam 2', '/warp-arena stop'] },
+      { title: '/new-gen-maintain [botnumber|stop|status]', desc: 'Standalone bot maintenance extracted from /lifesteal-start: maintains the requested usable bot count (default 25) via /new-gen without moving or breaking blocks. Replaces banned and deathbanned bots automatically.', examples: ['/new-gen-maintain 25', '/new-gen-maintain status', '/new-gen-maintain stop'] },
+      { title: '/freeforall [on|off|stop]', desc: 'Stationary combat mode: turns (aims) and hits nearby targets within reach using the best weapon in the bot\'s inventory. Never uses or holds a shield, never moves, and never breaks blocks.', examples: ['/freeforall', '/freeforall stop', '/all /freeforall'] }
     ]
   },
   {
@@ -48,7 +50,7 @@ const SECTIONS = [
       },
       {
         title: 'Command chains',
-        desc: 'Commands can be chained: && waits for each step, ; fires without waiting, and sleep pauses. Escaped \\&& and \\; send literal operators. /repeat re-runs a command n times or for a duration.',
+        desc: 'Commands can be chained: && waits for each step, ; fires without waiting, and sleep pauses. Escaped \\&& and \\; send literal operators. /repeat re-runs a command n times or for a duration; /repeat-cancel stops every pending /repeat run.',
         examples: ['/status && sleep 5s && /dump "fatal"', '/repeat 30s 2s /spawners']
       }
     ]
@@ -70,7 +72,7 @@ const SECTIONS = [
       },
       {
         title: 'Container filters (type + color)',
-        desc: 'The type keyword restricts WHERE items are deposited: shulker (shulker boxes), chest (chest + trapped chest), or all (default = both). Repeatable and OR\'d. A shulker color (white, orange, magenta, light_blue, yellow, lime, pink, gray, light_gray, cyan, purple, blue, brown, green, red, black) restricts shulker boxes to that color and implies the shulker type. Quoting forces a word to be a term: /dump "chest" searches for items called chest, /dump chest restricts to chests.',
+        desc: 'The type keyword restricts WHERE items are deposited: shulker (shulker boxes), chest (chest + trapped chest), or all (default = both). Repeatable and OR\'d; commas work too (shulker,chest ≡ shulker chest). A shulker color (white, orange, magenta, light_blue, yellow, lime, pink, gray, light_gray, cyan, purple, blue, brown, green, red, black) restricts shulker boxes to that color and implies the shulker type. Quoting forces a word to be a term: /dump "chest" searches for items called chest, /dump chest restricts to chests.',
         examples: ['/dump shulker', '/dump "fatal" shulker yellow', '/dump "fatal" "enchanted" shulker chest', '/dump "chestplate" chest']
       },
       {
@@ -82,6 +84,11 @@ const SECTIONS = [
         title: 'Reports and safety',
         desc: 'Each dump reports what was deposited, which containers were used, and what stayed behind (with the reason). A dump with a filter that matches nothing does NOT teleport — it reports "no items match" and stops. A chest that will not open is abandoned after DUMP_OPEN_TIMEOUT_MS instead of stalling the run. /dump-spawners is the spawner-only variant of the plain dump.',
         examples: ['/dump-spawners']
+      },
+      {
+        title: '/dump-gui-look — local storage dump (no TPA)',
+        desc: 'The /dump matching + container scan extracted for staying put: /dump-gui-look "term" [storagecontainertype] looks through the inventory for items matching the quoted term(s) — with the term omitted it dumps everything — then looks for storage containers whose type matches (shulker, chest, or comma-separated shulker,chest) and walks to each one to deposit. With the type omitted it looks for ANY storage container. No /tpa, no teleport, no AFK warp. Same grammar as /dump, so colors work too.',
+        examples: ['/dump-gui-look "netherite" shulker,chest', '/dump-gui-look "netherite" shulker', '/dump-gui-look']
       }
     ]
   },
@@ -207,8 +214,8 @@ const SECTIONS = [
     entries: [
       {
         title: '/repeat and /all-slow',
-        desc: '/repeat [n|duration] [delay] <cmd> re-runs a command with a gap (REPEAT_DELAY_MS). /all-slow [first-last] [delay] <cmd> broadcasts to the selected inclusive range (or every bot) staggered (ALL_SLOW_DELAY_MS), with a chat guard so plain chat cannot be sprayed by accident (prefix ! to send deliberately). /all-slow-cancel [id] stops a broadcast.',
-        examples: ['/repeat 5 30s /spawners', '/all-slow 30 /crates', '/all-slow !hello']
+        desc: '/repeat [n|duration] [delay] <cmd> re-runs a command with a gap (REPEAT_DELAY_MS); /repeat stop cancels the runs the current tab scheduled, /repeat-cancel cancels EVERY pending /repeat run in every tab. /all-slow [first-last] [delay] <cmd> broadcasts to the selected inclusive range (or every bot) staggered (ALL_SLOW_DELAY_MS), with a chat guard so plain chat cannot be sprayed by accident (prefix ! to send deliberately). /all-slow-cancel [id] stops a broadcast.',
+        examples: ['/repeat 5 30s /spawners', '/repeat-cancel', '/all-slow 30 /crates', '/all-slow !hello']
       },
       {
         title: 'Cron jobs',

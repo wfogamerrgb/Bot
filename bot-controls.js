@@ -77,6 +77,7 @@ function normalizeDumpWord (value) {
 
 // Quote-aware tokenizer: `tokenizeDumpArgs('"fatal ench" shulker')` →
 // [{ text: 'fatal ench', quoted: true }, { text: 'shulker', quoted: false }].
+// Commas split unquoted tokens too, so `shulker,chest` ≡ `shulker chest`.
 function tokenizeDumpArgs (raw) {
   const s = String(raw ?? '')
   const out = []
@@ -94,7 +95,9 @@ function tokenizeDumpArgs (raw) {
     }
     let text = ''
     while (i < s.length && !/\s/.test(s[i])) { text += s[i]; i++ }
-    out.push({ text, quoted: false })
+    for (const part of text.split(',')) {
+      if (part) out.push({ text: part, quoted: false })
+    }
   }
   return out
 }

@@ -807,14 +807,19 @@ module.exports = function createManualControls (deps) {
         const entry = needsBot()
         if (!entry) return true
         const bot = entry.bot
-        const win = entry.manualWindow || bot.currentWindow
+        // Works with NO window open: the player inventory stands in for the
+        // GUI, so /gui-tui never needs a window to be opened first.
+        const openWin = entry.manualWindow && entry.manualWindow.slots ? entry.manualWindow : (bot.currentWindow && bot.currentWindow.slots ? bot.currentWindow : null)
+        const win = openWin || bot.inventory
         if (!win || !win.slots) {
-          warn(activeId, 'No GUI is open — open one first (/window-open, /gui /shardshop, or /chat /shardshop).')
+          warn(activeId, 'Nothing to show — the bot has no inventory yet (not spawned?).')
           return true
         }
         entry.guiTui = !entry.guiTui
         if (entry.guiTui) {
-          okMsg(activeId, `GUI TUI shown for "${windowTitle(win)}" (${win.slots.length} slots) — the dashboard renders it as a clickable ASCII panel.`)
+          okMsg(activeId, openWin
+            ? `GUI TUI shown for "${windowTitle(win)}" (${win.slots.length} slots) — the dashboard renders it as a clickable ASCII panel.`
+            : `GUI TUI shown for the player inventory (${win.slots.length} slots) — no GUI is open, so the inventory stands in. The dashboard renders it as a clickable ASCII panel.`)
           printWindowSlots(activeId, bot, win)
         } else {
           i(activeId, 'GUI TUI hidden.')
@@ -1041,14 +1046,25 @@ module.exports = function createManualControls (deps) {
         alt
       })
     })
-    return { title: windowTitle(win), isInventory, slots }
+    return { title: isInventory ? 'Inventory' : windowTitle(win), isInventory, slots }
+  }
+
+  // The window /gui-tui renders: the tracked manual window, then any open
+  // container, then the player inventory — so the TUI works with no window.
+  function tuiWindowFor (entry) {
+    const manualWin = entry?.manualWindow && entry.manualWindow.slots ? entry.manualWindow : null
+    if (manualWin) return manualWin
+    const current = entry?.bot?.currentWindow
+    if (current && current.slots) return current
+    const inventory = entry?.bot?.inventory
+    return inventory && inventory.slots ? inventory : null
   }
 
   // Dashboard snapshot. Returns null when there is nothing manual to show. The
   // shape changed to carry `mode` separately from the GUI TUI, because /gui and
   // /chat /shardshop track windows even when manual mode is OFF.
   function snapshotFor (entry) {
-    const win = entry?.manualWindow && entry.manualWindow.slots ? entry.manualWindow : null
+    const win = entry?.guiTui ? tuiWindowFor(entry) : (entry?.manualWindow && entry.manualWindow.slots ? entry.manualWindow : null)
     const hasMode = !!entry?.manualMode
     const hasSession = !!entry?.manualSession
     const hasTui = !!entry?.guiTui && !!win

@@ -201,7 +201,7 @@ let WARP_AFK = process.env.WARP_COMMAND || '/warp afk'
 let WARP_BEFORE_CRATE = (process.env.WARP_BEFORE_CRATE ?? process.env.WARPORNOT ?? 'true').toLowerCase() !== 'false'
 let SERVER_COMMAND = (process.env.SERVER_COMMAND ?? '').trim()
 let TPA_MAIN_PLAYER = (process.env.TPA_MAIN_PLAYER || process.env.TPA_TARGET_PLAYER || '').trim()
-let TPA_TRUSTED_BOTS = parseNameList(process.env.TPA_TRUSTED_BOTS || BOT_NAMES.join(','))
+let TPA_TRUSTED_BOTS = parseNameList(process.env.TPA_TRUSTED_BOTS || [...BOT_NAMES, ...parseNameList(process.env.BOT_NAMES)].join(','))
 const TPA_AUTO_DEFAULT = /^(1|true|yes|on)$/i.test(process.env.TPA_AUTO_DEFAULT || 'false')
 let DUMP_HOME_COMMAND = (process.env.DUMP_HOME_COMMAND || '/home stash').trim()
 // /dump hidden pacing: at most DUMP_HIDDEN_CONCURRENT bots at the spot at any
@@ -263,6 +263,7 @@ function persistData () {
 // BOT_NAMES for you), so it is its own file, loaded at startup and consulted
 // before anything else decides to connect.
 const REMOVED_BOTS_FILE = (process.env.REMOVED_BOTS_FILE || '').trim() || path.join(__dirname, 'removed-bots.json')
+const DEATHBANNED_BOTS_FILE = (process.env.DEATHBANNED_BOTS_FILE || '').trim() || path.join(__dirname, 'data', 'deathbanned-bots.json')
 // What a permanent ban does to the live roster: 'remove' mirrors /closeBot,
 // 'hold' keeps the entry visible with the banned badge.
 const PERMANENT_BAN_ACTION = /^(hold|keep|visible)$/i.test(process.env.PERMANENT_BAN_ACTION || '') ? 'hold' : 'remove'
@@ -272,6 +273,16 @@ const BAN_RETRY_MS = readDelayMs(process.env.BAN_RETRY_MS, 1800000)
 let removedBots = removedBotsStore.loadRemovedBots(REMOVED_BOTS_FILE)
 function persistRemovedBots () { removedBots = removedBotsStore.saveRemovedBots(REMOVED_BOTS_FILE, removedBots) }
 function removedEntryFor (id) { return removedBotsStore.findRemovedBot(removedBots, id) }
+let deathbannedBots = removedBotsStore.loadRemovedBots(DEATHBANNED_BOTS_FILE)
+function persistDeathbannedBots () { try { deathbannedBots = removedBotsStore.saveRemovedBots(DEATHBANNED_BOTS_FILE, deathbannedBots) } catch (_) {} }
+function deathbannedEntryFor (id) { return removedBotsStore.findRemovedBot(deathbannedBots, id) }
+function recordDeathbannedBot (id, reason) {
+  const cleanReason = String(reason || 'deathbanned').trim() || 'deathbanned'
+  removedBotsStore.addRemovedBot(deathbannedBots, { bot: id, kind: 'deathban', reason: cleanReason }, { addedBy: 'deathban-detection' })
+  persistDeathbannedBots()
+  logFor(id || SYSTEM_ID, `{red-fg}💀 ${sanitize(id)} is deathbanned (${sanitize(cleanReason)}) — executing /closeBot and moving to offline death-banned section.{/red-fg}`)
+  dropFromRoster(id)
+}
 // Mirrors /closeBot: disconnect first (which stops the reconnect path dead), then
 // drop the entry so it stops appearing as a bot that might come back.
 function dropFromRoster (id) {
@@ -350,6 +361,8 @@ function handleTakenName (id, entry, detail) {
 // retries until its expiry instead of using transport backoff. Permanent bans
 // enter the removed list (ban-detection adds them, /unban reverses).
 function connectBlockReason (id) {
+  const deathban = deathbannedEntryFor(id)
+  if (deathban) return `deathbanned (${deathban.reason || 'deathban'})`
   const removal = removedEntryFor(id)
   return removal ? `on the removed list (${removedBotsStore.describeRemovedBot(removal)})` : null
 }
@@ -1171,7 +1184,7 @@ WARP_BEFORE_CRATE = (process.env.WARP_BEFORE_CRATE ?? process.env.WARPORNOT ?? '
 SERVER_COMMAND = (process.env.SERVER_COMMAND || '').trim()
 CLICK_COMPASS_ENABLED = /^(1|true|yes|on)$/i.test(process.env.CLICK_COMPASS || '')
 TPA_MAIN_PLAYER = (settings.get('TPA_MAIN_PLAYER') || process.env.TPA_TARGET_PLAYER || '').trim()
-TPA_TRUSTED_BOTS = parseNameList(process.env.TPA_TRUSTED_BOTS || BOT_NAMES.join(','))
+TPA_TRUSTED_BOTS = parseNameList(process.env.TPA_TRUSTED_BOTS || [...BOT_NAMES, ...parseNameList(process.env.BOT_NAMES)].join(','))
 DUMP_HOME_COMMAND = settings.get('DUMP_HOME_COMMAND') || '/home stash'
 CRATES_ALL_DUMP_ENV = parseCratesAllDump(settings.get('CRATES_ALL_DUMP'))
 CRATES_ALL_AFK_WARP = settings.get('CRATES_ALL_AFK_WARP')
@@ -1247,7 +1260,7 @@ const spawnerDrop = require(path.join(__dirname, 'spawner-drop')).createSpawnerD
   defaults: () => ({ durationMs: settings.get('SPAWNER_DROP_DURATION_MS'), cooldownMs: settings.get('SPAWNER_DROP_COOLDOWN_MS'), mode: settings.get('SPAWNER_DROP_MODE'), scope: settings.get('SPAWNER_DROP_SCOPE'), terms: [settings.get('SPAWNER_DROP_MATCH')] })
 })
 
-const LOCAL_COMMANDS = ['/server-commands', '/start-rtp', '/stop-rtp', '/evidence', '/connection', '/spawner-drop', '/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dump-spawners', '/dc', '/reconnect', '/crates', '/crates-loop', '/spawners', '/data', '/shardshop-loop', '/closeBot', '/bot-coinflip', '/bot-coinflip-all', '/ai-chat', '/repeat', '/use-book', '/enchanted-golden-apple-extract', '/ege', '/scripts', '/run-script', '/lifesteal-start', '/lifesteal-stop', '/lifesteal-status', '/tpa-roundrobin', '/duelsroomspam', '/queuespam', '/warp-arena', '/afk-park']
+const LOCAL_COMMANDS = ['/tpauto', '/freeforall', '/server-commands', '/start-rtp', '/stop-rtp', '/evidence', '/connection', '/spawner-drop', '/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dump-spawners', '/dump-gui-look', '/dc', '/reconnect', '/crates', '/crates-loop', '/spawners', '/data', '/shardshop-loop', '/closeBot', '/bot-coinflip', '/bot-coinflip-all', '/ai-chat', '/repeat', '/repeat-cancel', '/use-book', '/enchanted-golden-apple-extract', '/ege', '/scripts', '/run-script', '/lifesteal-start', '/lifesteal-stop', '/lifesteal-status', '/new-gen-maintain', '/tpa-roundrobin', '/duelsroomspam', '/queuespam', '/warp-arena', '/afk-park']
 
 // ── Lifesteal queue / arena / TPA automation (lifesteal-queue.js) ──────────
 // How many bots hold each role is configuration (live via the .ENV tab):
@@ -1272,10 +1285,12 @@ const lifestealQueue = require(path.join(__dirname, 'lifesteal-queue')).createLi
   },
   log: (id, msg) => logFor(id || SYSTEM_ID, `{cyan-fg}[lifesteal] ${sanitize(msg)}{/cyan-fg}`),
   getEnv: () => process.env,
-  isBanned: (id) => { try { const row = dataState.bots[id]; return Boolean(row?.banned && dataStore.isBanActive(row).held) } catch (_) { return false } },
+  isBanned: (id) => { try { if (deathbannedEntryFor(id) || removedEntryFor(id)) return true; const row = dataState.bots[id]; return Boolean(row?.banned && dataStore.isBanActive(row).held) } catch (_) { return false } },
+  onDeathban: (id, reason) => recordDeathbannedBot(id, reason),
   ensureRoster: (missing) => {
     try {
-      const result = persistGeneratedBots({ file: path.join(__dirname, '.env'), env: process.env, existing: Object.keys(bots), blocked: (removedBots.bots || []).map(row => row.bot), count: Number(missing) || 1, group: 'auto', io: fs })
+      const blocked = [...(removedBots.bots || []).map(row => row.bot), ...(deathbannedBots.bots || []).map(row => row.bot)]
+      const result = persistGeneratedBots({ file: path.join(__dirname, '.env'), env: process.env, existing: Object.keys(bots), blocked, count: Number(missing) || 1, group: 'auto', io: fs })
       refreshRuntimeConfig()
       logFor(SYSTEM_ID, `{green-fg}✓ [lifesteal] Saved ${result.names.length} generated account(s) to .env before connecting.{/green-fg}`)
       // Generated connects use the default connect delay — the same pacing as
@@ -1291,6 +1306,178 @@ const lifestealQueue = require(path.join(__dirname, 'lifesteal-queue')).createLi
     } catch (err) { return { ok: false, error: err && err.message ? err.message : String(err) } }
   },
 })
+
+// ── /freeforall: stationary aim + attack with best weapon, never shield ──────
+const WEAPON_BASE_SCORES = {
+  netherite_sword: 100,
+  netherite_axe: 95,
+  diamond_sword: 90,
+  diamond_axe: 85,
+  trident: 82,
+  mace: 80,
+  iron_sword: 70,
+  iron_axe: 65,
+  stone_sword: 50,
+  stone_axe: 45,
+  golden_sword: 40,
+  golden_axe: 35,
+  wooden_sword: 30,
+  wooden_axe: 25,
+}
+function weaponScoreForItem (item) {
+  if (!item || !item.name) return 0
+  const name = String(item.name).toLowerCase()
+  if (name.includes('shield')) return -1000
+  let score = WEAPON_BASE_SCORES[name] || 0
+  if (!score) {
+    if (name.endsWith('_sword')) score = 60
+    else if (name.endsWith('_axe')) score = 55
+    else return 0
+  }
+  try {
+    const ench = item.enchants || item.nbt?.value?.Enchantments?.value?.value || []
+    if (Array.isArray(ench)) {
+      for (const e of ench) {
+        const id = String(e?.name || e?.id?.value || e?.id || '').toLowerCase()
+        const lvl = Number(e?.lvl?.value ?? e?.lvl ?? 1) || 1
+        if (id.includes('sharpness')) score += lvl * 3
+        else if (id.includes('smite') || id.includes('bane')) score += lvl * 1
+        else if (id.includes('fire_aspect')) score += lvl * 2
+      }
+    }
+  } catch (_) {}
+  return score
+}
+function pickBestWeapon (bot) {
+  try {
+    const items = (bot?.inventory && typeof bot.inventory.items === 'function') ? bot.inventory.items() : []
+    let best = null
+    let bestScore = 0
+    for (const item of items) {
+      const score = weaponScoreForItem(item)
+      if (score > bestScore) { bestScore = score; best = item }
+    }
+    return best
+  } catch (_) { return null }
+}
+function pickNearestFreeForAllTarget (bot, selfId, maxReach = 4.5) {
+  try {
+    const selfPos = bot?.entity?.position
+    if (!selfPos) return null
+    let best = null
+    let bestDist = Infinity
+    const fleetLower = new Set(Object.keys(bots).map(k => k.toLowerCase()))
+    const consider = (ent, isPlayer) => {
+      if (!ent || ent === bot.entity || !ent.position) return
+      const uname = ent.username || ent.name || ''
+      if (uname && String(uname).toLowerCase() === String(selfId || '').toLowerCase()) return
+      const dx = ent.position.x - selfPos.x
+      const dy = ent.position.y - selfPos.y
+      const dz = ent.position.z - selfPos.z
+      const dist = Math.hypot(dx, dy, dz)
+      if (dist > maxReach) return
+      const effectiveDist = isPlayer && !fleetLower.has(String(uname).toLowerCase()) ? dist - 0.5 : dist
+      if (effectiveDist < bestDist) { bestDist = effectiveDist; best = ent }
+    }
+    if (bot.players && typeof bot.players === 'object') {
+      for (const [name, p] of Object.entries(bot.players)) {
+        if (name === selfId) continue
+        if (p && p.entity) consider(p.entity, true)
+      }
+    }
+    if (bot.entities && typeof bot.entities === 'object') {
+      for (const ent of Object.values(bot.entities)) {
+        if (!ent || ent === bot.entity) continue
+        const type = String(ent.type || '').toLowerCase()
+        if (type === 'player' || ent.username) consider(ent, true)
+        else if (type === 'mob' || type === 'hostile') consider(ent, false)
+      }
+    }
+    return best
+  } catch (_) { return null }
+}
+function stopFreeForAll (id, quiet = false) {
+  const entry = bots[id]
+  if (!entry) return false
+  const wasRunning = Boolean(entry.freeForAllRunning || entry.freeForAllTimer)
+  entry.freeForAllRunning = false
+  if (entry.freeForAllTimer) {
+    clearInterval(entry.freeForAllTimer)
+    entry.freeForAllTimer = null
+  }
+  try { entry.bot?.deactivateItem?.() } catch (_) {}
+  try { entry.bot?.clearControlStates?.() } catch (_) {}
+  if (wasRunning && !quiet) logFor(id, '{green-fg}✓ Free-for-all stopped.{/green-fg}')
+  return wasRunning
+}
+function startFreeForAll (id) {
+  const entry = bots[id]
+  if (!entry || !entry.bot || !entry.bot.entity) {
+    logFor(id || SYSTEM_ID, `{yellow-fg}⚠ ${sanitize(id || 'Bot')} is not currently spawned.{/yellow-fg}`)
+    return false
+  }
+  stopFreeForAll(id, true)
+  entry.freeForAllRunning = true
+  let lastAttackAt = 0
+  let busy = false
+  const tick = async () => {
+    if (!entry.freeForAllRunning || bots[id] !== entry || !entry.bot?.entity) {
+      stopFreeForAll(id, true)
+      return
+    }
+    if (busy) return
+    busy = true
+    try {
+      const bot = entry.bot
+      // Strictly no moving and no block breaking: stop pathfinder, clear movement controls, abort digging.
+      try { bot.pathfinder?.stop?.() } catch (_) {}
+      try { bot.clearControlStates?.() } catch (_) {}
+      try { if (bot.targetDigBlock && typeof bot.stopDigging === 'function') bot.stopDigging() } catch (_) {}
+      // Never shield: deactivate active item and unequip shield from off-hand/hand.
+      try { bot.deactivateItem?.() } catch (_) {}
+      try {
+        const offhand = bot.inventory?.slots?.[45]
+        if (offhand && String(offhand.name || '').toLowerCase().includes('shield') && typeof bot.unequip === 'function') {
+          await bot.unequip('off-hand')
+        }
+      } catch (_) {}
+      // Equip best weapon in hand (never a shield).
+      try {
+        const best = pickBestWeapon(bot)
+        const held = bot.heldItem
+        if (best && (!held || held.type !== best.type || held.slot !== best.slot)) {
+          if (typeof bot.equip === 'function') await bot.equip(best, 'hand')
+        } else if (held && String(held.name || '').toLowerCase().includes('shield')) {
+          if (typeof bot.unequip === 'function') await bot.unequip('hand')
+        }
+      } catch (_) {}
+      // Turn (aim) and hit nearest target within reach.
+      const target = pickNearestFreeForAllTarget(bot, id, 4.5)
+      if (!target || !target.position) return
+      try {
+        const aimHeight = Number.isFinite(target.height) ? target.height * 0.85 : 1.4
+        const aimPos = typeof target.position.offset === 'function'
+          ? target.position.offset(0, aimHeight, 0)
+          : { x: target.position.x, y: target.position.y + aimHeight, z: target.position.z }
+        if (typeof bot.lookAt === 'function') {
+          await bot.lookAt(aimPos, true)
+        }
+      } catch (_) {}
+      const nowMs = Date.now()
+      if (nowMs - lastAttackAt >= 625) {
+        lastAttackAt = nowMs
+        try { bot.attack(target) } catch (_) {}
+      }
+    } finally {
+      busy = false
+    }
+  }
+  entry.freeForAllTimer = setInterval(() => { tick().catch(() => {}) }, 150)
+  if (entry.freeForAllTimer.unref) entry.freeForAllTimer.unref()
+  tick().catch(() => {})
+  logFor(id, '{green-fg}✓ Free-for-all started: aiming and hitting with best weapon (never shields, no moving, no block breaking). Run /freeforall stop to end.{/green-fg}')
+  return true
+}
 
 // Standalone lifesteal routines (/tpa-roundrobin, /duelsroomspam, /queuespam,
 // /warp-arena, /afk-park): run ONE role on the bots already online — no roster
@@ -1353,13 +1540,13 @@ function dispatchCommandToBot (msg, id) {
   const command = String(msg || '').trim()
   if (!command) return false
   if (!bots[id]) return false
-  if (bots[id]?.rtpRunning && !/^\/(?:status|connection|coordinates|evidence|stop-rtp|start-rtp)(?:\s|$)/.test(command)) {
+  if (bots[id]?.rtpRunning && !/^\/(?:tpauto|freeforall|status|connection|coordinates|evidence|stop-rtp|start-rtp)(?:\s|$)/.test(command)) {
     logFor(id, '{yellow-fg}⚠ Stop roaming before broadcasting another operation to this bot.{/yellow-fg}')
     return false
   }
   if (manual.routeCommand(command, id)) return true
   const verb = command.split(/\s+/)[0]
-  if (['/all', '/all-slow', '/start-login', '/new-gen', '/crates-all', '/bot-coinflip-all', '/reconnect-all', '/unban-all', '/exit', '/cron'].includes(verb)) {
+  if (['/all', '/all-slow', '/start-login', '/new-gen', '/new-gen-maintain', '/crates-all', '/bot-coinflip-all', '/reconnect-all', '/unban-all', '/exit', '/cron'].includes(verb)) {
     logFor(id, '{yellow-fg}⚠ Fleet-wide command cannot be nested in a per-bot broadcast; run it directly.{/yellow-fg}')
     return false
   }
@@ -1547,6 +1734,12 @@ connecting: !online && !dataState.bots[id]?.banned && e.connectionState === 'con
   kick: escHtml(sanitize(row.reason || dataState.bots[row.bot]?.banReason || 'On removed list')),
   disconnectReason: sanitize(row.reason || dataState.bots[row.bot]?.banReason || 'On removed list'),
   disconnectedAt: dataState.bots[row.bot]?.bannedAt || null, pingHist: []
+}))).concat((deathbannedBots.bots || []).filter(row => !Object.hasOwn(bots, row.bot) && !removedEntryFor(row.bot)).map(row => ({
+  id: row.bot, number: null, online: false, connecting: false, state: 'deathbanned', banned: false, removed: true, deathbanned: true,
+  banKind: 'deathban',
+  kick: escHtml(sanitize(row.reason || 'Deathbanned')),
+  disconnectReason: sanitize(row.reason || 'Deathbanned'),
+  disconnectedAt: row.addedAt || null, pingHist: []
 })))
 }
 function serverCommandSnapshot(id) {
@@ -2360,13 +2553,16 @@ try{var offlinePref=localStorage.getItem('afk.showOffline');if(offlinePref!==nul
 el('show-all-bots').onchange=function(){try{localStorage.setItem('afk.showOffline',String(this.checked))}catch(_){}renderBots(lastBotSnapshot)}
 function renderBots(bs){lastBotSnapshot=bs;var box=el('botlist');box.innerHTML='';botStates={}
 var showAll = el('show-all-bots')?.checked || false
-for(var i=0;i<bs.length;i++){var b=bs[i]
-botStates[b.id]=b
-var old=prevOnline[b.id]
-if(old===true&&!b.online)toast(b.id+(b.banned?' was banned':' went offline')+(b.kick?' — '+b.kick:''),'bad')
-if(old===false&&b.online)toast(b.id+' is online','good')
-prevOnline[b.id]=b.online
-if(!showAll && !b.online) continue
+var regular=[],deathbannedList=[]
+for(var i=0;i<bs.length;i++){var item=bs[i]
+botStates[item.id]=item
+var old=prevOnline[item.id]
+if(old===true&&!item.online)toast(item.id+(item.deathbanned?' was deathbanned':item.banned?' was banned':' went offline')+(item.kick?' — '+item.kick:''),'bad')
+if(old===false&&item.online)toast(item.id+' is online','good')
+prevOnline[item.id]=item.online
+if(!showAll && !item.online) continue
+if(item.deathbanned)deathbannedList.push(item);else regular.push(item)}
+function appendBotCard(b,idx){
 var d=document.createElement('div')
 var cls = 'bot'
 if(b.online) cls += ' on'
@@ -2377,29 +2573,34 @@ d.setAttribute('data-id',b.id)
 var up=b.uptimeSec==null?'':fmtUp(b.uptimeSec)
 var manualHtml=b.manual&&b.manual.mode?'<span class="manual-badge">manual</span>':''
 var guiHtml=b.manual&&(b.manual.guiTui||b.manual.session)?'<span class="manual-badge" style="color:var(--cyan);border-color:rgba(103,232,249,.4)">gui</span>':''
-var bannedHtml=b.banned?'<span class="manual-badge" style="color:var(--red);border-color:rgba(248,113,113,.45)">⛔ '+(b.banKind==='permanent'||b.banKind==='blacklist'?'perma banned':'banned')+'</span>':''
+var bannedHtml=b.deathbanned?'<span class="manual-badge" style="color:var(--red);border-color:rgba(248,113,113,.45)">💀 deathbanned</span>':b.banned?'<span class="manual-badge" style="color:var(--red);border-color:rgba(248,113,113,.45)">⛔ '+(b.banKind==='permanent'||b.banKind==='blacklist'?'perma banned':'banned')+'</span>':''
 var authHtml=b.authFailed?'<span class="manual-badge" style="color:var(--red);border-color:rgba(248,113,113,.45)">🔑 '+b.authKind+'</span>':''
 var viewerHtml=b.manual&&b.manual.viewerPort?'<button class="manual-viewer" type="button" data-port="'+String(b.manual.viewerPort)+'">🌐 viewer</button>':''
 var cfHtml=b.coinflip?'<span class="manual-badge" style="color:var(--cyan);border-color:rgba(103,232,249,.4)">🎲 '+b.coinflip.flips+'/'+b.coinflip.planned+'</span>':''
-var offlineHtml = !b.online && !b.connecting ? '<span class="manual-badge" style="color:var(--red)">disconnected</span>' : ''
+var offlineHtml = !b.online && !b.connecting && !b.deathbanned ? '<span class="manual-badge" style="color:var(--red)">disconnected</span>' : ''
 var connectingHtml = b.connecting ? '<span class="manual-badge" style="color:var(--yellow);border-color:rgba(255,200,0,.4)">⏳ connecting</span>' : ''
 d.innerHTML='<div class="bhead"><div class="dot"></div><div class="bname"></div>'+bannedHtml+authHtml+cfHtml+manualHtml+guiHtml+viewerHtml+connectingHtml+offlineHtml+(b.attempts?'<div class="batt">↻'+b.attempts+'</div>':'')+'</div>'
 +'<div class="bmeta"><span>'+(b.ping==null?'—':b.ping)+'ms</span><span>'+(b.health==null?'—':b.health)+'❤</span><span>'+(b.food==null?'—':b.food)+'🍗</span>'+(up?'<span>'+up+'</span>':'')+'</div>'
 +'<div class="bmeta" title="Observed positive balance changes, estimated over the last minute; spending between probes can hide production. A dash means warming up, stale, or offline."><span>shards '+(b.shards==null?'—':Number(b.shards).toLocaleString())+'</span><span>≈ '+(b.shardsPerMinute==null?'—':Number(b.shardsPerMinute).toFixed(1))+' shards/min</span></div>'
 +'<canvas width="220" height="16"></canvas>'
-d.querySelector('.bname').textContent=(b.removed?'[removed] ':'['+(b.number||i+1)+'] ')+b.id
-if(b.banned)d.title='Banned'+(b.banKind?' ('+b.banKind+')':'')+(b.kick?' — '+b.kick:'')
+d.querySelector('.bname').textContent=(b.deathbanned?'[deathbanned] ':b.removed?'[removed] ':'['+(b.number||idx+1)+'] ')+b.id
+if(b.deathbanned)d.title='Deathbanned'+(b.kick?' — '+b.kick:'')
+else if(b.banned)d.title='Banned'+(b.banKind?' ('+b.banKind+')':'')+(b.kick?' — '+b.kick:'')
 else if(b.authFailed)d.title='Login rejected: '+b.authReason+' — fix the password and run /auth-retry '+b.id
 else if(b.coinflip)d.title='Coinflip run: '+b.coinflip.flips+' of '+b.coinflip.planned+' flips, net '+(b.coinflip.net>=0?'+':'')+b.coinflip.net+' — '+b.coinflip.stopped
 else if(b.disconnectReason)d.title='Disconnected'+(b.disconnectedAt?' at '+new Date(b.disconnectedAt).toISOString():'')+' — '+b.disconnectReason
 else if(b.kick)d.title=b.kick
 else if(b.connecting)d.title='Connecting to server...'
 if(!b.removed)d.onclick=(function(id){return function(){setView(id)}})(b.id)
-else d.title+=' — on removed list; /unban '+b.id+' restores it. Audit: /api/evidence?bot='+encodeURIComponent(b.id)
+else d.title+=' — '+(b.deathbanned?'deathbanned (closed, do not reconnect)':'on removed list; /unban '+b.id+' restores it')+'. Audit: /api/evidence?bot='+encodeURIComponent(b.id)
 var viewerButton=d.querySelector('.manual-viewer')
 if(viewerButton)viewerButton.onclick=(function(port){return function(e){e.preventDefault();e.stopPropagation();window.open('http://'+location.hostname+':'+port+'/','_blank','noopener')}})(b.manual.viewerHostPort||b.manual.viewerPort)
 box.appendChild(d)
 drawSpark(d.querySelector('canvas'),b.pingHist||[])}
+for(var rIdx=0;rIdx<regular.length;rIdx++)appendBotCard(regular[rIdx],rIdx)
+if(deathbannedList.length){
+var hdr=document.createElement('div');hdr.style.cssText='color:var(--red);font-size:10px;text-transform:uppercase;letter-spacing:.6px;padding:8px 4px 4px;border-top:1px solid var(--line);margin-top:6px;font-weight:700';hdr.textContent='Offline Death Banned Bots ('+deathbannedList.length+')';box.appendChild(hdr)
+for(var dIdx=0;dIdx<deathbannedList.length;dIdx++)appendBotCard(deathbannedList[dIdx],dIdx)}
 updateManualBar()
 updateGuiTui()
 var selected=botStates[view]
@@ -3491,7 +3692,11 @@ function detectTpaRequester (text) {
 }
 
 function isTrustedTpaName (name) {
-  return TPA_TRUSTED_BOTS.some(trusted => trusted.toLowerCase() === String(name || '').toLowerCase())
+  const lower = String(name || '').toLowerCase()
+  if (!lower) return false
+  if (TPA_MAIN_PLAYER && TPA_MAIN_PLAYER.toLowerCase() === lower) return true
+  if (Object.keys(bots).some(id => id.toLowerCase() === lower)) return true
+  return TPA_TRUSTED_BOTS.some(trusted => trusted.toLowerCase() === lower)
 }
 
 function createBotInstance(username, host, port, version) {
@@ -4145,6 +4350,7 @@ bot.on('messagestr', (text) => { try { lifestealQueue.onMessage(id, String(text 
 
 bot.on('death', () => {
   try { lifestealQueue.onDeath(id) } catch (_) {}
+  stopFreeForAll(id, true)
   cancelPendingRtp(id)
   recordEvidence(id, 'deaths', { source: 'mineflayer:death', position: botLocation(bot), reason: 'Death observed; killer/cause unknown unless the server supplies a death message.', recentServerMessages: (bots[id]?.chatHistory || []).slice(-5) })
   spawnerDrop.stop(id, 'death')
@@ -4156,7 +4362,9 @@ if (bot._client) bot._client.on('death_combat_event', packet => {
 
 bot.on('kicked', (reason) => {
 if (bots[id]?.bot !== bot) return
+stopFreeForAll(id, true)
 try { lifestealQueue.onKick(id, typeof reason === 'string' ? reason : JSON.stringify(reason)) } catch (_) {}
+if (!bots[id]) return
 cancelPendingRtp(id)
 let text
 try { text = typeof reason === 'string' ? reason : JSON.stringify(reason) } catch (_) { text = 'unknown' }
@@ -4296,6 +4504,7 @@ bot.on('end', (reason) => {
 const connectedBeforeEnd = connected
 connected = false
 if (bots[id]?.bot !== bot) return
+stopFreeForAll(id, true)
 entry.connectionState = 'disconnected'
 cancelPendingRtp(id)
 entry.disconnectedAt = Date.now()
@@ -4343,6 +4552,7 @@ lastRawError = null
 
 bots[id].disconnectManually = () => {
 manualDisconnect = true
+stopFreeForAll(id, true)
 rtpRoaming.stop(id)
 
 try { manual.stopManualMode(id) } catch (_) {}
@@ -4491,9 +4701,12 @@ const COMMANDS = {
 '/doc [topic]': 'Built-in documentation: /doc lists the topics (dump grammar, hidden dump, crates chain, settings, API, troubleshooting) and /doc <topic> opens one. The web GUI shows the same docs, searchable, in its 📚 docs panel',
 '/help': 'List all available commands',
 '/repeat [n|duration] [delay] <cmd>': `Re-run a command n times (default 1, max 50) or for a duration (e.g. /repeat 30s /spawners), leaving ${settings.get('REPEAT_DELAY_MS')}ms between runs (REPEAT_DELAY_MS) so a repeat takes time instead of machine-gunning the server. An explicit delay token overrides the gap for that run: /repeat 5 30s /spawners (5 runs, 30s apart), /repeat 30s 2s /spawners (every 2s for 30s). With no command given, repeats the previous command from history. /repeat stop cancels the runs still pending. /all-slow is not affected — it is a separate command with its own staggered dispatch.`,
+'/repeat-cancel': 'Cancel EVERY pending /repeat run in every tab/context — the blunt version of /repeat stop (which only cancels the runs the current tab scheduled)',
 '/status': 'Show active bot\'s connection, position, health, ping, uptime',
 '/inv': 'List active bot\'s inventory',
 '/tpauto on|off': 'Toggle automatic /tpaccept for trusted bot names only',
+'/freeforall [on|off|stop]': 'Stationary combat loop: aim and hit nearby targets with the best weapon in inventory (never shields, no moving, no block breaking)',
+'/new-gen-maintain [botnumber|stop|status]': 'Maintain the fleet at <botnumber> usable bots (default 25) via /new-gen without removing bots',
 '/find <name> ["name" …]': 'Search EVERY bot\'s inventory and open window for an item by display, custom, registry name, or NBT text — multiple quoted terms are OR\'d (same matching as /dump filters)',
   '/use-book [name]': `Scan the open GUI (or, with none open, the inventory) for a book, swap it into hotbar slot 1, select it and run /use && /use — every step ${settings.get('BOOK_USE_DELAY_MS')}ms apart (BOOK_USE_DELAY_MS) so the server is never spammed. [name] overrides the scan term (default "${settings.get('BOOK_ITEM_QUERY')}"). /use-book auto on|off (BOOK_AUTO) runs it automatically whenever a GUI opens with a book in it — no book in the GUI, nothing happens`,
   '/copy [name]': 'Everything about the held item — the exact name with unicode intact (clean, and raw with colour codes), registry name, type, count, slot, enchants, lore and NBT — printed AND copied to the clipboard. /copy name copies just the name',
@@ -4528,7 +4741,7 @@ const COMMANDS = {
 '/drop [count]': 'Drop the held stack (all of it, or [count] items from it)',
 '/pickup [all]': 'Walk to the nearest dropped item and collect it; /pickup all sweeps everything within reach',
 '/gui <cmd>': 'Send a server command (e.g. /gui /shardshop) and treat the GUI it opens as manual — no auto scan/click or warp',
-'/gui-tui': 'Toggle the ASCII GUI overlay on the dashboard for the open window (click a slot to interact, right-click for right button)',
+'/gui-tui': 'Toggle the ASCII GUI overlay on the dashboard (click a slot to interact, right-click for right button). Works with NO window open — then it shows the player inventory instead',
 '/walk <x|~dx> <y|~dy> <z|~dz> [range]': 'Pathfind near absolute or current-position-relative coordinates (range defaults to 1, capped at 16); /walk stop cancels',
 '/look <yaw> <pitch>': 'Turn the bot using yaw/pitch in degrees',
 '/lookat <x> <y> <z>': 'Turn the bot toward world coordinates',
@@ -4551,6 +4764,7 @@ const COMMANDS = {
 'anything else': 'Sent directly as a chat message/command from the active bot',
 '/dump [home|hidden|cancel] ["term" …] [shulker|chest] [shulker color]': 'Dump inventory: TPA to the configured main player (or /home stash, or the hidden fleet chain). Optional quoted terms filter WHAT is deposited (names + NBT, OR\'d, case-insensitive — "netherite" finds a renamed Fatal Chestplate); shulker/chest restrict WHICH containers are used and a shulker color (e.g. yellow) narrows shulker boxes. Examples: /dump "fatal" shulker yellow · /dump "fatal" "enchanted" shulker chest · /dump hidden "sword"',
 '/dump-spawners': 'Same as /dump, but only transfers SPAWNERS into the chests (everything else stays in the inventory)',
+'/dump-gui-look "term" [shulker|chest|shulker,chest] [shulker color]': '/dump\'s matching + container scan extracted for local storage: find the quoted term(s) in the inventory (no term = everything) and deposit into the nearby storage containers whose type matches — comma-separated shulker/chest accepted (e.g. /dump-gui-look "netherite" shulker,chest); no container type = any storage container. No TPA and no warp — the bot walks to each container it finds. Examples: /dump-gui-look "netherite" shulker · /dump-gui-look',
 '/ai-chat [start|stop|status|models|model-set] [bot]': 'AI chat for a bot — every 40-150 seconds the FreeLLM API answers the last 5 chat messages the bot saw, and only the message inside its double quotes is sent (verified first: cleaned up, word-limited, never starting with / or ., never an echo of a recent chat line, never a persona refusal). No prerecorded fallback — a turn that produces nothing verifiable is skipped and reported. \`models\` lists the API\'s models, \`model-set <model>\` picks one (AI_CHAT_MODEL, applies live). Requires FREE_LLM_API_KEY and FREE_LLM_BASE_URL'
 }
 
@@ -4661,8 +4875,13 @@ if (bots[id]?.rtpRunning) { logFor(id, '{yellow-fg}⚠ Stop roaming before dumpi
 const spawnersOnly = Boolean(options.spawnersOnly)
 const useHome = Boolean(options.home)
 const skipWarp = Boolean(options.skipWarp)
+// /dump-gui-look: the same matching + container scan + deposit loop, but
+// depositing into containers found near the bot — no /tpa, no teleport wait,
+// no AFK warp, and each container is walked up to before opening.
+const skipTpa = Boolean(options.skipTpa)
+const walkToContainers = Boolean(options.walk)
 const filter = normalizeDumpFilter(options.filter)
-const label = spawnersOnly ? '/dump-spawners' : '/dump'
+const label = options.label || (spawnersOnly ? '/dump-spawners' : '/dump')
 if (bots[id]) bots[id].dumpCancelRequested = false
 if (bots[id]?.dumpOperationActive) {
   logFor(id, `{yellow-fg}⚠ ${label}: a dump is already running for this bot.{/yellow-fg}`)
@@ -4672,7 +4891,7 @@ if (bots[id]?.dumpOperationActive) {
 // and the delayed AFK warp) while dumping — /dump opens chests only to
 // deposit into them, and none of that automation may run on them.
 if (bots[id]) bots[id].inDumpRoutine = true
-try { evidenceStore.startDump(id, { command: label, mode: useHome ? 'home' : options.target ? 'target' : 'tpa', filter, position: botLocation(bot) }) } catch (err) { logFor(id, `{red-fg}✗ Evidence save failed: ${sanitize(err.message)}{/red-fg}`) }
+try { evidenceStore.startDump(id, { command: label, mode: skipTpa ? 'local' : useHome ? 'home' : options.target ? 'target' : 'tpa', filter, position: botLocation(bot) }) } catch (err) { logFor(id, `{red-fg}✗ Evidence save failed: ${sanitize(err.message)}{/red-fg}`) }
 try {
 
 if (bots[id]) bots[id].dumpOperationActive = true
@@ -4715,6 +4934,10 @@ if (filterDesc) logFor(id, `{cyan-fg}› ${label}: ${filterDesc}.{/cyan-fg}`)
 const tpaTarget = options.target || TPA_MAIN_PLAYER
 const scanRadius = CHEST_SCAN_RADIUS
 
+if (skipTpa) {
+// No teleport happens: the containers are looked up right where the bot stands.
+logFor(id, `{cyan-fg}› ${label}: looking for containers near the bot…{/cyan-fg}`)
+} else {
 if (useHome) {
   bot.chat(DUMP_HOME_COMMAND)
   logFor(id, `{cyan-fg}› Sent ${DUMP_HOME_COMMAND}. Waiting for teleport...{/cyan-fg}`)
@@ -4748,6 +4971,7 @@ logFor(id, `{cyan-fg}› Teleport detected! Looking for chests...{/cyan-fg}`)
 await new Promise(r => setTimeout(r, DUMP_SETTLE_MS))
 } catch (err) {
 logFor(id, `{yellow-fg}⚠ ${err.message}. Looking for chests nearby anyway...{/yellow-fg}`)
+}
 }
 
 if (!botOnline(bots[id]) || bots[id]?.dumpCancelRequested) {
@@ -4797,6 +5021,15 @@ const chestBlock = bot.blockAt(chestPos)
 if (!chestBlock) {
   logFor(id, `{yellow-fg}⚠ ${label}: the chest at ${chestPos.x}, ${chestPos.y}, ${chestPos.z} is not loaded — skipping it.{/yellow-fg}`)
   continue
+}
+if (walkToContainers) {
+  // Containers the scan finds are often just out of reach — walk up to each
+  // one before opening it (same helper /crates uses to approach its shulker).
+  const reached = await walkToBlock(bot, chestPos, { reach: 4.5, timeoutMs: DUMP_OPEN_TIMEOUT_MS })
+  if (!reached) {
+    logFor(id, `{yellow-fg}⚠ ${label}: could not reach the container at ${chestPos.x}, ${chestPos.y}, ${chestPos.z} — skipping it.{/yellow-fg}`)
+    continue
+  }
 }
 let chestContainer
 let chestMoved = 0
@@ -4889,9 +5122,9 @@ if (remaining.length === 0) {
 }
 }
 
+if (!skipWarp) {
 await new Promise(r => setTimeout(r, DUMP_WARP_DELAY_MS))
 if (!bot.entity || bots[id]?.dumpCancelRequested) return
-if (!skipWarp) {
   logFor(id, `{cyan-fg}› Warping back to AFK…{/cyan-fg}`)
   try { bot.chat(WARP_AFK) } catch (_) {}
 }
@@ -4986,13 +5219,12 @@ function startHiddenDump (options = {}) {
 }
 
 function runLocalCommandForBot(id, cmd) {
-if (bots[id]?.rtpRunning && !/^\/(?:status|connection|coordinates|evidence|clear|inv|players|dc|disconnect|closeBot|reconnect)(?:\s|$)/.test(cmd)) { logFor(id, '{yellow-fg}⚠ Stop roaming before starting another routine.{/yellow-fg}'); return }
+if (bots[id]?.rtpRunning && !/^\/(?:tpauto|freeforall|status|connection|coordinates|evidence|clear|inv|players|dc|disconnect|closeBot|reconnect)(?:\s|$)/.test(cmd)) { logFor(id, '{yellow-fg}⚠ Stop roaming before starting another routine.{/yellow-fg}'); return }
 const entry = bots[id]
-if (!entry) return false
-const { bot } = entry
-
 const parts = String(cmd || '').trim().split(/\s+/)
 const baseCmd = parts[0]
+if (!entry && !['/lifesteal-start', '/lifesteal-stop', '/lifesteal-status', '/new-gen-maintain', '/tpa-roundrobin', '/duelsroomspam', '/queuespam', '/warp-arena', '/afk-park', '/scripts'].includes(baseCmd)) return false
+const { bot } = entry || {}
 
 switch (baseCmd) {
 case '/tpauto': {
@@ -5003,6 +5235,23 @@ case '/tpauto': {
   }
   entry.tpautoEnabled = mode === 'on'
   logFor(id, `{green-fg}✓ TPA auto ${entry.tpautoEnabled ? 'enabled' : 'disabled'}; trusted names only.{/green-fg}`)
+  return true
+}
+case '/freeforall': {
+  const mode = (parts[1] || '').toLowerCase()
+  if (mode === 'stop' || mode === 'off') {
+    if (!stopFreeForAll(id)) logFor(id, '{yellow-fg}⚠ Free-for-all is not running on this bot.{/yellow-fg}')
+    return true
+  }
+  if (mode && mode !== 'on' && mode !== 'start') {
+    logFor(id, `{yellow-fg}⚠ Usage: /freeforall [on|off|stop] (currently ${entry.freeForAllRunning ? 'running' : 'stopped'}).{/yellow-fg}`)
+    return true
+  }
+  if (!mode && entry.freeForAllRunning) {
+    stopFreeForAll(id)
+    return true
+  }
+  startFreeForAll(id)
   return true
 }
 case '/connection': {
@@ -5056,9 +5305,32 @@ case '/lifesteal-status': {
   const s = lifestealQueue.status()
   const fmtRole = (role) => (s.roles[role] && s.roles[role].length) ? s.roles[role].join(',') : '-'
   const mode = s.running ? (s.solo ? `SOLO ${s.solo.role}` : 'RUNNING') : 'stopped'
-  logFor(id, `{cyan-fg}› Lifesteal ${mode} — online ${s.online}/${s.total} (target ${s.cfg.targetBots}) | duels=${sanitize(fmtRole('duels'))} queue=${sanitize(fmtRole('queue'))} arena=${sanitize(fmtRole('arena'))} tpa=${sanitize(fmtRole('tpa'))}{/cyan-fg}`)
+  logFor(id, `{cyan-fg}› Lifesteal ${mode} — online ${s.online}/${s.total} (target ${s.cfg.targetBots}${s.maintainRunning ? `, maintain=${s.maintainTarget}` : ''}) | duels=${sanitize(fmtRole('duels'))} queue=${sanitize(fmtRole('queue'))} arena=${sanitize(fmtRole('arena'))} tpa=${sanitize(fmtRole('tpa'))}{/cyan-fg}`)
   logFor(id, `{cyan-fg}  role counts (live): duels=${s.cfg.duelsBots} queue=${s.cfg.queueBots} arena=${s.cfg.arenaBots} tpa=${s.cfg.tpaBots} — LIFESTEAL_*_BOTS, 0 disables{/cyan-fg}`)
-  if (s.deathbanned.length) logFor(id, `{yellow-fg}⚠ Deathbanned (${s.deathbanned.length}): ${sanitize(s.deathbanned.map(d => d.bot).join(', '))}{/yellow-fg}`)
+  const dbList = [...new Set([...s.deathbanned.map(d => d.bot), ...(deathbannedBots.bots || []).map(d => d.bot)])]
+  if (dbList.length) logFor(id, `{yellow-fg}⚠ Offline deathbanned (${dbList.length}): ${sanitize(dbList.join(', '))}{/yellow-fg}`)
+  return true
+}
+case '/new-gen-maintain': {
+  const arg = (parts[1] || '').toLowerCase()
+  if (arg === 'stop' || arg === 'off') {
+    const r = lifestealQueue.stopMaintain()
+    logFor(id, r.ok ? '{green-fg}✓ /new-gen-maintain stopped.{/green-fg}' : `{yellow-fg}⚠ ${sanitize(r.error || 'not running')}{/yellow-fg}`)
+    return true
+  }
+  if (arg === 'status') {
+    const s = lifestealQueue.status()
+    logFor(id, `{cyan-fg}› /new-gen-maintain ${s.maintainRunning ? `RUNNING (target ${s.maintainTarget} bots)` : 'stopped'} — online ${s.online}/${s.total}{/cyan-fg}`)
+    return true
+  }
+  const n = arg ? Number.parseInt(arg, 10) : 25
+  if (!Number.isFinite(n) || n < 1) {
+    logFor(id, '{yellow-fg}⚠ Usage: /new-gen-maintain <botnumber> | stop | status{/yellow-fg}')
+    return true
+  }
+  settings.set('LIFESTEAL_TARGET_BOTS', String(n))
+  const r = lifestealQueue.startMaintain(n)
+  logFor(id, `{green-fg}✓ /new-gen-maintain active: maintaining ${r.targetBots} usable bots via /new-gen (no moving, no block breaking).{/green-fg}`)
   return true
 }
 case '/tpa-roundrobin': return lifestealSoloCommand(id, 'tpa', parts, '/tpa-roundrobin')
@@ -5124,6 +5396,18 @@ return tpaAndDump(bot, id, { filter })
 case '/dump-spawners': {
 if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
 return tpaAndDump(bot, id, { spawnersOnly: true })
+}
+case '/dump-gui-look': {
+// /dump's matching + container scan extracted for local storage: look through
+// the inventory for items matching the quoted term(s) (no term = everything),
+// then deposit them into the nearby storage containers whose type matches —
+// comma-separated shulker/chest (e.g. shulker,chest); no type = any container.
+const parsed = parseDumpArgs(String(cmd || '').trim().slice('/dump-gui-look'.length))
+if (parsed.mode !== 'tpa') logFor(id, `{yellow-fg}⚠ /dump-gui-look ignores "${sanitize(parsed.mode)}" — it always dumps into containers near the bot.{/yellow-fg}`)
+if (parsed.unknown.length) logFor(id, `{yellow-fg}⚠ Unknown /dump-gui-look option "${sanitize(parsed.unknown[0])}" — ignored. Keywords: shulker, chest (commas fine), or a shulker color; "quoted words" filter item names.{/yellow-fg}`)
+if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
+const filter = { terms: parsed.terms, types: parsed.types, colors: parsed.colors }
+return tpaAndDump(bot, id, { filter, skipTpa: true, walk: true, skipWarp: true, label: '/dump-gui-look' })
 }
 case '/players': {
 if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
@@ -7443,7 +7727,7 @@ else { cancelPendingRtp(id); rtpRoaming.stop(id) }
 }
 return
 }
-if (activeId && bots[activeId]?.rtpRunning && /^\/(?:crates|crates-loop|crates-solo|dump|dump-spawners|spawners|spawner-drop|manual-interact|manual|use-book|ege|enchanted-golden-apple-extract|shardshop-loop|ai-chat|bot-coinflip|walk)(?:\s|$)/.test(trimmed)) {
+if (activeId && bots[activeId]?.rtpRunning && /^\/(?:crates|crates-loop|crates-solo|dump|dump-spawners|dump-gui-look|spawners|spawner-drop|manual-interact|manual|use-book|ege|enchanted-golden-apple-extract|shardshop-loop|ai-chat|bot-coinflip|walk)(?:\s|$)/.test(trimmed)) {
 logWarn('Stop roaming with /stop-rtp before starting another routine on this bot.')
 return
 }
@@ -7455,6 +7739,21 @@ const dangerEffect = destructiveCommandEffect(trimmed)
 if (dangerEffect && !dangerConfirm.confirm(trimmed)) {
   logWarn(`⚠ WARNING! DO NOT RUN ${sanitize(trimmed)} — it ${dangerEffect}. Repeat the command 1 more time if you want to (within ${Math.round(DANGER_CONFIRM_MS / 1000)}s). WARNING!`)
   return
+}
+
+// ── /repeat-cancel ─────────────────────────────────────────────────────────
+// The blunt stop: every pending /repeat run in EVERY scheduling context (each
+// web tab has its own), so "cancel all /repeat jobs" really means all of them.
+// (/repeat stop only cancels the runs scheduled by the current context.)
+if (/^\/repeat-cancel(?:\s|$)/i.test(trimmed)) {
+let cancelled = 0
+for (const pending of repeatTimers.values()) {
+  pending.forEach(t => { clearTimeout(t); cancelled++ })
+}
+repeatTimers.clear()
+if (cancelled) logSuccess(`Cancelled ${cancelled} pending /repeat run(s) across all tabs.`)
+else logWarn('No /repeat runs are pending.')
+return
 }
 
 // ── /repeat [n|duration] [delay] <command> ─────────────────────────────────
@@ -7964,9 +8263,13 @@ return
 if (trimmed === '/unban' || trimmed.startsWith('/unban ')) {
 const target = trimmed.slice('/unban'.length).trim()
 if (!target) { logWarn('Usage: /unban <bot name> — /removed lists them'); return }
-const restored = removedBotsStore.removeRemovedBot(removedBots, target)
-if (!restored) { logWarn(`"${sanitize(target)}" is not on the removed list. Run /removed to see it.`); return }
-persistRemovedBots()
+const restoredRemoved = removedBotsStore.removeRemovedBot(removedBots, target)
+const restoredDeathban = removedBotsStore.removeRemovedBot(deathbannedBots, target)
+const restored = restoredRemoved || restoredDeathban
+if (!restored) { logWarn(`"${sanitize(target)}" is not on the removed or deathbanned list. Run /removed or /list to see it.`); return }
+if (restoredRemoved) persistRemovedBots()
+if (restoredDeathban) persistDeathbannedBots()
+try { lifestealQueue._state?.deathbanned?.delete?.(restored.bot) } catch (_) {}
 // Clear the hold as well, or the next reconnect would just be held again.
 dataStore.upsertBot(dataState, { bot: restored.bot, banned: false, bannedAt: null, banKind: null, banReason: null, banExpiresAt: 0 })
 persistData()
@@ -8019,6 +8322,13 @@ const kick = b?.lastKickReason ? ` — last kick: ${sanitize(b.lastKickReason).s
 log(` [${idx + 1}] {cyan-fg}${name}{/cyan-fg} {red-fg}○ Offline{/red-fg}${ban}${authFail}${kick}`)
 }
 })
+const dbEntries = (deathbannedBots.bots || []).filter(row => !Object.hasOwn(bots, row.bot))
+if (dbEntries.length) {
+logInfo(`{bold}── Offline Death Banned Bots (${dbEntries.length}) ──{/bold}`)
+dbEntries.forEach((row, idx) => {
+log(` [D${idx + 1}] {red-fg}${sanitize(row.bot)}{/red-fg} {red-fg}💀 Deathbanned (closed){/red-fg}${row.reason ? ` — ${sanitize(row.reason).slice(0, 80)}` : ''}`)
+})
+}
 return
 }
 
@@ -8869,8 +9179,16 @@ try {
 }
 
 // ── Single-bot local commands ───────────────
-if (activeId && LOCAL_COMMANDS.includes(trimmed.split(/\s+/)[0])) {
+if (LOCAL_COMMANDS.includes(trimmed.split(/\s+/)[0])) {
+const cmdVerb = trimmed.split(/\s+/)[0]
+if (!activeId && ['/lifesteal-start', '/lifesteal-stop', '/lifesteal-status', '/new-gen-maintain', '/tpa-roundrobin', '/duelsroomspam', '/queuespam', '/warp-arena', '/afk-park', '/scripts'].includes(cmdVerb)) {
+return runLocalCommandForBot(SYSTEM_ID, trimmed)
+}
+if (activeId) {
 return runLocalCommandForBot(activeId, trimmed)
+}
+logWarn('No active bot.')
+return
 }
 
 switch (trimmed) {
