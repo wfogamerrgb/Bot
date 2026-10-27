@@ -1000,7 +1000,11 @@ const SYSTEM_ID = '__system__'
 const systemLogs = [] // mirrors a bots[id].logs array, for messages with no associated bot
 const bots = Object.create(null) // username → { bot, spawnTime, logs[], host, port, version, reconnectAttempts, … }
 const pearlStasis = createPearlStasis({ getBots: () => bots, logFor })
-const shardTracker = createShardTracker()
+// The rate window must outlast a full sampling round plus a skipped cycle:
+// with a 60s window and a >60s round, most bots aged out before their next
+// probe and the fleet total only counted whichever bots were inside the
+// window at that instant ("≈ 39.6 (37 sampled)" out of a 179-bot roster).
+const shardTracker = createShardTracker({ windowMs: 180000, maxGapMs: 300000 })
 const proxyReconnectSlots = new Map() // pace retries sharing the same outbound proxy
 let activeId = null
 function currentActiveId() { return activeId } // read the global from inside handleCommand's shadowed scope
@@ -2681,7 +2685,7 @@ var offlineHtml = !b.online && !b.connecting && !b.deathbanned ? '<span class="m
 var connectingHtml = b.connecting ? '<span class="manual-badge" style="color:var(--yellow);border-color:rgba(255,200,0,.4)">⏳ connecting</span>' : ''
 d.innerHTML='<div class="bhead"><div class="dot"></div><div class="bname"></div>'+bannedHtml+authHtml+cfHtml+manualHtml+guiHtml+viewerHtml+connectingHtml+offlineHtml+(b.attempts?'<div class="batt">↻'+b.attempts+'</div>':'')+'</div>'
 +'<div class="bmeta"><span>'+(b.ping==null?'—':b.ping)+'ms</span><span>'+(b.health==null?'—':b.health)+'❤</span><span>'+(b.food==null?'—':b.food)+'🍗</span>'+(up?'<span>'+up+'</span>':'')+'</div>'
-+'<div class="bmeta" title="Observed positive balance changes, estimated over the last minute; spending between probes can hide production. A dash means warming up, stale, or offline."><span>shards '+(b.shards==null?'—':Number(b.shards).toLocaleString())+'</span><span>≈ '+(b.shardsPerMinute==null?'—':Number(b.shardsPerMinute).toFixed(1))+' shards/min</span></div>'
++'<div class="bmeta" title="Observed positive balance changes, estimated per minute over the last 3 minutes of probes; spending between probes can hide production. A dash means warming up, stale, or offline."><span>shards '+(b.shards==null?'—':Number(b.shards).toLocaleString())+'</span><span>≈ '+(b.shardsPerMinute==null?'—':Number(b.shardsPerMinute).toFixed(1))+' shards/min</span></div>'
 +'<canvas width="220" height="16"></canvas>'
 d.querySelector('.bname').textContent=(b.deathbanned?'[deathbanned] ':b.removed?'[removed] ':'['+(b.number||idx+1)+'] ')+b.id
 if(b.deathbanned)d.title='Deathbanned'+(b.kick?' — '+b.kick:'')
@@ -7299,14 +7303,23 @@ function startTimeseriesSampler () {
   logFor(SYSTEM_ID, `{cyan-fg}› Time-series sampling every ${cfDuration(intervalMs)} → ${TIMESERIES_FILE}${rankText}{/cyan-fg}`)
 }
 
-// Probe one idle bot at a time, spread over each sampling interval. This is
-// independent of the hourly analytics sampler, and never adds traffic while a
-// bot is using crates, shardshop, coinflip, admission, or manual GUIs.
+// Probe idle bots spread over each sampling interval. This is independent of
+// the hourly analytics sampler, and never adds traffic while a bot is using
+// crates, shardshop, coinflip, admission, or manual GUIs.
+//
+// Throughput is the whole game: the roster must be probed INSIDE one sampling
+// interval or the rate window ages most bots out and "N sampled" counts a
+// fraction of the fleet. The old serial loop ran one probe at a time on a 1s
+// tick with a 1s pacing floor — 1 probe/s, so a 179-bot round took ~3 minutes.
+// Probes are now paced at interval/N with a small floor and run
+// bounded-parallel; each result still feeds the tracker via
+// recordTimeseriesSample, unchanged.
+const SHARD_MAX_IN_FLIGHT = 8
 let shardSampleCursor = 0
-let shardSampleBusy = false
+let shardProbesInFlight = 0
 let shardNextProbeAt = 0
-async function sampleNextShardBalance (now = Date.now()) {
-if (shardSampleBusy || timeseriesSampling || now < shardNextProbeAt) return false
+function sampleNextShardBalance (now = Date.now()) {
+if (timeseriesSampling || now < shardNextProbeAt || shardProbesInFlight >= SHARD_MAX_IN_FLIGHT) return false
 const ids = Object.keys(bots)
 if (!ids.length) return false
 const interval = settings.get('SHARD_SAMPLE_INTERVAL_MS')
@@ -7314,24 +7327,27 @@ for (let i = 0; i < ids.length; i++) {
   const id = ids[shardSampleCursor++ % ids.length]
   const entry = bots[id]
   if (!botOnline(entry) || roamBusy(entry) || entry.rtpRunning || entry.shardProbeAt && now - entry.shardProbeAt < interval) continue
-  shardSampleBusy = true
   entry.shardProbeAt = now
-  shardNextProbeAt = now + Math.max(1000, Math.floor(interval / ids.length))
-  try {
-    const balance = await queryBalance(id, 'Shards', '/shards')
+  shardNextProbeAt = now + Math.max(250, Math.floor(interval / ids.length))
+  shardProbesInFlight++
+  queryBalance(id, 'Shards', '/shards').then(balance => {
     if (bots[id] === entry && botOnline(entry) && !roamBusy(entry) && balance != null) {
       recordTimeseriesSample(id, { shards: balance }, 'shard-rate')
       notifyBotsChanged()
     }
-    return balance != null
-  } finally { shardSampleBusy = false }
+  }).catch(err => logFor(SYSTEM_ID, `{yellow-fg}⚠ Shard sampling failed: ${sanitize(err.message)}{/yellow-fg}`))
+    .finally(() => { shardProbesInFlight-- })
+  return true
 }
 return false
 }
 function startShardSampler () {
+  // Tick faster than the pacing floor so interval/N actually binds: on a 1s
+  // tick the fleet could never exceed one probe per second however fast the
+  // probes answered.
   const timer = setInterval(() => {
-    sampleNextShardBalance().catch(err => logFor(SYSTEM_ID, `{yellow-fg}⚠ Shard sampling failed: ${sanitize(err.message)}{/yellow-fg}`))
-  }, 1000)
+    try { sampleNextShardBalance() } catch (err) { logFor(SYSTEM_ID, `{yellow-fg}⚠ Shard sampling failed: ${sanitize(err.message)}{/yellow-fg}`) }
+  }, 250)
   timer.unref?.()
 }
 

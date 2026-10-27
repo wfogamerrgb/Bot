@@ -4,7 +4,49 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { readDelayMs, readInt, readNumber, parseDumpMode, parseDataArgs, parseCratesAllDump, parseCratesAllAfk, parseCratesAllFlags, shuffledCopy, createSlowBroadcast, createSlowBroadcastManager, parseChatGameRange, parseChatGameEquation, isChatGameEnd, createChatGameManager, parseProxyGroups, resolveBotProxy, hasProxyAuth, proxyAuthHeader, buildHttpConnectRequest, describeProxy, resolveLoginPassword, resolveFallbackPassword, parseBotPasswords, classifyAuthReply, nextAuthFailure, isAuthBlocked, findIgnoredProxyGroupVars, destructiveCommandEffect, createCommandConfirmation, parseItemGlobs, itemMatchesGlobs, parseRewardSlots, parseScript, parseScriptLine, selectScriptBots, listBotScripts, loadBotScript, parseTorControlPorts, deriveTorControlPorts, deriveTorControlTargets, resolveTorScope, sendTorSignal, commandSuggestions } = require('../bot-controls')
+const { readDelayMs, readInt, readNumber, parseDumpMode, parseDataArgs, parseCratesAllDump, parseCratesAllAfk, parseCratesAllFlags, shuffledCopy, createSlowBroadcast, createSlowBroadcastManager, parseChatGameRange, parseChatGameEquation, isChatGameEnd, createChatGameManager, parseProxyGroups, resolveBotProxy, hasProxyAuth, proxyAuthHeader, buildHttpConnectRequest, describeProxy, resolveLoginPassword, resolveFallbackPassword, parseBotPasswords, classifyAuthReply, nextAuthFailure, isAuthBlocked, findIgnoredProxyGroupVars, destructiveCommandEffect, createCommandConfirmation, parseItemGlobs, itemMatchesGlobs, parseRewardSlots, parseScript, parseScriptLine, selectScriptBots, listBotScripts, loadBotScript, parseTorControlPorts, deriveTorControlPorts, deriveTorControlTargets, resolveTorScope, sendTorSignal, commandSuggestions, createShardTracker, parseShardBalance } = require('../bot-controls')
+
+test('shard tracker estimates a per-minute rate over a sparse probe window', () => {
+  const tracker = createShardTracker({ windowMs: 180000, maxGapMs: 300000 })
+  const t0 = 1000000
+  tracker.observe('A', 100, t0)
+  tracker.observe('A', 400, t0 + 120000) // +300 over two minutes = 150/min
+  const snap = tracker.snapshot('A', t0 + 150000)
+  assert.ok(snap.shardsPerMinute != null, 'a probe gap wider than the old 60s window must still produce a rate')
+  assert.ok(Math.abs(snap.shardsPerMinute - 150) < 1, `rate ${snap.shardsPerMinute} ≈ 150/min`)
+  assert.equal(snap.shards, 400)
+})
+
+test('shard tracker rate goes quiet once probes stop and never invents gains', () => {
+  const tracker = createShardTracker({ windowMs: 180000, maxGapMs: 300000 })
+  const t0 = 1000000
+  tracker.observe('A', 100, t0)
+  tracker.observe('A', 90, t0 + 60000) // spending between probes: zero production
+  assert.equal(tracker.snapshot('A', t0 + 61000).shardsPerMinute, 0, 'a balance drop is zero production, never negative')
+  assert.equal(tracker.snapshot('A', t0 + 600000).shardsPerMinute, null, 'stale probes dash out')
+  // The first sight of a bot is a baseline, never counted as production.
+  const fresh = createShardTracker({ windowMs: 180000, maxGapMs: 300000 })
+  fresh.observe('B', 5000, t0)
+  assert.equal(fresh.snapshot('B', t0 + 1000).shardsPerMinute, null)
+  assert.equal(fresh.snapshot('B', t0 + 1000).shardsProduced, 0)
+})
+
+test('shard tracker dedupes one reply seen by two listeners', () => {
+  const tracker = createShardTracker({ windowMs: 180000, maxGapMs: 300000 })
+  const t0 = 1000000
+  tracker.observe('A', 100, t0)
+  tracker.observe('A', 150, t0 + 60000)
+  tracker.observe('A', 150, t0 + 60200) // the same reply, second listener — no new gain
+  assert.equal(tracker.snapshot('A', t0 + 61000).shardsProduced, 50)
+  assert.equal(tracker.snapshot('A', t0 + 61000).shardsPerMinute, 50)
+})
+
+test('parseShardBalance reads the /shards reply and ignores other money lines', () => {
+  assert.equal(parseShardBalance('Shards | Balance: 1,234'), 1234)
+  assert.equal(parseShardBalance('  shards balance is 2.5k'), 2500)
+  assert.equal(parseShardBalance('Payments | Your balance is $1k.'), null)
+  assert.equal(parseShardBalance('Coins | Balance: 10'), null)
+})
 
 function clock() {
   let time = 0, sequence = 0

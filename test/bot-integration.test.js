@@ -2218,6 +2218,41 @@ test('/spawners accumulates earnings on the bot row and publishes inventory usag
   assert.equal(r.run('dataState.bots.A.lifetimeEarned'), 470)
 })
 
+// The fleet shards/min stat is only as good as the sampler feeding it: every
+// online bot needs a probe inside the rate window or "N sampled" counts a
+// fraction of the roster (37 of 179 was the old serial sampler's ceiling).
+// Drives the real sampler with a stubbed /shards reply and asserts the whole
+// fleet lands in the tracker.
+test('shard sampling probes the whole fleet and the fleet rate counts every bot', async () => {
+  const r = runtime({ TEST_CREATE_BOTS: true, TIMESERIES_ENABLED: 'false' })
+  await r.run(`
+    for (const id of ['A', 'B', 'C']) bots[id].bot = { entity: {} }
+    queryBalance = async (id) => {
+      const e = bots[id]
+      e.probeRan = (e.probeRan || 0) + 1
+      e.probeBal = (e.probeBal || 0) + 1000
+      return e.probeBal
+    }
+  `)
+  // Two paced rounds 63s apart: round one baselines each bot, round two
+  // records a gain. The fake `now` values drive the pacing and per-bot gap
+  // gates; the probes themselves resolve against real time below.
+  const t = Date.now()
+  for (const at of [t, t + 21000, t + 42000, t + 63000, t + 84000, t + 105000]) {
+    r.run(`sampleNextShardBalance(${at})`)
+    await new Promise(res => setTimeout(res, 5))
+  }
+  await new Promise(res => setTimeout(res, 20))
+  const stats = plain(r.run('globalStats()'))
+  assert.equal(stats.shardsRateBots, 3, 'every online bot is inside the rate window')
+  assert.ok(stats.shardsPerMinute != null && Number.isFinite(stats.shardsPerMinute) && stats.shardsPerMinute > 0,
+    'the fleet total is a measured number, not a dash')
+  for (const id of ['A', 'B', 'C']) {
+    const snap = plain(r.run(`shardTracker.snapshot(${JSON.stringify(id)})`))
+    assert.ok(snap.shardsPerMinute != null, id + ' has a measured rate')
+  }
+})
+
 // ── Coinflip data runs, time series, analytics and the .ENV settings tab ─────
 
 // Its own history files per runtime: these commands write records, and the
