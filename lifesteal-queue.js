@@ -10,6 +10,8 @@
 //            something (solid block ahead OR stuck in place). Then repeats.
 //   tpa    — one bot spams `/tpa <player>` round-robin over every visible
 //            player until deathban, then a fresh random bot takes over.
+//            LIFESTEAL_TPA_CMD (default /tpa) switches the sent command —
+//            /tpahere pulls each player to the bot instead.
 //   idle   — every other bot stays `/warp afk` (sent once, not spammed).
 // How many bots hold each role is configuration, not a constant:
 //   LIFESTEAL_DUELS_BOTS / LIFESTEAL_QUEUE_BOTS / LIFESTEAL_ARENA_BOTS /
@@ -20,13 +22,21 @@
 //
 // Standalone routines (no roster, no /new-gen, no Tor restart — just the
 // routine on the bots that are already online):
-//   /tpa-roundrobin [count]   /duelsroomspam [count]   /queuespam [count]
-//   /warp-arena [count]       /afk-park [count]        …each with `stop`
-// They run ONE role across up to [count] bots (default: every online bot) via
-// startSolo(role, count); duels/queue re-send their command every
-// SOLO_REPEAT_MS because a standalone "spam" is the whole point. A standalone
-// routine and /lifesteal-start are mutually exclusive (both drive the same
-// roles), and a standalone routine never creates or replaces accounts.
+//   /tpa-roundrobin             /tpahere-roundrobin
+//   /duelsroomspam [count]      /queuespam [count]
+//   /warp-arena [count]         /afk-park [count]        …each with `stop`
+// /tpa-roundrobin and /tpahere-roundrobin BIND TO THE BOT the command was
+// issued on (startSolo(role, 0, { onlyIds: [id] })): one INDEPENDENT
+// round-robin per bot — its own player cursor, its own stop — so running the
+// command on more bots (or /all) runs several at once and only the bound bot
+// ever sends its /tpa or /tpahere. The other routines run ONE role across up
+// to [count] bots (default: every online bot) via startSolo(role, count);
+// duels/queue re-send their command every SOLO_REPEAT_MS because a standalone
+// "spam" is the whole point. /tpahere-roundrobin always sends
+// `/tpahere <player>` (pulling the player to the bot) regardless of
+// LIFESTEAL_TPA_CMD. Standalone routines and /lifesteal-start are mutually
+// exclusive (both drive the same roles), and a standalone routine never
+// creates or replaces accounts.
 // Roster  — every ROSTER_TICK_MS the manager tops the fleet back up to
 //            TARGET_BOTS (default 20) via /new-gen semantics
 //            (persistGeneratedBots + default-paced connects). It NEVER removes
@@ -75,6 +85,7 @@ const DEFAULTS = {
   arenaStuckDist: 0.15,
   arenaTimeoutMs: 30000,
   arenaRepeatDelayMs: 2000,
+  tpaCmd: '/tpa',
   tpaIntervalMs: 5000,
   tpaCooldownMs: 1200,
   // Standalone /duelsroomspam and /queuespam re-send cadence (managed roles
@@ -113,6 +124,7 @@ function readConfig (env) {
     arenaStuckDist: Number.isFinite(Number(e.LIFESTEAL_ARENA_STUCK_DIST)) ? Number(e.LIFESTEAL_ARENA_STUCK_DIST) : DEFAULTS.arenaStuckDist,
     arenaTimeoutMs: num('LIFESTEAL_ARENA_TIMEOUT_MS', DEFAULTS.arenaTimeoutMs, 5000),
     arenaRepeatDelayMs: num('LIFESTEAL_ARENA_REPEAT_MS', DEFAULTS.arenaRepeatDelayMs, 0),
+    tpaCmd: (e.LIFESTEAL_TPA_CMD || DEFAULTS.tpaCmd).trim() || DEFAULTS.tpaCmd,
     tpaIntervalMs: num('LIFESTEAL_TPA_INTERVAL_MS', DEFAULTS.tpaIntervalMs, 1000),
     tpaCooldownMs: num('LIFESTEAL_TPA_COOLDOWN_MS', DEFAULTS.tpaCooldownMs, 0),
     soloRepeatMs: num('LIFESTEAL_SOLO_REPEAT_MS', DEFAULTS.soloRepeatMs, 1000),
@@ -253,13 +265,17 @@ function createLifestealQueue (deps) {
     lastSent: new Map(), // `${id}:${cmd}` -> timestamp (resend cooldown)
     arenaRun: new Map(), // id -> per-bot walk state (phase/waitUntil/…)
     tpaRun: new Map(), // id -> per-bot round-robin cursor (index/nextAt/…)
-    solo: null, // { role, count, lastRepeat } while a standalone routine runs
+    solo: null, // { role, count, lastRepeat } while a spread standalone routine runs
+    pinnedRuns: new Map(), // `${role}:${id}` -> per-bot standalone runs (bound round-robins)
     timers: [],
     lastRosterCheck: 0,
   }
 
   const ROLE_ORDER = ['duels', 'queue', 'arena', 'tpa']
-  const SOLO_ROLES = new Set([...ROLE_ORDER, 'afk'])
+  // /tpahere-roundrobin drives the SAME tpa round-robin role; only the sent
+  // command differs (/tpahere <player> pulls the player to the bot).
+  const SOLO_ALIASES = { tpahere: { role: 'tpa', cmd: '/tpahere' } }
+  const SOLO_ROLES = new Set([...ROLE_ORDER, 'afk', ...Object.keys(SOLO_ALIASES)])
 
   function onlineIds () {
     const bots = getBots() || {}
@@ -313,7 +329,7 @@ function createLifestealQueue (deps) {
     if (typeof onDeathban === 'function') {
       try { onDeathban(id, cleanReason, expiresAt) } catch (_) {}
     }
-    if ((state.running && !state.solo) || state.maintainRunning) {
+    if ((state.running && !state.solo && !state.pinnedRuns.size) || state.maintainRunning) {
       requestTopUp(1, `deathban replacement for ${id}`)
     }
   }
@@ -453,12 +469,39 @@ function createLifestealQueue (deps) {
   // How many bots a role wants: the configured count in managed mode, and the
   // standalone [count] (0 = every online bot) for a solo routine. Any role the
   // solo run did not ask for wants nothing.
-  function wantedCount (role) {
+  function countPinned (role) {
+    let n = 0
+    for (const run of state.pinnedRuns.values()) if (run.role === role) n++
+    return n
+  }
+
+  function pinnedRunOf (role, id) {
+    return state.pinnedRuns.get(`${role}:${id}`) || null
+  }
+
+  // Pinned holders currently sitting in the role — a pinned bot that is
+  // offline is dropped (step 1) and must NOT make the generic fill invent a
+  // replacement: a per-bot binding is only ever that bot.
+  function ensuredPinnedCount (role) {
+    let n = 0
+    for (const id of state.roles[role]) if (pinnedRunOf(role, id)) n++
+    return n
+  }
+
+  // What the generic fill may spread over arbitrary online bots: the
+  // standalone [count] for a spread solo run, the configured counts in
+  // managed mode, and nothing when per-bot runs own the routine.
+  function spreadWant (role) {
     if (state.solo) return role === state.solo.role ? (state.solo.count || Infinity) : 0
+    if (state.pinnedRuns.size) return 0
     if (role === 'duels') return state.cfg.duelsBots
     if (role === 'queue') return state.cfg.queueBots
     if (role === 'arena') return state.cfg.arenaBots
     return state.cfg.tpaBots
+  }
+
+  function wantedCount (role) {
+    return ensuredPinnedCount(role) + spreadWant(role)
   }
 
   function maintainRoles () {
@@ -472,12 +515,28 @@ function createLifestealQueue (deps) {
       }
     }
     // 2. Shrink when a count was lowered live — the extras go back to idle.
+    //    Bots pinned by a per-bot standalone run are never shrunk away.
     for (const role of ROLE_ORDER) {
       const want = wantedCount(role)
       while (state.roles[role].length > want) {
-        const id = state.roles[role][state.roles[role].length - 1]
+        let at = -1
+        for (let i = state.roles[role].length - 1; i >= 0; i--) {
+          if (!pinnedRunOf(role, state.roles[role][i])) { at = i; break }
+        }
+        if (at === -1) break
+        const id = state.roles[role][at]
         dropHolder(role, id)
         parkAfk(id)
+      }
+    }
+    // 2.5. Per-bot standalone runs always keep THEIR bot holding the role.
+    for (const run of state.pinnedRuns.values()) {
+      if (!onlineSet.has(run.id)) continue
+      const held = roleOf(run.id)
+      if (held && held !== run.role) continue
+      if (!state.roles[run.role].includes(run.id)) {
+        const cmd = run.role === 'duels' ? state.cfg.duelsCmd : run.role === 'queue' ? state.cfg.queueCmd : null
+        assignRole(run.role, run.id, cmd)
       }
     }
     // 3. Fill every short role from the online pool. A bot holds at most one
@@ -628,7 +687,12 @@ function createLifestealQueue (deps) {
       const target = names[run.index % names.length]
       run.index += 1
       run.lastTarget = target
-      say(id, `/tpa ${target}`)
+      // Resolved per send so a live LIFESTEAL_TPA_CMD change lands on the next
+      // round-robin hit; a /tpahere run always forces /tpahere for its own
+      // bound bot (each binding is an independent round-robin).
+      const pinned = pinnedRunOf('tpa', id)
+      const tpaCmd = (pinned && pinned.cmd) || (state.solo && state.solo.cmd) || state.cfg.tpaCmd
+      say(id, `${tpaCmd} ${target}`)
       run.nextAt = t + state.cfg.tpaCooldownMs + Math.floor(Math.random() * Math.max(0, state.cfg.tpaIntervalMs - state.cfg.tpaCooldownMs))
     }
   }
@@ -706,13 +770,13 @@ function createLifestealQueue (deps) {
     state.cfg = readConfig(getEnv())
     noteSessions()
     maintainRoles()
-    if (state.solo && (state.solo.role === 'duels' || state.solo.role === 'queue')) maintainSoloRepeat()
+    if (state.solo || state.pinnedRuns.size) maintainSoloRepeat()
     maintainArena()
     maintainTpa()
     maintainIdle()
     // A standalone routine runs the routine only — no roster top-up (that
     // would call /new-gen and create accounts the user never asked for).
-    if (!state.solo) maintainRoster()
+    if (!state.solo && !state.pinnedRuns.size) maintainRoster()
   }
 
   // Standalone /duelsroomspam and /queuespam re-send their command on a
@@ -720,12 +784,23 @@ function createLifestealQueue (deps) {
   // replacement events do the re-sending).
   function maintainSoloRepeat () {
     const t = now()
-    if (t - state.solo.lastRepeat < state.cfg.soloRepeatMs) return
-    state.solo.lastRepeat = t
-    const cmd = state.solo.role === 'duels' ? state.cfg.duelsCmd : state.cfg.queueCmd
-    for (const id of state.roles[state.solo.role]) {
-      state.lastSent.delete(`${id}:${cmd}`)
-      say(id, cmd)
+    if (state.solo && (state.solo.role === 'duels' || state.solo.role === 'queue')
+        && t - state.solo.lastRepeat >= state.cfg.soloRepeatMs) {
+      state.solo.lastRepeat = t
+      const cmd = state.solo.role === 'duels' ? state.cfg.duelsCmd : state.cfg.queueCmd
+      for (const id of state.roles[state.solo.role]) {
+        if (pinnedRunOf(state.solo.role, id)) continue
+        state.lastSent.delete(`${id}:${cmd}`)
+        say(id, cmd)
+      }
+    }
+    for (const run of state.pinnedRuns.values()) {
+      if (run.role !== 'duels' && run.role !== 'queue') continue
+      if (t - run.lastRepeat < state.cfg.soloRepeatMs) continue
+      run.lastRepeat = t
+      const cmd = run.role === 'duels' ? state.cfg.duelsCmd : state.cfg.queueCmd
+      state.lastSent.delete(`${run.id}:${cmd}`)
+      say(run.id, cmd)
     }
   }
 
@@ -746,7 +821,7 @@ function createLifestealQueue (deps) {
 
   function start () {
     state.cfg = readConfig(getEnv())
-    if (state.solo) return { ok: false, error: 'a standalone routine is running — stop it first' }
+    if (state.solo || state.pinnedRuns.size) return { ok: false, error: 'a standalone routine is running — stop it first' }
     if (state.running) return { ok: false, error: 'already running' }
     state.running = true
     state.lastRosterCheck = 0
@@ -759,12 +834,51 @@ function createLifestealQueue (deps) {
 
   // Standalone routines: run ONE role on the bots already online — no roster
   // top-up, no /new-gen, no Tor restart. count 0 = every online bot.
-  function startSolo (role, count) {
+  //
+  // opts.onlyIds binds the routine to specific bots — one INDEPENDENT
+  // round-robin per bot (its own player cursor, its own stop). That is what
+  // /tpahere-roundrobin and /tpa-roundrobin use: they bind to the bot the
+  // command was issued on, and any number of them can run at once.
+  function startSolo (role, count, opts) {
     if (!SOLO_ROLES.has(role)) return { ok: false, error: `unknown routine: ${role}` }
-    if (state.running) return { ok: false, error: state.solo ? 'a standalone routine is already running — stop it first' : 'stop /lifesteal-start first' }
+    // An alias (tpahere) fills the canonical role slot but forces its own
+    // command; name is what status reports ("SOLO tpahere").
+    const alias = SOLO_ALIASES[role] || null
+    const canonical = alias ? alias.role : role
+    const name = role
+    const cmd = alias ? alias.cmd : null
+    const onlyIds = opts && Array.isArray(opts.onlyIds)
+      ? [...new Set(opts.onlyIds.map(id => String(id || '').trim()).filter(Boolean))]
+      : null
+
+    if (onlyIds && onlyIds.length) {
+      if (state.running && !state.solo && !state.pinnedRuns.size) return { ok: false, error: 'stop /lifesteal-start first' }
+      if (state.solo && state.solo.role === canonical) return { ok: false, error: 'a spread standalone routine is running for this role — stop it first' }
+      const online = new Set(onlineIds())
+      const taken = roleTaken()
+      for (const id of onlyIds) {
+        if (state.pinnedRuns.has(`${canonical}:${id}`)) return { ok: false, error: `a standalone routine is already running for ${id}` }
+        if (!online.has(id)) return { ok: false, error: `${id} is not currently online` }
+        if (taken.has(id)) return { ok: false, error: `${id} is already busy with the ${roleOf(id)} role` }
+      }
+      state.cfg = readConfig(getEnv())
+      for (const id of onlyIds) {
+        state.pinnedRuns.set(`${canonical}:${id}`, { role: canonical, name, cmd, id, lastRepeat: now() })
+      }
+      state.running = true
+      state.afkSent.clear()
+      armLoops()
+      tick()
+      log(null, `standalone ${name} routine bound to ${onlyIds.join(', ')} (one round-robin per bot)`)
+      return { ok: true, role: name, count: onlyIds.length, pinned: [...onlyIds] }
+    }
+
+    if (state.running && !state.solo && !state.pinnedRuns.size) return { ok: false, error: 'stop /lifesteal-start first' }
+    if (state.solo) return { ok: false, error: 'a spread standalone routine is already running — stop it first' }
+    if (countPinned(canonical)) return { ok: false, error: 'per-bot standalone routines are running for this role — stop them first' }
     const n = Number.isFinite(count) && count > 0 ? Math.floor(count) : 0
     state.cfg = readConfig(getEnv())
-    state.solo = { role, count: n, lastRepeat: now() }
+    state.solo = { role: canonical, name, cmd, count: n, lastRepeat: now() }
     state.running = true
     state.afkSent.clear()
     armLoops()
@@ -773,9 +887,42 @@ function createLifestealQueue (deps) {
     return { ok: true, role, count: n }
   }
 
-  function stopSolo () {
-    if (!state.solo) return { ok: false, error: 'no standalone routine running' }
-    return stop()
+  // stopSolo() stops everything; stopSolo(role) stops every run of that role;
+  // stopSolo(role, id) stops just that bot's bound run.
+  function stopSolo (role, id) {
+    if (role == null) {
+      if (!state.solo && !state.pinnedRuns.size) return { ok: false, error: 'no standalone routine running' }
+      return stop()
+    }
+    const alias = SOLO_ALIASES[role] || null
+    const canonical = alias ? alias.role : role
+    let stopped = 0
+    if (id != null) {
+      if (state.pinnedRuns.delete(`${canonical}:${id}`)) {
+        releaseRole(String(id), true)
+        stopped++
+      }
+    } else {
+      for (const [key, run] of [...state.pinnedRuns]) {
+        if (run.role !== canonical) continue
+        state.pinnedRuns.delete(key)
+        releaseRole(run.id, true)
+        stopped++
+      }
+      if (state.solo && state.solo.role === canonical) {
+        for (const holder of [...state.roles[canonical]]) dropHolder(canonical, holder)
+        state.solo = null
+        stopped++
+      }
+    }
+    if (!state.solo && !state.pinnedRuns.size) {
+      if (!stopped) return { ok: false, error: 'no standalone routine running' }
+      const r = stop()
+      return r.ok ? { ok: true, stopped } : r
+    }
+    if (!stopped) return { ok: false, error: 'no matching standalone routine running' }
+    log(null, `standalone ${role} routine stopped for ${id != null ? id : 'all bots'}`)
+    return { ok: true, stopped }
   }
 
   function stop () {
@@ -791,14 +938,24 @@ function createLifestealQueue (deps) {
     state.arenaRun.clear()
     state.tpaRun.clear()
     state.solo = null
+    state.pinnedRuns.clear()
     log(null, 'lifesteal automation stopped')
     return { ok: true }
+  }
+
+  function soloSummaries () {
+    const out = []
+    if (state.solo) out.push({ role: state.solo.name || state.solo.role, count: state.solo.count })
+    for (const run of state.pinnedRuns.values()) out.push({ role: run.name || run.role, count: 1 })
+    return out
   }
 
   function status () {
     return {
       running: state.running,
-      solo: state.solo ? { role: state.solo.role, count: state.solo.count } : null,
+      solo: soloSummaries()[0] || null,
+      solos: soloSummaries(),
+      pinned: [...state.pinnedRuns.values()].map(run => ({ role: run.name || run.role, bot: run.id })),
       cfg: { ...state.cfg },
       roles: {
         duels: [...state.roles.duels],

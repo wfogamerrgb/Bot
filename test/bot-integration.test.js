@@ -435,8 +435,15 @@ test('new-gen saves generated roster and proxy groups before staggered connectio
   const res = await r.request('/api/command', JSON.stringify({ text: '/new-gen 3' }), cookie)
   assert.equal(res.status, 202)
   const saved = require('dotenv').parse(r.fakeFiles.get('.env'))
+  // The seeded roster A,B,C is ungrouped (direct), so it consumes the direct
+  // share first: the 3 new names split 2 into group 2 and 1 onto direct —
+  // the 3:1 weighting that gives direct 3/4 against a single proxy group.
   const names = saved.PROXY_GROUP_2_BOTS.split(',')
-  assert.equal(names.length, 3)
+  assert.equal(names.length, 2)
+  const directFlagged = Object.keys(saved).filter(key => /^BOT_DIRECT_/.test(key))
+  assert.equal(directFlagged.length, 1)
+  assert.equal(saved[directFlagged[0]], 'true')
+  assert.ok(saved.BOT_NAMES.includes(directFlagged[0].slice('BOT_DIRECT_'.length)))
   assert.equal(r.createdBots.length, 0, 'saving precedes every connection')
   assert.ok(names.every(name => saved.BOT_NAMES.includes(name) && /^[A-Za-z0-9_]{3,16}$/.test(name)))
   const timer = [...r.timers.keys()].find(t => t.delay === 0 && String(t.fn).includes('createBotInstance(name)'))
@@ -3086,11 +3093,11 @@ test('/doc lists the built-in docs and opens a topic', async () => {
 // demand — without any roster top-up.
 test('standalone lifesteal routines route from the console and stop on demand', () => {
   const r = runtime({ TEST_CREATE_BOTS: true, LIFESTEAL_SOLO_REPEAT_MS: '5000' })
-  r.run("handleCommand('/tpa-roundrobin 2')")
-  assert.match(logsText(r), /Standalone tpa routine started on 2 bot\(s\)/)
+  r.run("handleCommand('/tpa-roundrobin')")
+  assert.match(logsText(r), /Standalone tpa round-robin bound to /)
 
   r.run("handleCommand('/tpa-roundrobin banana')")
-  assert.match(logsText(r), /Usage: \/tpa-roundrobin \[count\|all\] \[stop\]/)
+  assert.match(logsText(r), /Usage: \/tpa-roundrobin \[stop \[all\]\]/)
 
   r.run("handleCommand('/lifesteal-status')")
   assert.match(logsText(r), /Lifesteal SOLO tpa —/)
@@ -3099,6 +3106,23 @@ test('standalone lifesteal routines route from the console and stop on demand', 
   r.run("handleCommand('/tpa-roundrobin stop')")
   assert.match(logsText(r), /Standalone routine stopped/)
   r.run("handleCommand('/tpa-roundrobin stop')")
+  assert.match(logsText(r), /no standalone routine running/)
+})
+
+test('/tpahere-roundrobin runs the tpa round-robin with /tpahere and stops on demand', () => {
+  const r = runtime({ TEST_CREATE_BOTS: true })
+  r.run("handleCommand('/tpahere-roundrobin')")
+  assert.match(logsText(r), /Standalone tpahere round-robin bound to /)
+
+  r.run("handleCommand('/tpahere-roundrobin banana')")
+  assert.match(logsText(r), /Usage: \/tpahere-roundrobin \[stop \[all\]\]/)
+
+  r.run("handleCommand('/lifesteal-status')")
+  assert.match(logsText(r), /Lifesteal SOLO tpahere —/)
+
+  r.run("handleCommand('/tpahere-roundrobin stop')")
+  assert.match(logsText(r), /Standalone routine stopped/)
+  r.run("handleCommand('/tpahere-roundrobin stop')")
   assert.match(logsText(r), /no standalone routine running/)
 })
 
@@ -3157,6 +3181,49 @@ test('/freeforall aims and hits with the best weapon, never shields, and never m
 
   r.run("handleCommand('/freeforall stop')")
   assert.equal(r.run('bots.A.freeForAllRunning'), false)
+})
+
+test('/kos swarms only unprotected players and stops on demand', async () => {
+  const r = runtime({ TEST_CREATE_BOTS: true, KOS_ENGAGE_DELAY_MS: '0', KOS_STAGGER_MS: '0', TPA_MAIN_PLAYER: 'Main' })
+  r.run(`
+    globalThis.kosActions = { equipped: [], looked: [], attacked: [], deactivated: 0, cleared: 0, pathStopped: 0, digStopped: 0 }
+    bots.A.bot.entity = { position: { x: 0, y: 64, z: 0 } }
+    bots.A.bot.targetDigBlock = { name: 'stone' }
+    bots.A.bot.stopDigging = () => { kosActions.digStopped++ }
+    bots.A.bot.pathfinder = { stop: () => { kosActions.pathStopped++ } }
+    bots.A.bot.clearControlStates = () => { kosActions.cleared++ }
+    bots.A.bot.deactivateItem = () => { kosActions.deactivated++ }
+    bots.A.bot.inventory = {
+      slots: { 45: { name: 'shield', slot: 45, type: 99 } },
+      items: () => [{ name: 'netherite_sword', slot: 37, type: 20 }]
+    }
+    bots.A.bot.equip = (item, dest) => { kosActions.equipped.push([item.name, dest]); bots.A.bot.heldItem = item }
+    bots.A.bot.unequip = (dest) => {}
+    bots.A.bot.lookAt = (pos) => { kosActions.looked.push(pos) }
+    bots.A.bot.attack = (ent) => { kosActions.attacked.push(ent.username || ent.name) }
+    bots.A.bot.players = {
+      Main: { entity: { username: 'Main', height: 1.8, position: { x: 1, y: 64, z: 0 } } },
+      B: { entity: { username: 'B', height: 1.8, position: { x: 1, y: 64, z: 1 } } },
+      Random: { entity: { username: 'Random', height: 1.8, position: { x: 2, y: 64, z: 1 } } }
+    }
+  `)
+  r.run("handleCommand('/kos')")
+  await new Promise(resolve => setImmediate(resolve))
+  await new Promise(resolve => setImmediate(resolve))
+  const act = plain(r.run('kosActions'))
+  assert.deepEqual(act.attacked, ['Random'], 'only the unprotected player is hit — never the TPA main player or a fleet bot')
+  assert.ok(act.looked.length >= 1, 'aims at the target')
+  assert.deepEqual(act.equipped, [['netherite_sword', 'hand']], 'best weapon in hand')
+  assert.ok(act.deactivated >= 1, 'never holds a shield')
+  assert.ok(act.cleared >= 1 && act.pathStopped >= 1 && act.digStopped >= 1, 'never moves or breaks blocks')
+
+  r.run("handleCommand('/kos banana')")
+  assert.match(logsText(r), /Usage: \/kos \[on\|off\|stop\]/)
+  r.run("handleCommand('/kos stop')")
+  assert.equal(r.run("kos.isRunning('A')"), false)
+  assert.match(logsText(r), /KOS stopped/)
+  r.run("handleCommand('/kos stop')")
+  assert.match(logsText(r), /KOS is not running on this bot/)
 })
 
 test('/new-gen-maintain maintains the requested bot count via /new-gen', () => {

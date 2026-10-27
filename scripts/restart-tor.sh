@@ -29,7 +29,7 @@ die() {
 
 # ---------------- config ----------------
 TOR_PORTS="${TOR_PORTS:-9050 9150 9250}"        # space-separated SOCKS ports — ALL of them!
-TOR_HOME="${TOR_HOME:-/etc/tor-instances}" # torrc-<port> + data-<port> live here
+TOR_HOME="${TOR_HOME:-}" # default chosen below: /etc as root, per-user dir otherwise
 CONTROL_OFFSET="${CONTROL_OFFSET:-1}"      # control port = socks port + this
 BOOT_TIMEOUT="${BOOT_TIMEOUT:-25}"         # seconds for the whole fleet to answer
 KILL_TIMEOUT="${KILL_TIMEOUT:-5}"          # seconds to wait for ports to go free
@@ -49,8 +49,18 @@ for arg in "$@"; do
   esac
 done
 
-# ---------------- root only ----------------
-[ "$(id -u)" -eq 0 ] || die "must run as root (box-wide kill + port takeover). Try: sudo npm run start"
+# ---------------- root-aware TOR_HOME ----------------
+# Root gets system-wide instances in /etc/tor-instances. A normal user gets
+# their own dir under $TMPDIR (tor only needs a 700 dir it owns), so
+# `bash restart-tor.sh` behaves the same on macOS and Linux WITHOUT sudo.
+# Non-root can only kill its own tor processes; foreign listeners on our ports
+# are reported instead of silently skipped.
+if [ "$(id -u)" -eq 0 ]; then
+  TOR_HOME="${TOR_HOME:-/etc/tor-instances}"
+else
+  TOR_HOME="${TOR_HOME:-${TMPDIR:-/tmp}/tor-instances-$(id -u)}"
+  log "not root — instances in ${TOR_HOME} (only your own tor processes are touched)"
+fi
 
 # ---------------- remote proxy → nothing to do ----------------
 PROXY_HOST="${PROXY_HOST:-127.0.0.1}"
@@ -163,7 +173,7 @@ while :; do
     port_busy "$port" && busy="$busy $port"
   done
   [ -z "$busy" ] && break
-  [ "$SECONDS" -ge "$deadline" ] && die "ports still held after SIGKILL:${busy} — something is respawning them; refusing to continue"
+  [ "$SECONDS" -ge "$deadline" ] && die "ports still held after SIGKILL:${busy} — a process we cannot kill owns them (try sudo), or something is respawning them; refusing to continue"
   for port in $busy; do kill_port_holders "$port"; done
   sleep 0.2
 done

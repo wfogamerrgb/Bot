@@ -404,6 +404,103 @@ test('standalone afk-park parks the requested count once — sent once, never sp
   h.q.stopSolo()
 })
 
+// ── /tpahere round-robin ───────────────────────────────────────────────────
+test('standalone tpahere-roundrobin spams /tpahere <player> instead of /tpa', () => {
+  const players = { Alice: {}, Bob: {} }
+  const h = makeHarness(['A', 'B', 'C'], {
+    env: { LIFESTEAL_TPA_INTERVAL_MS: '1000', LIFESTEAL_TPA_COOLDOWN_MS: '0' },
+    botExtra: () => ({ entity: { position: { x: 0, y: 64, z: 0 }, yaw: 0, players }, players }),
+  })
+  assert.equal(LQ.readConfig({}).tpaCmd, '/tpa', 'the managed role keeps /tpa by default')
+  assert.equal(LQ.readConfig({ LIFESTEAL_TPA_CMD: '/tpahere' }).tpaCmd, '/tpahere')
+  const r = h.q.startSolo('tpahere', 2)
+  assert.equal(r.ok, true)
+  assert.equal(h.q.status().solo.role, 'tpahere', 'status reports the tpahere routine')
+  h.advance(2000)
+  h.q.tick()
+  const hereSends = h.sent.filter(m => m.msg.startsWith('/tpahere '))
+  assert.ok(hereSends.length >= 2, 'both bots spam /tpahere <player>')
+  assert.deepEqual([...new Set(hereSends.map(m => m.id))].sort(), ['A', 'B'])
+  assert.ok(hereSends.some(m => m.msg === '/tpahere Alice'), 'round-robin targets the visible players')
+  assert.ok(!h.sent.some(m => m.msg.startsWith('/tpa ')), 'the tpahere routine never sends /tpa')
+  h.q.stop()
+})
+
+test('LIFESTEAL_TPA_CMD flips the managed tpa role to /tpahere', () => {
+  const players = { Alice: {}, Bob: {} }
+  const h = makeHarness(['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J'], {
+    env: {
+      LIFESTEAL_TPA_CMD: '/tpahere',
+      LIFESTEAL_TPA_BOTS: '2',
+      LIFESTEAL_TPA_INTERVAL_MS: '1000',
+      LIFESTEAL_TPA_COOLDOWN_MS: '0',
+    },
+    botExtra: () => ({ entity: { position: { x: 0, y: 64, z: 0 }, yaw: 0, players }, players }),
+  })
+  h.q.start()
+  h.advance(2000)
+  h.q.tick()
+  const tpaSends = h.sent.filter(m => m.msg.startsWith('/tpa'))
+  assert.ok(tpaSends.length >= 2, 'both tpa holders spam')
+  for (const m of tpaSends) assert.match(m.msg, /^\/tpahere \w+$/, 'the configured command is used')
+  assert.ok(!h.sent.some(m => m.msg.startsWith('/tpa ')), 'LIFESTEAL_TPA_CMD=/tpahere replaces /tpa entirely')
+  h.q.stop()
+})
+
+// ── per-bot bindings (/tpahere-roundrobin on the current bot) ─────────────
+test('per-bot tpahere binding: only the bound bot spams, and several bindings run at once', () => {
+  const players = { Alice: {}, Bob: {} }
+  const h = makeHarness(['A', 'B', 'C'], {
+    env: { LIFESTEAL_TPA_INTERVAL_MS: '1000', LIFESTEAL_TPA_COOLDOWN_MS: '0' },
+    botExtra: () => ({ entity: { position: { x: 0, y: 64, z: 0 }, yaw: 0, players }, players }),
+  })
+  const senders = () => new Set(h.sent.filter(m => m.msg.startsWith('/tpahere ')).map(m => m.id))
+  const r = h.q.startSolo('tpahere', 0, { onlyIds: ['B'] })
+  assert.equal(r.ok, true)
+  assert.deepEqual(r.pinned, ['B'])
+  assert.equal(h.q.status().roles.tpa.join(','), 'B', 'only the bound bot holds the tpa role')
+  h.advance(2000)
+  h.q.tick()
+  assert.deepEqual([...senders()], ['B'], 'only the bound bot sends /tpahere')
+
+  // A second binding on another bot runs its own independent round-robin.
+  assert.equal(h.q.startSolo('tpahere', 0, { onlyIds: ['A'] }).ok, true)
+  assert.equal(h.q.startSolo('tpahere', 0, { onlyIds: ['B'] }).ok, false, 'the same bot cannot be bound twice')
+  h.sent.length = 0
+  // Past LIFESTEAL_RESEND_MS (15s): say() dedups identical /tpahere sends
+  // inside that window, so a fresh send needs the window to have elapsed.
+  h.advance(16000)
+  h.q.tick()
+  const both = senders()
+  assert.ok(both.has('A') && both.has('B'), 'both bound bots spam, each its own round-robin')
+  assert.ok(!both.has('C'), 'an unbound bot never sends /tpahere')
+  h.q.stop()
+})
+
+test('per-bot tpahere bindings stop one bot at a time and refuse offline bots', () => {
+  const players = { Alice: {}, Bob: {} }
+  const h = makeHarness(['A', 'B'], {
+    env: { LIFESTEAL_TPA_INTERVAL_MS: '1000', LIFESTEAL_TPA_COOLDOWN_MS: '0' },
+    botExtra: () => ({ entity: { position: { x: 0, y: 64, z: 0 }, yaw: 0, players }, players }),
+  })
+  assert.equal(h.q.startSolo('tpahere', 0, { onlyIds: ['Ghost'] }).ok, false, 'an offline bot cannot be bound')
+  assert.equal(h.q.startSolo('tpahere', 0, { onlyIds: ['A', 'B'] }).ok, true, 'several bots can be bound at once')
+  assert.equal(h.q.stopSolo('tpahere', 'A').ok, true)
+  assert.deepEqual(h.q.status().roles.tpa, ['B'], 'only the stopped bot is released')
+  h.sent.length = 0
+  h.advance(1200)
+  h.q.tick()
+  h.advance(1200)
+  h.q.tick()
+  const ids = new Set(h.sent.filter(m => m.msg.startsWith('/tpahere ')).map(m => m.id))
+  assert.ok(!ids.has('A'), 'the stopped binding stops sending')
+  assert.ok(ids.has('B'), 'the remaining binding keeps round-robining')
+  assert.equal(h.q.stopSolo('tpahere').ok, true, 'stop without an id ends every binding of the role')
+  assert.equal(h.q.status().running, false)
+  assert.equal(h.q.stopSolo('tpahere', 'B').ok, false, 'nothing is left to stop')
+  h.q.stop()
+})
+
 test('a ban in a standalone routine drops the role but never orders a /new-gen replacement', () => {
   const h = makeHarness(['A', 'B', 'C', 'D'], { env: { LIFESTEAL_ROSTER_TICK_MS: '0' } })
   h.q.startSolo('queue', 1)

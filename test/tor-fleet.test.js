@@ -70,6 +70,70 @@ test('in-flight deduplication and cooldown prevent NEWNYM storms; failures retry
   const disabled = createAllBannedTorRotation({ snapshot: () => { throw Error('should not inspect') }, enabled: () => false })
   assert.deepEqual(await disabled.check(), [])
 })
+test('a ban wave trips past the share threshold, not only when every bot is banned', async () => {
+  let time = 0
+  const rows = Array.from({ length: 10 }, (_, i) => ({ id: `B${i}`, proxy, banned: i < 8, bannedAt: i < 8 ? i + 1 : 0 }))
+  const calls = [], restarts = []
+  const manager = createAllBannedTorRotation({
+    snapshot: () => rows, now: () => time,
+    rotate: async e => { calls.push(e.port); return { ok: true, before: '198.51.100.1', after: '198.51.100.2' } },
+    restart: async e => { restarts.push(e.port); return { ok: true, before: '198.51.100.1', after: '198.51.100.9' } }
+  })
+  assert.deepEqual(await manager.check(), [], '8 of 10 is exactly 80% — not MORE than 80%')
+  rows[8].banned = true; rows[8].bannedAt = 11
+  await manager.check()
+  assert.deepEqual(calls, [9150], '9 of 10 (>80%) fires even though one bot is still unbanned')
+  assert.deepEqual(restarts, [], 'a verified NEWNYM never escalates to the restart fallback')
+  // A stricter threshold re-arms the question: 1.0 means "all or nothing".
+  const strict = createAllBannedTorRotation({
+    snapshot: () => rows, now: () => time, threshold: () => 1,
+    rotate: async () => { calls.push(9999); return { ok: true, before: 'a', after: 'b' } }
+  })
+  time = 900000
+  await strict.check()
+  assert.deepEqual(calls, [9150], 'threshold 1.0 does not fire at 9 of 10')
+  rows[9].banned = true; rows[9].bannedAt = 12
+  await strict.check()
+  assert.equal(calls.length, 2, 'but every bot banned always fires')
+})
+test('an unverifiable NEWNYM escalates to the Tor restart fallback and stays honest', async () => {
+  let time = 0
+  const restarts = []
+  const manager = createAllBannedTorRotation({
+    snapshot: () => [{ id: 'A', proxy, banned: true, bannedAt: 1 }], now: () => time,
+    rotate: async () => ({ ok: false, before: '198.51.100.1', error: 'SOCKS probe exit IP unchanged after 3 NEWNYM attempts' }),
+    restart: async e => { restarts.push(e.port); return { ok: true, before: '198.51.100.1', after: '198.51.100.9' } }
+  })
+  const [result] = await manager.check()
+  assert.equal(result.ok, true)
+  assert.equal(result.restarted, true)
+  assert.deepEqual(restarts, [9150])
+  assert.equal(result.after, '198.51.100.9', 'the restart\'s proven exit is what gets reported')
+  // Both halves failing keeps the episode open — retried after cooldown with
+  // the combined reason, never marked done.
+  let attempts = 0
+  const stubborn = createAllBannedTorRotation({
+    snapshot: () => [{ id: 'A', proxy, banned: true, bannedAt: 1 }], now: () => time,
+    rotate: async () => { attempts++; return { ok: false, before: '198.51.100.1', error: 'unchanged after NEWNYM' } },
+    restart: async () => ({ ok: false, before: '198.51.100.1', after: '198.51.100.1', error: 'restart completed but the exit is STILL 198.51.100.1' })
+  })
+  const [failed] = await stubborn.check()
+  assert.equal(failed.ok, false)
+  assert.match(failed.error, /unchanged after NEWNYM.*STILL 198\.51\.100\.1/)
+  await stubborn.check()
+  assert.equal(attempts, 1, 'cooldown gates the retry')
+  time = 300000
+  await stubborn.check()
+  assert.equal(attempts, 2, 'a failed episode is retried after cooldown, not marked completed')
+  // Without a restart fallback the original failure stands alone.
+  const lonely = createAllBannedTorRotation({
+    snapshot: () => [{ id: 'A', proxy, banned: true, bannedAt: 1 }], now: () => 0,
+    rotate: async () => ({ ok: false, error: 'Tor control rejected NEWNYM' })
+  })
+  const [bare] = await lonely.check()
+  assert.equal(bare.ok, false)
+  assert.match(bare.error, /Tor control rejected NEWNYM/)
+})
 test('verification talks to a real isolated Tor control protocol server', async t => {
   const net = require('node:net')
   const server = net.createServer(socket => {

@@ -14,15 +14,22 @@ base detection, survival helpers, and Discord alerts.
 ## Verified Tor recovery and reference panels
 
 - `TOR_AUTO_ROTATE_BANNED=true` automatically checks local Tor SOCKS endpoints
-  when bans arrive and every 30 seconds. Only a nonempty cohort whose **every
-  assigned account is confirmed banned and offline** triggers rotation. Unknown,
-  pending, suspected or expired bans prevent it. Accounts removed from the live
-  roster retain their actual proxy route; direct/remote/HTTP routes are excluded.
+  when bans arrive and every 30 seconds. A nonempty cohort triggers rotation
+  when **every assigned account is confirmed banned and offline**, or when
+  **more than `TOR_ROTATE_BAN_RATIO` (default 0.8 = 80%)** of them are — by the
+  time most of a circuit's accounts are banned, its exit is already flagged.
+  Unknown, pending, suspected or expired bans count as not banned. Accounts
+  removed from the live roster retain their actual proxy route; direct/remote/HTTP
+  routes are excluded.
 - Control uses the existing **SOCKS port + 1** convention. Auto-rotation performs
   a bounded HTTPS exit-IP probe through that SOCKS endpoint before NEWNYM, waits
   10 seconds, then probes again. Up to three attempts are allowed; failures retry
   after a five-minute cooldown, and successful ban episodes rotate only once.
   An acknowledgement or unchanged IP is **not** reported as a verified change.
+  When NEWNYM cannot prove a change, the rotation escalates to a full Tor
+  restart (`PROXY_RESTART_CMD` — default `scripts/restart-tor.sh --tor-only`)
+  and re-proves the exit; an unchanged exit after the restart is still a
+  failure, so the circuit is never claimed healthy when it is not.
 - A probe verifies the exit used for its HTTPS destination, not necessarily the
   Minecraft destination: Tor can choose multiple circuits/exits per endpoint.
   Existing TCP connections keep their paths, and an IP change does **not** lift
@@ -935,7 +942,20 @@ pool). Every role is also available **standalone** — see the command table.
 | `LIFESTEAL_QUEUE_BOTS` | `1` | Bots holding `/queue` (`0` disables the role) |
 | `LIFESTEAL_ARENA_BOTS` | `1` | Bots looping `/warp arena` → wait → forward-until-hit (`0` disables) |
 | `LIFESTEAL_TPA_BOTS` | `1` | Bots spamming `/tpa <player>` round-robin — raise for more `/tpa` bots (`0` disables) |
+| `LIFESTEAL_TPA_CMD` | `/tpa` | Command the tpa role spams per player — set `/tpahere` to pull each player to the bot instead |
 | `LIFESTEAL_SOLO_REPEAT_MS` | `15000` | Re-send cadence for standalone `/duelsroomspam` and `/queuespam` |
+
+### KOS combat pacing (`/kos`)
+
+Vanilla rejects hits on a hurt target for 10 ticks (0.5s) — inside that window
+a hit adds at most the difference over the previous one — so `/kos` spreads the
+fleet's swings just past the window instead of letting every bot swing at once.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `KOS_ENGAGE_DELAY_MS` | `500` | Delay after a target comes in reach (the `/tpaccept` moment) before the first hit |
+| `KOS_STAGGER_MS` | `550` | Minimum spacing between fleet hits on one target (rotating across bots) |
+| `KOS_BOT_COOLDOWN_MS` | `625` | Minimum spacing between one bot's own hits (full sword recharge) |
 
 ### GUI and crate automation
 
@@ -1434,10 +1454,12 @@ Any unrecognized input is sent as a Minecraft chat message or command.
 | `/crates-solo [bot] [color] [dump=…] [afk=…] ["term" …] [shulker|chest] [color]` | Run that sequence for one bot, with the same flags and dump filters |
 | `/lifesteal-start` / `-stop` / `-status` | Lifesteal role automation with configurable role counts (`LIFESTEAL_*_BOTS`) |
 | `/tpa-roundrobin [count\|all] [stop]` | Standalone: spam `/tpa <player>` round-robin on up to `count` bots (default all) |
+| `/tpahere-roundrobin [count\|all] [stop]` | Standalone: the same round-robin always sending `/tpahere <player>` — pulls each visible player to the bot |
 | `/duelsroomspam [count\|all] [stop]` | Standalone: spam the duels-room command on up to `count` bots |
 | `/queuespam [count\|all] [stop]` | Standalone: spam `/queue` on up to `count` bots |
 | `/warp-arena [count\|all] [stop]` | Standalone: loop `/warp arena` → walk-until-hit on up to `count` bots |
 | `/afk-park [count\|all] [stop]` | Standalone: park up to `count` bots at the AFK warp (once each) |
+| `/kos [on\|off\|stop]` | Kill-on-sight combat: attack players who are **not** the TPA main player, fleet bots, or trusted names — hits spread out around the 0.5s damage-immunity window (`/all /kos` arms the fleet) |
 | `/drop [count]` | Drop the held stack (or `count` items from it) |
 | `/pickup [all]` | Pathfind to the nearest dropped item and collect it (`all` = sweep the area) |
 | `/gui <server command>` | Open a server GUI and manage it manually (no auto-click/auto-warp) |

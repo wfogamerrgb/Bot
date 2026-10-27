@@ -131,6 +131,15 @@ function usedNames(config, { file, io, existing, blocked }) {
     })]
 }
 
+// Auto-route weighting for /new-gen. The direct connection is the favourite
+// route: 3 shares against every proxy group's 1 — "used 2x more of the time" —
+// so with one proxy group the split is exactly 3/4 direct and 1/4 group, and
+// each further group divides its own single share. The route furthest below
+// its weighted share takes the next name (ties: direct first, then the lower
+// group index), which keeps the ratio exact over any run length.
+const DIRECT_SHARE = 3
+const GROUP_SHARE = 1
+
 function persistGeneratedBots({ file = path.join(__dirname, '.env'), env = process.env, existing = [], blocked = [], count = 1, group = 'auto', io = fs, randomInt = crypto.randomInt }) {
   let text = ''
   try { text = io.readFileSync(file, 'utf8') } catch (err) { if (err.code !== 'ENOENT') throw err }
@@ -141,11 +150,31 @@ function persistGeneratedBots({ file = path.join(__dirname, '.env'), env = proce
   const names = generateNames(count, used, randomInt)
   const updates = { BOT_NAMES: [...new Set([...parseNameList(config.BOT_NAMES), ...names])].join(',') }
   const groups = new Map(routes.map(route => [route.index, parseNameList(config[`PROXY_GROUP_${route.index}_BOTS`])]))
+  // Roster names outside every group already ride the direct/default route,
+  // so they seed the direct share before any new name is placed.
+  const grouped = new Set([...groups.values()].flat().map(keyOf))
+  let directCount = parseNameList(config.BOT_NAMES).filter(name => !grouped.has(keyOf(name))).length
   const assignments = []
   for (const name of names) {
-    const selected = group === 'direct' ? null : group === 'auto' ? [...groups.keys()].sort((a, b) => groups.get(a).length - groups.get(b).length || a - b)[0] ?? null : Number(group)
+    let selected
+    if (group === 'auto') {
+      const shares = [...groups].map(([index, members]) => ({ index, share: members.length / GROUP_SHARE }))
+      if (groups.size) shares.push({ index: null, share: directCount / DIRECT_SHARE })
+      selected = shares.length
+        ? shares.sort((a, b) => a.share - b.share || (a.index === null ? -1 : b.index === null ? 1 : a.index - b.index))[0].index
+        : null
+    } else {
+      selected = group === 'direct' ? null : Number(group)
+    }
     if (selected != null) { groups.get(selected).push(name); updates[`PROXY_GROUP_${selected}_BOTS`] = groups.get(selected).join(',') }
-    else if (group === 'direct') updates[`BOT_DIRECT_${name}`] = 'true'
+    else if (group === 'direct' || (group === 'auto' && groups.size)) {
+      // A direct pick is flagged like group=direct so it bypasses a global
+      // PROXY_HOST too — "direct" has to mean direct. With no proxy groups at
+      // all there is nothing to distribute against, so names keep riding the
+      // default route (previous behaviour, unchanged).
+      updates[`BOT_DIRECT_${name}`] = 'true'
+      directCount++
+    }
     assignments.push({ name, group: selected })
   }
   saveEnvFile(file, text, updates, io)

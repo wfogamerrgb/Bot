@@ -60,7 +60,7 @@ const {
 } = require('./bot-controls')
 const os = require('os')
 const { createMonitoring, classifyKick } = require('./monitoring')
-const { createAllBannedTorRotation } = require('./tor-fleet')
+const { createAllBannedTorRotation, readTorExitIp } = require('./tor-fleet')
 const { createPearlStasis } = require('./pearl-stasis')
 const removedBotsStore = require('./removed-bots')
 const net = require('net')
@@ -72,7 +72,7 @@ const { decodeCommandTree, decodeCompletions } = require('./server-commands')
 const { persistGeneratedBots, persistRegeneratedName } = require('./generated-bots')
 const { namesFromText } = require(path.join(__dirname, 'robot-login'))
 const zlib = require('zlib')
-const { exec, execFile } = require('child_process')
+const { exec, execFile, spawn } = require('child_process')
 const { createTerminal, sshConfig } = require('./expose-terminal')
 const dataStore = require(path.join(__dirname, 'data-store'))
 // Runtime settings (the dashboard .ENV tab: temporary overrides, never written to disk),
@@ -704,17 +704,55 @@ const PROXY_STALL_ENABLED = PROXY_ENABLED && process.env.PROXY_STALL_WATCHDOG !=
 const PROXY_STALL_TIMEOUT_MS = readDelayMs(process.env.PROXY_STALL_TIMEOUT_MS, 90000)
 const PROXY_STALL_CHECK_MS = readDelayMs(process.env.PROXY_STALL_CHECK_MS, 20000)
 const PROXY_STALL_RATIO = readNumber(process.env.PROXY_STALL_RATIO, 0.5, 0, 1)
-const PROXY_IS_LOCAL = /^(127\.0\.0\.1|localhost|::1)$/i.test(PROXY_HOST)
-// Only a local SOCKS proxy can be restarted from here, and the command to do it
-// differs per platform: Homebrew on macOS, systemd on Linux. It used to assume
-// brew unconditionally, so a Linux host running Tor locally hit "brew: command
-// not found" from the stall watchdog. Unset on anything else — the watchdog
-// then stays quiet instead of spawning a command that cannot work.
-const PROXY_RESTART_CMD = process.env.PROXY_RESTART_CMD || (PROXY_IS_LOCAL
-? (process.platform === 'darwin' ? 'brew services restart tor'
-: process.platform === 'linux' ? 'systemctl restart tor 2>/dev/null || sudo systemctl restart tor'
-: '')
-: '')
+// "Local" means we can restart the proxy ourselves: the default route OR any
+// proxy GROUP pointing at loopback. The deployed ECS config is group-only
+// (PROXY_HOST empty, PROXY_GROUP_2/3 on localhost:9050) — treating only
+// PROXY_HOST as local left its Tor unmanaged: nothing started it, nothing
+// noticed when it died, and every group bot saw "ECONNREFUSED … nothing is
+// listening". PROXY_LOCAL_ENDPOINTS is the set of loopback SOCKS ports that
+// actually carry bots (tor-fleet's "controllable endpoint" notion, in bulk).
+const PROXY_LOCAL_HOST_RE = /^(127\.0\.0\.1|localhost|::1)$/i
+const PROXY_LOCAL_ENDPOINTS = (() => {
+  const out = new Map()
+  const add = (host, port) => {
+    if (!host || !PROXY_LOCAL_HOST_RE.test(host)) return
+    const p = parseInt(port, 10)
+    if (!Number.isInteger(p) || p < 1 || p > 65535) return
+    out.set(`${host}:${p}`, { host, port: p })
+  }
+  if (PROXY_ENABLED) add(PROXY_HOST, PROXY_PORT)
+  for (const group of PROXY_GROUPS) add(group.host, group.port)
+  return [...out.values()]
+})()
+const PROXY_IS_LOCAL = PROXY_LOCAL_ENDPOINTS.length > 0
+// Only a local SOCKS proxy can be restarted from here. On Linux the command is
+// resolved in order of what actually manages the proxy — guessing wrong means a
+// watchdog that fires and does nothing (which is how it "didn't work" before:
+// `systemctl restart tor` targets the systemd unit, not the instances that
+// `npm run start` (scripts/restart-tor.sh) launches, and bare `sudo` in a
+// TTY-less process hangs forever on the password prompt):
+//   1. /usr/local/bin/restart-tor — the Docker image's helper (verified restart),
+//   2. scripts/restart-tor.sh --tor-only — the repo's own forceful restart that
+//      `npm run start` uses on bare metal,
+//   3. systemd's tor unit as a last resort, with `sudo -n` so it fails fast
+//      instead of blocking on a password.
+// Unset on anything else — the watchdog then stays quiet instead of spawning a
+// command that cannot work.
+function resolveProxyRestartCmd () {
+if (!PROXY_IS_LOCAL) return ''
+if (process.platform === 'win32') return ''
+// The repo's own forceful restart — the same tool `npm run start` uses. It is
+// rootless now (per-user TOR_HOME), so it works identically on macOS and
+// Linux without sudo. Preferred over brew/systemd, which manage their own
+// single service instance and leave our other ports dead.
+const selfRestart = path.join(__dirname, 'scripts', 'restart-tor.sh')
+if (fs.existsSync(selfRestart)) return `bash ${JSON.stringify(selfRestart)} --tor-only`
+if (fs.existsSync('/usr/local/bin/restart-tor')) return '/usr/local/bin/restart-tor'
+if (process.platform === 'darwin') return 'brew services restart tor'
+if (process.platform === 'linux') return 'systemctl restart tor 2>/dev/null || sudo -n systemctl restart tor'
+return ''
+}
+const PROXY_RESTART_CMD = process.env.PROXY_RESTART_CMD || resolveProxyRestartCmd()
 const PROXY_RESTART_COOLDOWN_MS = readDelayMs(process.env.PROXY_RESTART_COOLDOWN_MS, 120000)
 let lastProxyRestart = 0
 
@@ -770,7 +808,15 @@ destination: { host: targetHost, port: targetPort }
 client.setSocket(socket)
 client.emit('connect')
 }).catch(err => {
-const errMsg = `SOCKS5 proxy connection failed: ${err.message}`
+// "connect ECONNREFUSED 127.0.0.1:9050" means the local Tor/proxy simply
+// isn't listening (down, still bootstrapping, or mid-restart) — say how to
+// start it instead of leaking a bare socket error into every bot's status.
+const localProxy = /^(127\.0\.0\.1|localhost|::1)$/i.test(proxy.host || '')
+let hint = ''
+if (localProxy && /ECONNREFUSED|EHOSTUNREACH/.test(err.message || '')) {
+  hint = ' — local SOCKS5 proxy ' + proxy.host + ':' + proxy.port + ' is not listening (Tor is down or restarting). Start it: Docker -> restart-tor · Linux -> sudo npm run start (or systemctl start tor) · macOS -> brew services start tor. Bots retry automatically.'
+}
+const errMsg = `SOCKS5 proxy connection failed: ${err.message}${hint}`
 client.emit('error', new Error(errMsg))
 client.emit('end', errMsg)
 })
@@ -990,6 +1036,8 @@ function torBanSnapshot() {
 const autoTorRotation = createAllBannedTorRotation({
   snapshot: torBanSnapshot,
   enabled: () => settings.get('TOR_AUTO_ROTATE_BANNED'),
+  threshold: () => readNumber(settings.get('TOR_ROTATE_BAN_RATIO'), 0.8, 0, 1),
+  restart: restartTorForBans,
   log: message => logFor(SYSTEM_ID, `{cyan-fg}[Tor] ${sanitize(message)}{/cyan-fg}`)
 })
 function roamBusy(entry) {
@@ -1148,7 +1196,16 @@ cfDefine('LIFESTEAL_DUELS_BOTS', { type: 'int', def: 1, min: 0, group: 'Lifestea
 cfDefine('LIFESTEAL_QUEUE_BOTS', { type: 'int', def: 1, min: 0, group: 'Lifesteal', desc: 'How many bots hold the /queue role (live; 0 disables the role)' })
 cfDefine('LIFESTEAL_ARENA_BOTS', { type: 'int', def: 1, min: 0, group: 'Lifesteal', desc: 'How many bots loop /warp arena → walk-until-hit (live; 0 disables the role)' })
 cfDefine('LIFESTEAL_TPA_BOTS', { type: 'int', def: 1, min: 0, group: 'Lifesteal', desc: 'How many bots spam /tpa round-robin — raise this for more /tpa bots (live; 0 disables the role)' })
+cfDefine('LIFESTEAL_TPA_CMD', { type: 'string', def: '/tpa', group: 'Lifesteal', desc: 'Command the tpa role spams per player — /tpahere pulls each player to the bot (live; /tpahere-roundrobin always uses /tpahere)' })
 cfDefine('LIFESTEAL_SOLO_REPEAT_MS', { type: 'ms', def: 15000, min: 1000, group: 'Lifesteal', desc: 'Re-send cadence for standalone /duelsroomspam and /queuespam (live)' })
+// /kos pacing. Vanilla rejects hits on a hurt target for 10 ticks (500ms) —
+// inside that window a hit adds at most the difference over the previous one —
+// so the fleet's swings are spaced just past the window and rotate across bots.
+cfDefine('KOS_ENGAGE_DELAY_MS', { type: 'ms', def: 500, min: 0, group: 'Combat', desc: '/kos: delay after a target comes in reach (the /tpaccept moment) before the fleet starts hitting (live)' })
+cfDefine('KOS_STAGGER_MS', { type: 'ms', def: 550, min: 0, group: 'Combat', desc: '/kos: minimum spacing between fleet hits on one target — the 10-tick (500ms) damage-immunity window wastes closer hits (live)' })
+cfDefine('KOS_BOT_COOLDOWN_MS', { type: 'ms', def: 600, min: 0, group: 'Combat', desc: '/kos: minimum spacing between one bot\'s own hits — netherite sword recharge (live)' })
+cfDefine('KOS_BOT_COOLDOWN_JITTER_MS', { type: 'ms', def: 100, min: 0, group: 'Combat', desc: '/kos: random extra delay (0..this) added to each of the bot\'s own hits — give or take a couple of ticks so swings never land on a fixed rhythm (live)' })
+cfDefine('KOS_STAGGER_JITTER_MS', { type: 'ms', def: 50, min: 0, group: 'Combat', desc: '/kos: random extra delay (0..this) added to the fleet hit slot per target — keeps the rotation non-periodic (live)' })
 cfDefine('BOT_NAMES', { type: 'list', group: 'Server', live: false, desc: 'The roster (startup-only — edit the file and restart to change it)' })
 cfDefine('CONNECT_DELAY_MS', { type: 'ms', def: 22571, min: 0, group: 'Timing', live: false, desc: 'Gap between bot connects (startup, /new-gen, lifesteal top-up)' })
 // Routine defaults refresh on file changes and temporary overrides. Only
@@ -1162,7 +1219,8 @@ cfDefine('WARP_COMMAND', { type: 'string', def: '/warp afk', group: 'Dump', desc
 cfDefine('WEB_PORT', { type: 'int', def: 80, min: 1, max: 65535, group: 'Dashboard', live: false, desc: 'Dashboard port (startup-only)' })
 cfDefine('WEB_PASSWORD', { type: 'string', group: 'Dashboard', live: false, desc: 'Dashboard login (startup-only; leave empty for a generated one)' })
 cfDefine('TOR_CONTROL_PORTS', { type: 'string', def: '', group: 'Tor', desc: 'Tor control ports for /tor-newnym and the dashboard button — empty = every local proxy SOCKS port + 1, matching scripts/restart-tor.sh (live)' })
-cfDefine('TOR_AUTO_ROTATE_BANNED', { type: 'bool', def: true, group: 'Tor', desc: 'When every assigned bot on one local Tor SOCKS endpoint is confirmed banned, request NEWNYM and verify a changed probe exit IP; never unban/reconnect blocked accounts (live)' })
+cfDefine('TOR_AUTO_ROTATE_BANNED', { type: 'bool', def: true, group: 'Tor', desc: 'When every assigned bot on one local Tor SOCKS endpoint is confirmed banned — or more than TOR_ROTATE_BAN_RATIO of them — request NEWNYM and verify a changed probe exit IP, escalating to a full Tor restart when the exit cannot change; never unban/reconnect blocked accounts (live)' })
+cfDefine('TOR_ROTATE_BAN_RATIO', { type: 'number', def: 0.8, min: 0, max: 1, group: 'Tor', desc: 'Ban share on one local Tor SOCKS endpoint that triggers the circuit restart early (0.8 = more than 80% banned; 1.0 = only when all are banned) (live)' })
 cfDefine('ROBOT_AUTH_DELAY_MS', { type: 'ms', def: 5000, min: 5000, group: 'Auth', desc: 'Global minimum spacing of start-login /login and /register sends, including fallback candidates (live)' })
 cfDefine('TOR_ROTATE_DELAY_MS', { type: 'string', def: '5000', group: 'Tor', desc: 'Delay between bot reconnects during a /tor-newnym rotation, so a group rotate does not hit the login rate limit at once (live)' })
 
@@ -1260,7 +1318,7 @@ const spawnerDrop = require(path.join(__dirname, 'spawner-drop')).createSpawnerD
   defaults: () => ({ durationMs: settings.get('SPAWNER_DROP_DURATION_MS'), cooldownMs: settings.get('SPAWNER_DROP_COOLDOWN_MS'), mode: settings.get('SPAWNER_DROP_MODE'), scope: settings.get('SPAWNER_DROP_SCOPE'), terms: [settings.get('SPAWNER_DROP_MATCH')] })
 })
 
-const LOCAL_COMMANDS = ['/tpauto', '/freeforall', '/server-commands', '/start-rtp', '/stop-rtp', '/evidence', '/connection', '/spawner-drop', '/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dump-spawners', '/dump-gui-look', '/dc', '/reconnect', '/crates', '/crates-loop', '/spawners', '/data', '/shardshop-loop', '/closeBot', '/bot-coinflip', '/bot-coinflip-all', '/ai-chat', '/repeat', '/repeat-cancel', '/use-book', '/enchanted-golden-apple-extract', '/ege', '/scripts', '/run-script', '/lifesteal-start', '/lifesteal-stop', '/lifesteal-status', '/new-gen-maintain', '/tpa-roundrobin', '/duelsroomspam', '/queuespam', '/warp-arena', '/afk-park']
+const LOCAL_COMMANDS = ['/tpauto', '/freeforall', '/kos', '/server-commands', '/start-rtp', '/stop-rtp', '/evidence', '/connection', '/spawner-drop', '/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dump-spawners', '/dump-gui-look', '/dc', '/reconnect', '/crates', '/crates-loop', '/spawners', '/data', '/shardshop-loop', '/closeBot', '/bot-coinflip', '/bot-coinflip-all', '/ai-chat', '/repeat', '/repeat-cancel', '/use-book', '/enchanted-golden-apple-extract', '/ege', '/scripts', '/run-script', '/lifesteal-start', '/lifesteal-stop', '/lifesteal-status', '/new-gen-maintain', '/tpa-roundrobin', '/tpahere-roundrobin', '/duelsroomspam', '/queuespam', '/warp-arena', '/afk-park']
 
 // ── Lifesteal queue / arena / TPA automation (lifesteal-queue.js) ──────────
 // How many bots hold each role is configuration (live via the .ENV tab):
@@ -1271,10 +1329,13 @@ const LOCAL_COMMANDS = ['/tpauto', '/freeforall', '/server-commands', '/start-rt
 // server just not /server lifesteal). Roster tops up to LIFESTEAL_TARGET_BOTS
 // (default 20) via /new-gen semantics and never removes bots. Server-banned
 // bots count as missing so they are replaced with fresh names.
-// The roles are also available STANDALONE — /tpa-roundrobin, /duelsroomspam,
-// /queuespam, /warp-arena, /afk-park [count|all] [stop] — each runs just its
-// own routine on [count] online bots (default all), with no roster top-up,
-// no /new-gen and no Tor restart.
+// The roles are also available STANDALONE — /tpa-roundrobin,
+// /tpahere-roundrobin, /duelsroomspam, /queuespam, /warp-arena, /afk-park —
+// each runs just its own routine with no roster top-up, no /new-gen and no
+// Tor restart. The tpa round-robins bind to the bot the command was issued
+// on (one independent round-robin per bot — run it on more bots or /all to
+// run several); the others run on [count|all] online bots (default all).
+// /tpahere-roundrobin is the tpa round-robin sending /tpahere <player>.
 const lifestealQueue = require(path.join(__dirname, 'lifesteal-queue')).createLifestealQueue({
   getBots: () => bots,
   isOnline: (entry) => botOnline(entry),
@@ -1479,15 +1540,54 @@ function startFreeForAll (id) {
   return true
 }
 
-// Standalone lifesteal routines (/tpa-roundrobin, /duelsroomspam, /queuespam,
-// /warp-arena, /afk-park): run ONE role on the bots already online — no roster
-// top-up, no /new-gen, no Tor restart. `[count|all]` limits the routine to
-// that many bots (default: every online bot); `stop` ends it.
+// ── /kos: kill-on-sight with trust filter and fleet-staggered hits ──────────
+// /freeforall attacks anything nearby; /kos only attacks PLAYERS who are NOT
+// protected — never TPA_MAIN_PLAYER, never fleet bots, never TPA_TRUSTED_BOTS
+// (isTrustedTpaName is the "tpa main player and bots list" /tpauto trusts). So
+// a random player who accepts a /tpa or /tpahere and lands in the fleet gets
+// swarmed, and the main player and the bots never take a hit. Vanilla damage
+// immunity rejects hits on a hurt target for 10 ticks (500ms) — inside that
+// window a hit adds at most the difference over the previous one — so "all
+// bots hit at once" wastes nearly every hit. kos.js spreads the swings out:
+// one fleet hit per target per KOS_STAGGER_MS (550), rotating across bots,
+// starting KOS_ENGAGE_DELAY_MS (500) after the target comes in reach.
+const kos = require(path.join(__dirname, 'kos')).createKos({
+  getBots: () => bots,
+  isProtectedName: (name) => isTrustedTpaName(name),
+  pickBestWeapon,
+  now: () => Date.now(),
+  setPulse: setInterval,
+  clearPulse: clearInterval,
+  getEnv: () => process.env,
+  log: (id, msg) => logFor(id || SYSTEM_ID, `{cyan-fg}[kos] ${sanitize(msg)}{/cyan-fg}`),
+})
+
+// Standalone lifesteal routines (/tpa-roundrobin, /tpahere-roundrobin,
+// /duelsroomspam, /queuespam, /warp-arena, /afk-park): run ONE role on the
+// bots already online — no roster top-up, no /new-gen, no Tor restart.
+// `[count|all]` limits the routine to that many bots (default: every online
+// bot); `stop` ends it.
 function lifestealSoloCommand (id, role, parts, name) {
   const arg = String(parts[1] || '').toLowerCase()
+  const arg2 = String(parts[2] || '').toLowerCase()
+  // /tpa-roundrobin and /tpahere-roundrobin BIND TO THIS BOT only — one
+  // independent round-robin per bot (own cursor, own stop). Run the command
+  // on more bots (or /all) to run several at once. Everything else keeps the
+  // [count|all] spread.
+  const perBot = role === 'tpa' || role === 'tpahere'
   if (arg === 'stop' || arg === 'off') {
-    const r = lifestealQueue.stopSolo()
+    const r = perBot ? lifestealQueue.stopSolo(role, arg2 === 'all' ? null : id) : lifestealQueue.stopSolo()
     logFor(id, r.ok ? '{green-fg}✓ Standalone routine stopped.{/green-fg}' : `{yellow-fg}⚠ ${sanitize(r.error || 'no standalone routine running')}{/yellow-fg}`)
+    return true
+  }
+  if (perBot) {
+    if (arg) {
+      logFor(id, `{yellow-fg}⚠ Usage: ${name} [stop [all]] — it binds to THIS bot only; run it on more bots (or /all) to run multiple.{/yellow-fg}`)
+      return true
+    }
+    const r = lifestealQueue.startSolo(role, 0, { onlyIds: [id] })
+    if (!r.ok) { logFor(id, `{yellow-fg}⚠ ${sanitize(r.error || 'could not start')}{/yellow-fg}`); return true }
+    logFor(id, `{green-fg}✓ Standalone ${sanitize(role)} round-robin bound to ${sanitize(id)} — stop with ${name} stop.{/green-fg}`)
     return true
   }
   let count = 0
@@ -1540,7 +1640,7 @@ function dispatchCommandToBot (msg, id) {
   const command = String(msg || '').trim()
   if (!command) return false
   if (!bots[id]) return false
-  if (bots[id]?.rtpRunning && !/^\/(?:tpauto|freeforall|status|connection|coordinates|evidence|stop-rtp|start-rtp)(?:\s|$)/.test(command)) {
+  if (bots[id]?.rtpRunning && !/^\/(?:tpauto|freeforall|kos|status|connection|coordinates|evidence|stop-rtp|start-rtp)(?:\s|$)/.test(command)) {
     logFor(id, '{yellow-fg}⚠ Stop roaming before broadcasting another operation to this bot.{/yellow-fg}')
     return false
   }
@@ -4351,6 +4451,7 @@ bot.on('messagestr', (text) => { try { lifestealQueue.onMessage(id, String(text 
 bot.on('death', () => {
   try { lifestealQueue.onDeath(id) } catch (_) {}
   stopFreeForAll(id, true)
+  kos.stop(id, true)
   cancelPendingRtp(id)
   recordEvidence(id, 'deaths', { source: 'mineflayer:death', position: botLocation(bot), reason: 'Death observed; killer/cause unknown unless the server supplies a death message.', recentServerMessages: (bots[id]?.chatHistory || []).slice(-5) })
   spawnerDrop.stop(id, 'death')
@@ -4363,6 +4464,7 @@ if (bot._client) bot._client.on('death_combat_event', packet => {
 bot.on('kicked', (reason) => {
 if (bots[id]?.bot !== bot) return
 stopFreeForAll(id, true)
+kos.stop(id, true)
 try { lifestealQueue.onKick(id, typeof reason === 'string' ? reason : JSON.stringify(reason)) } catch (_) {}
 if (!bots[id]) return
 cancelPendingRtp(id)
@@ -4505,6 +4607,7 @@ const connectedBeforeEnd = connected
 connected = false
 if (bots[id]?.bot !== bot) return
 stopFreeForAll(id, true)
+kos.stop(id, true)
 entry.connectionState = 'disconnected'
 cancelPendingRtp(id)
 entry.disconnectedAt = Date.now()
@@ -4553,6 +4656,7 @@ lastRawError = null
 bots[id].disconnectManually = () => {
 manualDisconnect = true
 stopFreeForAll(id, true)
+kos.stop(id, true)
 rtpRoaming.stop(id)
 
 try { manual.stopManualMode(id) } catch (_) {}
@@ -4620,20 +4724,239 @@ currentConnectDelay += CONNECT_DELAY_MS + Math.floor(Math.random() * (CONNECT_DE
 // instead of sitting there dead forever. If a large fraction of bots stall at
 // once, restarts the local proxy service first since that points at the shared
 // tunnel rather than any individual bot.
-function restartProxyService() {
-if (!PROXY_RESTART_CMD) return
+// ── Managed Tor (auto-start) ─────────────────────────────────────────────────
+// Nothing listening on the local SOCKS port used to mean "connect ECONNREFUSED
+// 127.0.0.1:9050" plus a manual `brew services start tor` / `systemctl start
+// tor`. Now the app starts its OWN tor process — no root, no system service —
+// with a private DataDirectory under the OS temp dir, respawns it if it dies,
+// and stops it on exit. If the port is already taken (system tor, the Docker
+// entrypoint, npm run start), it stays out of the way entirely.
+let managedTor = null // { child, bin }
+let managedTorSpawning = false
+const TOR_BINARIES = ['tor', '/opt/homebrew/bin/tor', '/usr/local/bin/tor', '/usr/sbin/tor']
+
+function managedTorDir () {
+return path.join(os.tmpdir(), 'afk-console-tor-' + PROXY_PORT)
+}
+
+function torLog (line) {
+// tor is chatty at notice level; keep milestones and anything wrong.
+if (/Bootstrapped|Opening Socks|Closing|\[warn\]|\[err\]| Died|Failed/.test(line)) {
+  logFor(SYSTEM_ID, `{gray-fg}[tor] ${sanitize(line)}{/gray-fg}`)
+}
+}
+
+function startManagedTor (reason) {
+if (!PROXY_ENABLED || !PROXY_IS_LOCAL || managedTor || managedTorSpawning || process.platform === 'win32') return
+managedTorSpawning = true
+const dir = managedTorDir()
+try { fs.mkdirSync(dir, { recursive: true, mode: 0o700 }) } catch (_) {}
+const torrc = path.join(dir, 'torrc')
+try {
+  fs.writeFileSync(torrc, 'SocksPort 127.0.0.1:' + PROXY_PORT + '\nControlPort 127.0.0.1:' + (PROXY_PORT + 1) + '\nCookieAuthentication 0\nDataDirectory ' + dir + '\nLog notice stdout\n')
+} catch (err) {
+  managedTorSpawning = false
+  logFor(SYSTEM_ID, `{red-fg}✗ ${sanitize(String(reason))} — cannot write ${sanitize(torrc)}: ${sanitize(err.message)}{/red-fg}`)
+  return
+}
+const tryBin = i => {
+  if (i >= TOR_BINARIES.length) {
+    managedTorSpawning = false
+    const how = process.platform === 'darwin' ? 'brew install tor' : 'sudo apt install tor'
+    logFor(SYSTEM_ID, `{red-fg}✗ ${sanitize(String(reason))} and no tor binary found — install it (${how}) or point PROXY_HOST at your proxy. Bots keep retrying.{/red-fg}`)
+    return
+  }
+  const bin = TOR_BINARIES[i]
+  const child = spawn(bin, ['-f', torrc], { stdio: ['ignore', 'pipe', 'pipe'] })
+  child.on('error', err => {
+    if (err.code === 'ENOENT') { tryBin(i + 1); return }
+    managedTorSpawning = false
+    logFor(SYSTEM_ID, `{red-fg}✗ tor failed to start: ${sanitize(err.message)}{/red-fg}`)
+  })
+  const feed = out => {
+    let buf = ''
+    out.on('data', d => {
+      buf += d
+      const lines = buf.split('\n'); buf = lines.pop()
+      for (const line of lines) if (line.trim()) torLog(line.trim())
+    })
+  }
+  feed(child.stdout); feed(child.stderr)
+  child.on('exit', (code, sig) => {
+    if (managedTor && managedTor.child === child) managedTor = null
+    if (appStopping) return
+    // Something else (restart-tor.sh, system tor) may own the port now — never
+    // fight it. Only respawn when the port is genuinely dead.
+    const probe = net.connect(PROXY_PORT, PROXY_HOST, () => probe.destroy())
+    probe.on('error', () => {
+      logFor(SYSTEM_ID, `{yellow-fg}⚠ managed Tor exited (${sig || code}) — restarting in 5s{/yellow-fg}`)
+      setTimeout(() => startManagedTor('managed Tor exited'), 5000)
+    })
+  })
+  managedTor = { child, bin }
+  managedTorSpawning = false
+  logFor(SYSTEM_ID, `{green-fg}✓ started managed Tor (${sanitize(bin)}) on ${PROXY_HOST}:${PROXY_PORT} — ${sanitize(String(reason))}{/green-fg}`)
+}
+tryBin(0)
+}
+
+function restartManagedTor () {
+const cur = managedTor
+managedTor = null
+// wipe tor's state file for a guaranteed new circuit (same contract as
+// scripts/restart-tor.sh: kill + state wipe = fresh guard + fresh exit)
+try { fs.rmSync(path.join(managedTorDir(), 'state'), { force: true }) } catch (_) {}
+if (cur) {
+  try { cur.child.removeAllListeners('exit'); cur.child.kill('SIGKILL') } catch (_) {}
+}
+startManagedTor('restart requested')
+}
+
+let appStopping = false
+function stopManagedTor () {
+appStopping = true
+if (managedTor) { try { managedTor.child.kill() } catch (_) {} }
+}
+process.on('exit', stopManagedTor)
+// SIGINT/SIGTERM kill node WITHOUT running 'exit' handlers — without these the
+// managed tor would outlive the app as an orphan on the SOCKS port.
+for (const sig of ['SIGINT', 'SIGTERM']) {
+process.on(sig, () => { stopManagedTor(); process.exit(0) })
+}
+
+let proxyRestartRunning = false
+
+// Bring the local SOCKS proxy back when it is down:
+//   1. PROXY_RESTART_CMD (resolveProxyRestartCmd: scripts/restart-tor.sh first,
+//      then container helper / brew / systemd fallbacks),
+//   2. VERIFY our port actually answers afterwards — a command can exit 0
+//      without bringing up OUR port (e.g. `brew services restart tor` runs the
+//      9050 service only),
+//   3. managed Tor as the safety net when the command failed or fell short.
+function ensureLocalProxy (reason) {
+if (!PROXY_IS_LOCAL || proxyRestartRunning) return
+const verify = PROXY_LOCAL_ENDPOINTS[0] || { host: PROXY_HOST, port: PROXY_PORT }
+if (!PROXY_RESTART_CMD) {
+  if (managedTor) restartManagedTor()
+  else startManagedTor(reason)
+  return
+}
+proxyRestartRunning = true
+console.warn(`[proxy-watchdog] ${reason} — restarting local proxy: ${PROXY_RESTART_CMD}`)
+const fallback = why => {
+  logFor(SYSTEM_ID, `{yellow-fg}⚠ ${sanitize(why)} — falling back to managed Tor{/yellow-fg}`)
+  if (managedTor) restartManagedTor()
+  else startManagedTor(`${reason} (restart command insufficient)`)
+}
+exec(PROXY_RESTART_CMD, {
+  timeout: 150000,
+  // App-driven restarts care about "is it LISTENING again" first; the exit-IP
+  // proof (REQUIRE_NEW_EXIT=1) stays `npm run start`'s stricter job.
+  env: /restart-tor/.test(PROXY_RESTART_CMD) ? { ...process.env, REQUIRE_NEW_EXIT: '0' } : process.env
+}, (err) => {
+  if (err) {
+    proxyRestartRunning = false
+    console.error(`[proxy-watchdog] Restart command failed: ${sanitize(err.message)}`)
+    fallback('restart command failed')
+    return
+  }
+  console.warn(`[proxy-watchdog] Restart command completed — verifying ${verify.host}:${verify.port}…`)
+  setTimeout(() => {
+    const probe = net.connect(verify.port, verify.host, () => {
+      probe.destroy()
+      proxyRestartRunning = false
+      logFor(SYSTEM_ID, `{green-fg}✓ ${verify.host}:${verify.port} is listening again — bots can connect{/green-fg}`)
+    })
+    probe.on('error', () => {
+      proxyRestartRunning = false
+      fallback(`nothing listening on ${verify.host}:${verify.port} after the restart command`)
+    })
+  }, 2000)
+})
+}
+
+function restartProxyService(reason) {
 const now = Date.now()
 if (now - lastProxyRestart < PROXY_RESTART_COOLDOWN_MS) return
 lastProxyRestart = now
-console.warn(`[proxy-watchdog] Multiple bots stalled at once — restarting local proxy: ${PROXY_RESTART_CMD}`)
-exec(PROXY_RESTART_CMD, (err, stdout, stderr) => {
-if (err) console.error(`[proxy-watchdog] Restart command failed: ${sanitize(err.message)}`)
-else console.warn(`[proxy-watchdog] Restart command completed.`)
-})
+ensureLocalProxy(reason)
+}
+
+// ── Ban-wave Tor restart (tor-fleet auto-rotation escalation) ─────────────────
+// When SIGNAL NEWNYM cannot prove a changed exit (control port dead, exit
+// pinned, probe unchanged), restart Tor itself and re-prove. OK only when the
+// SOCKS probe answers again AND the exit actually changed — an unchanged exit
+// is a burned circuit and must keep failing, so the rotation retries after its
+// cooldown instead of claiming success.
+function probeTorExitIp (endpoint) {
+return readTorExitIp(endpoint).catch(() => null)
+}
+async function restartTorForBans (endpoint) {
+const before = await probeTorExitIp(endpoint)
+if (!PROXY_RESTART_CMD) {
+  return { ok: false, before: before || undefined, error: 'no local Tor restart command (set PROXY_RESTART_CMD)' }
+}
+const failure = await new Promise(resolve => exec(PROXY_RESTART_CMD, {
+  timeout: 150000,
+  // Unlike the stall watchdog (REQUIRE_NEW_EXIT=0 — "listening again" is
+  // enough there), a ban rotation only counts with a PROVEN exit change, so
+  // restart-tor.sh keeps its strict default here.
+  env: /restart-tor/.test(PROXY_RESTART_CMD) ? { ...process.env, REQUIRE_NEW_EXIT: '1' } : process.env
+}, err => resolve(err)))
+if (failure) return { ok: false, before: before || undefined, error: `restart command failed: ${failure.message}` }
+let after = null
+for (let i = 0; i < 3 && !after; i++) {
+  after = await probeTorExitIp(endpoint)
+  if (!after) await new Promise(resolve => setTimeout(resolve, 5000))
+}
+if (!after) return { ok: false, before: before || undefined, error: 'restart completed but the SOCKS exit probe never answered' }
+if (before && after === before) return { ok: false, before, after, error: `restart completed but the exit is STILL ${after}` }
+return { ok: true, before: before || undefined, after }
+}
+
+// Startup proxy probe: if the local SOCKS proxy is not listening a few seconds
+// after boot, print exactly how to start it. Bare-metal `node bot.js` on Linux
+// or macOS otherwise floods every bot with "connect ECONNREFUSED 127.0.0.1:9050"
+// with no hint that Tor was never started.
+if (PROXY_LOCAL_ENDPOINTS.length) {
+setTimeout(() => {
+  for (const ep of PROXY_LOCAL_ENDPOINTS) {
+    const probe = net.connect(ep.port, ep.host, () => probe.destroy())
+    probe.on('error', err => {
+      // Not listening → bring Tor up ourselves (restart-tor.sh, then managed
+      // fallback) instead of demanding a manual start.
+      if (err.code === 'ECONNREFUSED') ensureLocalProxy(`local SOCKS5 proxy ${ep.host}:${ep.port} not listening at startup`)
+    })
+  }
+}, 3000)
+}
+
+// Local-proxy liveness runs regardless of PROXY_STALL_ENABLED: a group-only
+// config has no stall watchdog, but its Tor can still die mid-run, and a
+// refused connection to a local SOCKS port IS the proxy being down. Restart
+// (cooldown-gated like the stall path). Kept out of the stall interval so the
+// two watchdogs can never double-fire on the same death.
+if (PROXY_LOCAL_ENDPOINTS.length) {
+const localLiveness = setInterval(() => {
+  for (const ep of PROXY_LOCAL_ENDPOINTS) {
+    const liveness = net.connect(ep.port, ep.host, () => liveness.destroy())
+    liveness.on('error', err => {
+      if (err.code === 'ECONNREFUSED') restartProxyService(`local SOCKS5 proxy ${ep.host}:${ep.port} is not listening`)
+    })
+  }
+}, PROXY_STALL_CHECK_MS)
+if (localLiveness.unref) localLiveness.unref()
 }
 
 if (PROXY_STALL_ENABLED) {
 setInterval(() => {
+// Proxy liveness probe: bots still handshaking have no entity yet, so the
+// spawned-stall filter below cannot see them — when the local proxy died the
+// watchdog used to observe "nothing stalled" and never recover. A refused
+// connection to the local SOCKS port IS the proxy being down; restart it
+// (cooldown-gated like the stall path).
+// (The proxy liveness probe moved to its own interval above the stall
+// watchdog, so it also covers group-only local routes.)
 const now = Date.now()
 const spawned = Object.entries(bots).filter(([, entry]) => entry.bot?.entity && entry.spawnTime && !entry.manualDisconnect)
 const stalled = spawned.filter(([, entry]) => now - entry.lastActivity > PROXY_STALL_TIMEOUT_MS)
@@ -4641,7 +4964,7 @@ if (stalled.length === 0) return
 
 // Shared-proxy failure: a big chunk of bots went quiet at the same time.
 if (spawned.length >= 2 && stalled.length / spawned.length >= PROXY_STALL_RATIO) {
-restartProxyService()
+restartProxyService('Multiple bots stalled at once')
 }
 
 stalled.forEach(([id, entry]) => {
@@ -4706,6 +5029,7 @@ const COMMANDS = {
 '/inv': 'List active bot\'s inventory',
 '/tpauto on|off': 'Toggle automatic /tpaccept for trusted bot names only',
 '/freeforall [on|off|stop]': 'Stationary combat loop: aim and hit nearby targets with the best weapon in inventory (never shields, no moving, no block breaking)',
+'/kos [on|off|stop]': 'Kill-on-sight combat like /freeforall but only attacking players NOT on the protected list (TPA_MAIN_PLAYER, fleet bots, TPA_TRUSTED_BOTS) — a random player who accepts a /tpa or /tpahere gets swarmed while the main player and bots stay untouched. Hits are spread out around vanilla\'s 10-tick damage-immunity window: first hit KOS_ENGAGE_DELAY_MS (500) after the target comes in reach, then one fleet hit per KOS_STAGGER_MS (550, +KOS_STAGGER_JITTER_MS) per target, rotating across bots; each bot recharges KOS_BOT_COOLDOWN_MS (600, +KOS_BOT_COOLDOWN_JITTER_MS) between its own hits — vanilla 3-block reach, no reach extension, hits go through walls. /all /kos arms the whole fleet',
 '/new-gen-maintain [botnumber|stop|status]': 'Maintain the fleet at <botnumber> usable bots (default 25) via /new-gen without removing bots',
 '/find <name> ["name" …]': 'Search EVERY bot\'s inventory and open window for an item by display, custom, registry name, or NBT text — multiple quoted terms are OR\'d (same matching as /dump filters)',
   '/use-book [name]': `Scan the open GUI (or, with none open, the inventory) for a book, swap it into hotbar slot 1, select it and run /use && /use — every step ${settings.get('BOOK_USE_DELAY_MS')}ms apart (BOOK_USE_DELAY_MS) so the server is never spammed. [name] overrides the scan term (default "${settings.get('BOOK_ITEM_QUERY')}"). /use-book auto on|off (BOOK_AUTO) runs it automatically whenever a GUI opens with a book in it — no book in the GUI, nothing happens`,
@@ -4722,7 +5046,8 @@ const COMMANDS = {
 '/lifesteal-start': 'Restarts Tor first (scripts/restart-tor.sh --tor-only, LIFESTEAL_TOR_RESTART_CMD override — brew services restart tor is NOT this repo\'s Tor and has no control port 9051), then requests NEWNYM on every local control port so reconnecting bots get fresh circuits, then: random bot /duelsroomqueue + random bot /queue (replaced on death, same bot allowed), one non-queue bot loops /warp arena → 5s → forward-until-hit, one bot spams /tpa until deathban (24h park), rest /warp afk (role sizes are configurable: LIFESTEAL_DUELS_BOTS / LIFESTEAL_QUEUE_BOTS / LIFESTEAL_ARENA_BOTS / LIFESTEAL_TPA_BOTS, default 1 each, 0 disables). Banned bots are replaced via /new-gen so the loop continues; roster tops up to LIFESTEAL_TARGET_BOTS=20 (never removes; counts saved names so a pending connect wave is never duplicated)',
 '/lifesteal-stop': 'Stop lifesteal automation and release held forward keys',
 '/lifesteal-status': 'Show lifesteal roles (duels/queue/arena/tpa holders), role counts, online/total counts and deathbanned bots',
-'/tpa-roundrobin [count|all] [stop]': 'Standalone: spam /tpa <player> round-robin on [count] online bots (default all) — just the tpa routine, no roster top-up, no /new-gen, no Tor restart. LIFESTEAL_TPA_INTERVAL_MS paces it; "stop" ends it',
+'/tpa-roundrobin [stop [all]]': 'Standalone: spam /tpa <player> round-robin bound to THIS bot only — one independent round-robin per bot (own cursor, own stop), so only the bound bot ever sends. Run it on more bots or /all to run several; "stop" unbinds this bot ("stop all" every bot). No roster top-up, no /new-gen, no Tor restart; LIFESTEAL_TPA_INTERVAL_MS paces it',
+'/tpahere-roundrobin [stop [all]]': 'Standalone: the same per-bot round-robin as /tpa-roundrobin but always sends /tpahere <player>, pulling each visible player to THIS bot. Run it on more bots or /all to run several; "stop" unbinds this bot ("stop all" every bot)',
 '/duelsroomspam [count|all] [stop]': 'Standalone: spam the duels-room command (LIFESTEAL_DUELSROOM_CMD) on [count] online bots (default all), re-sending every LIFESTEAL_SOLO_REPEAT_MS. "stop" ends it',
 '/queuespam [count|all] [stop]': 'Standalone: spam /queue on [count] online bots (default all), re-sending every LIFESTEAL_SOLO_REPEAT_MS. "stop" ends it',
 '/warp-arena [count|all] [stop]': 'Standalone: loop /warp arena → wait 5s → hold forward until collision on [count] online bots (default all). "stop" ends it',
@@ -5219,11 +5544,11 @@ function startHiddenDump (options = {}) {
 }
 
 function runLocalCommandForBot(id, cmd) {
-if (bots[id]?.rtpRunning && !/^\/(?:tpauto|freeforall|status|connection|coordinates|evidence|clear|inv|players|dc|disconnect|closeBot|reconnect)(?:\s|$)/.test(cmd)) { logFor(id, '{yellow-fg}⚠ Stop roaming before starting another routine.{/yellow-fg}'); return }
+if (bots[id]?.rtpRunning && !/^\/(?:tpauto|freeforall|kos|status|connection|coordinates|evidence|clear|inv|players|dc|disconnect|closeBot|reconnect)(?:\s|$)/.test(cmd)) { logFor(id, '{yellow-fg}⚠ Stop roaming before starting another routine.{/yellow-fg}'); return }
 const entry = bots[id]
 const parts = String(cmd || '').trim().split(/\s+/)
 const baseCmd = parts[0]
-if (!entry && !['/lifesteal-start', '/lifesteal-stop', '/lifesteal-status', '/new-gen-maintain', '/tpa-roundrobin', '/duelsroomspam', '/queuespam', '/warp-arena', '/afk-park', '/scripts'].includes(baseCmd)) return false
+if (!entry && !['/lifesteal-start', '/lifesteal-stop', '/lifesteal-status', '/new-gen-maintain', '/tpa-roundrobin', '/tpahere-roundrobin', '/duelsroomspam', '/queuespam', '/warp-arena', '/afk-park', '/scripts'].includes(baseCmd)) return false
 const { bot } = entry || {}
 
 switch (baseCmd) {
@@ -5252,6 +5577,23 @@ case '/freeforall': {
     return true
   }
   startFreeForAll(id)
+  return true
+}
+case '/kos': {
+  const mode = (parts[1] || '').toLowerCase()
+  if (mode === 'stop' || mode === 'off') {
+    if (!kos.stop(id)) logFor(id, '{yellow-fg}⚠ KOS is not running on this bot.{/yellow-fg}')
+    return true
+  }
+  if (mode && mode !== 'on' && mode !== 'start') {
+    logFor(id, `{yellow-fg}⚠ Usage: /kos [on|off|stop] (currently ${kos.isRunning(id) ? 'running' : 'stopped'}).{/yellow-fg}`)
+    return true
+  }
+  if (!mode && kos.isRunning(id)) {
+    kos.stop(id)
+    return true
+  }
+  kos.start(id)
   return true
 }
 case '/connection': {
@@ -5334,6 +5676,7 @@ case '/new-gen-maintain': {
   return true
 }
 case '/tpa-roundrobin': return lifestealSoloCommand(id, 'tpa', parts, '/tpa-roundrobin')
+case '/tpahere-roundrobin': return lifestealSoloCommand(id, 'tpahere', parts, '/tpahere-roundrobin')
 case '/duelsroomspam': return lifestealSoloCommand(id, 'duels', parts, '/duelsroomspam')
 case '/queuespam': return lifestealSoloCommand(id, 'queue', parts, '/queuespam')
 case '/warp-arena': return lifestealSoloCommand(id, 'arena', parts, '/warp-arena')
@@ -9181,7 +9524,7 @@ try {
 // ── Single-bot local commands ───────────────
 if (LOCAL_COMMANDS.includes(trimmed.split(/\s+/)[0])) {
 const cmdVerb = trimmed.split(/\s+/)[0]
-if (!activeId && ['/lifesteal-start', '/lifesteal-stop', '/lifesteal-status', '/new-gen-maintain', '/tpa-roundrobin', '/duelsroomspam', '/queuespam', '/warp-arena', '/afk-park', '/scripts'].includes(cmdVerb)) {
+if (!activeId && ['/lifesteal-start', '/lifesteal-stop', '/lifesteal-status', '/new-gen-maintain', '/tpa-roundrobin', '/tpahere-roundrobin', '/duelsroomspam', '/queuespam', '/warp-arena', '/afk-park', '/scripts'].includes(cmdVerb)) {
 return runLocalCommandForBot(SYSTEM_ID, trimmed)
 }
 if (activeId) {
