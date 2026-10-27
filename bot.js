@@ -1,4 +1,4 @@
-require('dotenv').config() // npm install dotenv ws — neo-blessed only if TUI_GUI, socks only for PROXY_HOST
+require('dotenv').config({ override: true }) // npm install dotenv ws — neo-blessed only if TUI_GUI, socks only for PROXY_HOST; override so a physical .env beats the force-loaded container env (Docker) and /env-set values survive a restart
 const {
   readDelayMs,
   readInt,
@@ -69,13 +69,13 @@ const path = require('path')
 const http = require('http')
 const crypto = require('crypto')
 const { decodeCommandTree, decodeCompletions } = require('./server-commands')
-const { persistGeneratedBots, persistRegeneratedName } = require('./generated-bots')
+const { persistGeneratedBots, persistRegeneratedName, saveEnvFile } = require('./generated-bots')
 const { namesFromText } = require(path.join(__dirname, 'robot-login'))
 const zlib = require('zlib')
 const { exec, execFile, spawn } = require('child_process')
 const { createTerminal, sshConfig } = require('./expose-terminal')
 const dataStore = require(path.join(__dirname, 'data-store'))
-// Runtime settings (the dashboard .ENV tab: temporary overrides, never written to disk),
+// Runtime settings (the dashboard .ENV tab: live overrides; /env set also saves them to .env),
 // coinflip data collection, the time-series store, and the read-only analytics pages.
 const settings = require(path.join(__dirname, 'settings'))
 const coinflip = require(path.join(__dirname, 'coinflip'))
@@ -349,9 +349,43 @@ function handleTakenName (id, entry, detail) {
   retireRoster()
   const delay = readDelayMs(process.env.ROBOT_CONNECT_DELAY_MS, 5000)
   setTimeout(() => {
-    if (!Object.hasOwn(bots, replacement.name) && !connectBlockReason(replacement.name)) createBotInstance(replacement.name, host, port, version)
+    // A generated replacement is /new-gen naming, so it may pass BOT_MAX.
+    if (!Object.hasOwn(bots, replacement.name) && !connectBlockReason(replacement.name)) createBotInstance(replacement.name, host, port, version, { force: true })
   }, delay)
   return true
+}
+
+// ── .env persistence for /env set and the dashboard .ENV tab ─────────────────
+// Settings used to be run-only, which is exactly what broke under Docker: the
+// task definition force-loads the environment, there is no .env to edit, and a
+// change evaporated on the next restart. The physical .env is now the durable
+// store (dotenv loads it over the force-loaded values at boot), and these two
+// helpers write and undo single lines in it, leaving the rest of the file —
+// roster, credentials — untouched. The in-memory override still applies the
+// value instantly; the file only decides what survives a restart.
+function envLineOriginal (text, key) {
+  const match = String(text || '').match(new RegExp(`^\\s*(?:export\\s+)?${key}\\s*=\\s*(.*)$`, 'm'))
+  return match ? { hadLine: true, value: match[1] } : { hadLine: false, value: null }
+}
+// key -> what its .env line said before this run's /env set, so reset can undo.
+const envLineOriginals = new Map()
+function persistEnvSetting (key, value) {
+  const file = path.join(__dirname, '.env')
+  let text = ''
+  try { text = fs.readFileSync(file, 'utf8') } catch (err) { if (err.code !== 'ENOENT') throw err }
+  if (!envLineOriginals.has(key)) envLineOriginals.set(key, envLineOriginal(text, key))
+  saveEnvFile(file, text, { [key]: value }, fs)
+}
+// Undo one saved set: put the line back the way it was, or remove it entirely.
+function restoreEnvSetting (key) {
+  const original = envLineOriginals.get(key)
+  if (!original) return null
+  envLineOriginals.delete(key)
+  const file = path.join(__dirname, '.env')
+  let text = ''
+  try { text = fs.readFileSync(file, 'utf8') } catch (err) { if (err.code !== 'ENOENT') throw err }
+  saveEnvFile(file, text, { [key]: original.hadLine ? original.value : null }, fs)
+  return original.hadLine ? 'restored' : 'removed'
 }
 
 // ── Connect gate ────────────────────────────────────────────────────────────
@@ -1018,7 +1052,7 @@ const robotLogin = require(path.join(__dirname, 'robot-login')).createRobotLogin
   env: () => process.env, directory: __dirname, io: fs, setTimer: setTimeout, clearTimer: clearTimeout,
   roster: () => [...BOT_NAMES, ...parseNameList(process.env.BOT_NAMES)],
   existing: () => Object.keys(bots), blocked: id => Boolean(connectBlockReason(id)),
-  connect: id => createBotInstance(id), close: id => dropFromRoster(id),
+  connect: id => createBotInstance(id, null, null, null, { force: true }), close: id => dropFromRoster(id),
   send: (id, command) => bots[id].bot.chat(command),
   isPlayerChat: message => Boolean(detectPlayerChat(message)),
   onAuthenticated: id => bots[id]?.onAdmissionAuthenticated?.(),
@@ -1195,7 +1229,7 @@ cfDefine('VERSION', { type: 'string', def: '1.21.2', group: 'Server', desc: 'Ver
 // Lifesteal role sizing. All live: lifesteal-queue.js re-reads the env on every
 // tick, so changing one here reshapes the running loop — lowering a count
 // releases the extra bots back to /warp afk, raising one fills from the pool.
-cfDefine('LIFESTEAL_TARGET_BOTS', { type: 'int', def: 20, min: 1, group: 'Lifesteal', desc: 'Fleet size /lifesteal-start tops up to via /new-gen; bots are never removed (live)' })
+cfDefine('LIFESTEAL_TARGET_BOTS', { type: 'int', def: 20, min: 1, group: 'Lifesteal', desc: 'Target fleet size for /new-gen-maintain; a plain /lifesteal-start never grows the roster (live)' })
 cfDefine('LIFESTEAL_DUELS_BOTS', { type: 'int', def: 1, min: 0, group: 'Lifesteal', desc: 'How many bots hold the duels-room role (live; 0 disables the role)' })
 cfDefine('LIFESTEAL_QUEUE_BOTS', { type: 'int', def: 1, min: 0, group: 'Lifesteal', desc: 'How many bots hold the /queue role (live; 0 disables the role)' })
 cfDefine('LIFESTEAL_ARENA_BOTS', { type: 'int', def: 1, min: 0, group: 'Lifesteal', desc: 'How many bots loop /warp arena → walk-until-hit (live; 0 disables the role)' })
@@ -1212,6 +1246,10 @@ cfDefine('KOS_BOT_COOLDOWN_JITTER_MS', { type: 'ms', def: 100, min: 0, group: 'C
 cfDefine('KOS_STAGGER_JITTER_MS', { type: 'ms', def: 50, min: 0, group: 'Combat', desc: '/kos: random extra delay (0..this) added to the fleet hit slot per target — keeps the rotation non-periodic (live)' })
 cfDefine('BOT_NAMES', { type: 'list', group: 'Server', live: false, desc: 'The roster (startup-only — edit the file and restart to change it)' })
 cfDefine('CONNECT_DELAY_MS', { type: 'ms', def: 22571, min: 0, group: 'Timing', live: false, desc: 'Gap between bot connects (startup, /new-gen, lifesteal top-up)' })
+// Fleet ceiling. The roster (BOT_NAMES) is never trimmed — names past the cap
+// simply stay unconnected until a slot frees up. /new-gen is deliberately
+// exempt: generating more bots is how the user asks for more than the cap.
+cfDefine('BOT_MAX', { type: 'int', def: 80, min: 1, group: 'Server', desc: 'How many bots this run holds at once — new names wait for a free slot; /new-gen and lifesteal top-ups may exceed it (live)' })
 // Routine defaults refresh on file changes and temporary overrides. Only
 // roster/listener wiring remains restart-only; per-run flags still take priority.
 cfDefine('CRATES_ALL_DUMP', { type: 'string', def: 'tpa', group: 'Crates', desc: 'Live default dump step for /crates-all (off|tpa|home|hidden|player:<name>)' })
@@ -1330,9 +1368,12 @@ const LOCAL_COMMANDS = ['/tpauto', '/freeforall', '/kos', '/server-commands', '/
 // LIFESTEAL_TPA_BOTS, default 1 each, 0 disables the role. Role holders are
 // always distinct bots; anyone left over stays /warp afk. Replaced on death,
 // same bot allowed again; deathbanned bots are parked 24h (can still join
-// server just not /server lifesteal). Roster tops up to LIFESTEAL_TARGET_BOTS
-// (default 20) via /new-gen semantics and never removes bots. Server-banned
-// bots count as missing so they are replaced with fresh names.
+// server just not /server lifesteal). The roster never grows on its own:
+// only /new-gen or an explicit /new-gen-maintain (topping up to
+// LIFESTEAL_TARGET_BOTS, default 20) adds names, and nothing removes healthy
+// names. A banned/deathbanned/retired name is recycled in place — its roster
+// slot becomes a fresh /new-gen name in the same route — so a ban or deathban
+// replacement swaps rather than grows the fleet.
 // The roles are also available STANDALONE — /tpa-roundrobin,
 // /tpahere-roundrobin, /duelsroomspam, /queuespam, /warp-arena, /afk-park —
 // each runs just its own routine with no roster top-up, no /new-gen and no
@@ -1340,6 +1381,18 @@ const LOCAL_COMMANDS = ['/tpauto', '/freeforall', '/kos', '/server-commands', '/
 // on (one independent round-robin per bot — run it on more bots or /all to
 // run several); the others run on [count|all] online bots (default all).
 // /tpahere-roundrobin is the tpa round-robin sending /tpahere <player>.
+
+// A roster name is "dead" when it can never hold a role again: server-banned
+// (active ban), retired/taken (removed list) or deathbanned. Dead names keep
+// occupying BOT_NAMES slots until a replacement recycles the slot.
+function rosterNameIsDead (id) {
+  try {
+    if (deathbannedEntryFor(id) || removedEntryFor(id)) return true
+    const row = dataState.bots[id]
+    return Boolean(row?.banned && dataStore.isBanActive(row).held)
+  } catch (_) { return false }
+}
+
 const lifestealQueue = require(path.join(__dirname, 'lifesteal-queue')).createLifestealQueue({
   getBots: () => bots,
   isOnline: (entry) => botOnline(entry),
@@ -1350,24 +1403,48 @@ const lifestealQueue = require(path.join(__dirname, 'lifesteal-queue')).createLi
   },
   log: (id, msg) => logFor(id || SYSTEM_ID, `{cyan-fg}[lifesteal] ${sanitize(msg)}{/cyan-fg}`),
   getEnv: () => process.env,
-  isBanned: (id) => { try { if (deathbannedEntryFor(id) || removedEntryFor(id)) return true; const row = dataState.bots[id]; return Boolean(row?.banned && dataStore.isBanActive(row).held) } catch (_) { return false } },
+  isBanned: (id) => rosterNameIsDead(id),
   onDeathban: (id, reason) => recordDeathbannedBot(id, reason),
-  ensureRoster: (missing) => {
+  // opts.grow === false means "replace dead names in place only" — the
+  // ban/deathban event replacements. Only an explicit /new-gen-maintain
+  // top-up passes grow and may add names to the roster.
+  ensureRoster: (missing, opts = {}) => {
     try {
+      const want = Number(missing) || 1
+      const grow = opts.grow !== false
+      const envFile = path.join(__dirname, '.env')
       const blocked = [...(removedBots.bots || []).map(row => row.bot), ...(deathbannedBots.bots || []).map(row => row.bot)]
-      const result = persistGeneratedBots({ file: path.join(__dirname, '.env'), env: process.env, existing: Object.keys(bots), blocked, count: Number(missing) || 1, group: 'auto', io: fs })
+      // Recycle first: a dead name (banned, deathbanned or retired) still
+      // holding a BOT_NAMES slot hands that slot to a fresh name in the same
+      // route, so a ban/deathban replacement swaps in place and the fleet can
+      // never grow without an explicit /new-gen. Only a genuine top-up —
+      // nothing dead left to recycle — adds names to the roster.
+      const roster = parseNameList(process.env.BOT_NAMES)
+      const dead = roster.filter(id => id && rosterNameIsDead(id))
+      const avoid = [...blocked, ...dead]
+      const names = []
+      let recycled = 0
+      for (const taken of dead.slice(0, want)) {
+        const swap = persistRegeneratedName({ file: envFile, env: process.env, taken, existing: [...roster, ...Object.keys(bots), ...names], blocked: avoid, io: fs })
+        if (swap && swap.name) { names.push(swap.name); recycled++ }
+      }
+      const leftover = want - names.length
+      if (grow && leftover > 0) {
+        const result = persistGeneratedBots({ file: envFile, env: process.env, existing: [...Object.keys(bots), ...names], blocked: avoid, count: leftover, group: 'auto', io: fs })
+        names.push(...result.names)
+      }
       refreshRuntimeConfig()
-      logFor(SYSTEM_ID, `{green-fg}✓ [lifesteal] Saved ${result.names.length} generated account(s) to .env before connecting.{/green-fg}`)
+      logFor(SYSTEM_ID, `{green-fg}✓ [lifesteal] Saved ${names.length} generated account(s) to .env before connecting.${recycled ? ` Recycled ${recycled} dead roster slot(s) — replacements never grow the fleet.` : ''}{/green-fg}`)
       // Generated connects use the default connect delay — the same pacing as
       // a normal startup connect ("just the default one") — not the
       // robot-admission ROBOT_CONNECT_DELAY_MS burst.
       let connectAt = 0
-      result.assignments.forEach(({ name }) => {
+      names.forEach((name) => {
         const at = connectAt
         connectAt += CONNECT_DELAY_MS + Math.floor(Math.random() * (CONNECT_DELAY_RANDOM_MS + 1))
-        setTimeout(() => { if (!Object.hasOwn(bots, name) && !connectBlockReason(name)) createBotInstance(name) }, at)
+        setTimeout(() => { if (!Object.hasOwn(bots, name) && !connectBlockReason(name)) createBotInstance(name, null, null, null, { force: true }) }, at)
       })
-      return { ok: true, names: result.names }
+      return { ok: true, names }
     } catch (err) { return { ok: false, error: err && err.message ? err.message : String(err) } }
   },
 })
@@ -2303,7 +2380,7 @@ button.tb:hover{color:var(--txt);border-color:var(--acc)}
 </style><link rel="stylesheet" href="/xterm.css"><script src="/chart.js"></script><script src="/coinflip-dashboard.js"></script><script src="/xterm.js"></script><script src="/xterm-addon-fit.js"></script></head><body>
 <div id="app">
 <header><div class="logo">⛏ AFK<b>CONSOLE</b></div><div id="chips"></div><div id="wsstate" class="wsstate down">offline</div><button id="logout">sign out</button></header>
-<aside><div class="views"><div class="vchip on" data-view="all">ALL</div><div class="vchip" data-view="system">SYSTEM</div><button class="vchip" id="terminalbtn" type="button">TERMINAL</button><button class="vchip" id="envbtn" type="button" title="Temporary .env overrides — nothing is written to disk">.ENV</button><button class="vchip" id="coinflipbtn" type="button" title="Coinflip fleet analytics">COINFLIP</button><!--PLAYBTN--></div><label style="display:flex;align-items:center;gap:6px;padding:4px 0;font-size:11px;color:var(--dim);cursor:pointer"><input type="checkbox" id="show-all-bots" checked style="accent-color:var(--acc)">Show offline bots</label><div id="botlist"></div></aside>
+<aside><div class="views"><div class="vchip on" data-view="all">ALL</div><div class="vchip" data-view="system">SYSTEM</div><button class="vchip" id="terminalbtn" type="button">TERMINAL</button><button class="vchip" id="envbtn" type="button" title="Runtime settings — /env set values are saved to the physical .env">.ENV</button><button class="vchip" id="coinflipbtn" type="button" title="Coinflip fleet analytics">COINFLIP</button><!--PLAYBTN--></div><label style="display:flex;align-items:center;gap:6px;padding:4px 0;font-size:11px;color:var(--dim);cursor:pointer"><input type="checkbox" id="show-all-bots" checked style="accent-color:var(--acc)">Show offline bots</label><div id="botlist"></div></aside>
 <main>
 <div id="loghead"><span id="channame">ALL CHANNELS</span><span id="newchip"></span>
 <input id="search" placeholder="filter logs…"><button class="tb" id="topbtn" type="button" title="scroll to top">↑ top</button><button class="tb" id="bottombtn" type="button" title="scroll to newest">↓ bottom</button><button class="tb" id="followbtn" type="button">⏸ pause</button>
@@ -2795,7 +2872,7 @@ fetch('/api/settings',{credentials:'same-origin',cache:'no-store'}).then(functio
 function envSave(key,value){
 fetch('/api/settings',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:key,value:value})}).then(function(r){return r.json()}).then(function(m){
 if(!m.ok){toast(m.error||('could not set '+key),'bad');return}
-toast(key+(m.value==null?' updated (temporary)':(' = '+m.value+' (temporary)')),'good');envLoad()
+toast(key+(m.value==null?' updated (saved to .env)':(' = '+m.value+' (saved to .env)')),'good');envLoad()
 }).catch(function(){toast('could not reach the console','bad')})
 }
 function envReset(key){
@@ -3313,8 +3390,13 @@ try { msg = JSON.parse(body || '{}') } catch (_) { msg = null }
 const result = msg && msg.key ? settings.set(msg.key, msg.value) : { ok: false, error: 'a setting name is required' }
 res.writeHead(result.ok ? 200 : 400, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
 res.end(JSON.stringify(result))
-if (result.ok) logFor(SYSTEM_ID, `{cyan-fg}› .ENV tab: ${sanitize(String(msg.key))} set for this run only${result.live ? '' : ' (startup-only key — the running process keeps its old value)'}{/cyan-fg}`)
-else logFor(SYSTEM_ID, `{yellow-fg}⚠ .ENV tab rejected ${sanitize(String(msg && msg.key))}: ${sanitize(result.error)}{/yellow-fg}`)
+if (result.ok) {
+// Saved to the physical .env like /env set — the tab and the command are the
+// same surface, and a run-only value evaporates on the next Docker restart.
+let saved = true
+try { persistEnvSetting(result.key, msg.value) } catch (err) { saved = false; logFor(SYSTEM_ID, `{yellow-fg}⚠ .ENV tab: ${sanitize(result.key)} is live but its .env line could not be saved (${sanitize(err.code || err.message)}){/yellow-fg}`) }
+logFor(SYSTEM_ID, `{cyan-fg}› .ENV tab: ${sanitize(String(msg.key))} ${saved ? 'saved to .env' : 'set for this run only'}${result.live ? '' : ' (startup-only key — the running process keeps its old value)'}{/cyan-fg}`)
+} else logFor(SYSTEM_ID, `{yellow-fg}⚠ .ENV tab rejected ${sanitize(String(msg && msg.key))}: ${sanitize(result.error)}{/yellow-fg}`)
 return
 }
 if (p === '/api/settings/reset' && req.method === 'POST') {
@@ -3322,7 +3404,23 @@ settings.reload()
 const body = await readBody(req, 8192)
 let msg
 try { msg = JSON.parse(body || '{}') } catch (_) { msg = null }
-const result = msg && msg.all ? { ok: true, cleared: settings.resetAll().length } : settings.reset(msg && msg.key)
+// Reset also undoes the saved .env line, or the value would come back on the
+// next restart even after the user reset it.
+if (msg && msg.all) {
+for (const key of [...envLineOriginals.keys()]) { try { restoreEnvSetting(key) } catch (_) {} }
+const result = { ok: true, cleared: settings.resetAll().length }
+res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
+res.end(JSON.stringify(result))
+return
+}
+let undone = null
+if (msg && msg.key) { try { undone = restoreEnvSetting(settings.canonicalKey(String(msg.key))) } catch (_) {} }
+const result = settings.reset(msg && msg.key)
+if (!result.ok && undone) {
+res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
+res.end(JSON.stringify({ ok: true, key: settings.canonicalKey(String(msg.key)), restored: undone }))
+return
+}
 res.writeHead(result.ok ? 200 : 400, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
 res.end(JSON.stringify(result))
 return
@@ -3803,7 +3901,7 @@ function isTrustedTpaName (name) {
   return TPA_TRUSTED_BOTS.some(trusted => trusted.toLowerCase() === lower)
 }
 
-function createBotInstance(username, host, port, version) {
+function createBotInstance(username, host, port, version, options = {}) {
 refreshRuntimeConfig()
 host = host || HOST
 port = port || PORT
@@ -3812,6 +3910,16 @@ const id = username
 if (!/^[A-Za-z0-9_]{1,16}$/.test(id) || ['__proto__', 'constructor', 'prototype'].includes(id)) { logFor(SYSTEM_ID, '{red-fg}✗ Invalid Minecraft username.{/red-fg}'); return null }
 const blocked = connectBlockReason(id)
 if (blocked) { logFor(SYSTEM_ID, `{yellow-fg}⚠ ${sanitize(id)}: ${sanitize(blocked)}{/yellow-fg}`); return null }
+// BOT_MAX: the fleet ceiling. Reconnecting an existing bot is not a new bot
+// and is never capped; /new-gen (with its lifesteal top-ups and generated
+// replacements) is explicitly exempt. Every other new name waits for a slot.
+if (!options.force && !Object.hasOwn(bots, id)) {
+const cap = Math.floor(Number(settings.get('BOT_MAX')) || 0)
+if (cap > 0 && Object.keys(bots).length >= cap) {
+logFor(SYSTEM_ID, `{yellow-fg}⛔ ${sanitize(id)} not connected — BOT_MAX=${cap} reached (${Object.keys(bots).length} bots live). Close a bot, /env set BOT_MAX higher, or /new-gen for more.{/yellow-fg}`)
+return null
+}
+}
 rtpRoaming.stop(id)
 robotLogin.reconnect(id)
 let connected = false
@@ -5034,7 +5142,7 @@ const COMMANDS = {
 '/tpauto on|off': 'Toggle automatic /tpaccept for trusted bot names only',
 '/freeforall [on|off|stop]': 'Stationary combat loop: aim and hit nearby targets with the best weapon in inventory (never shields, no moving, no block breaking)',
 '/kos [on|off|stop]': 'Kill-on-sight combat like /freeforall but only attacking players NOT on the protected list (TPA_MAIN_PLAYER, fleet bots, TPA_TRUSTED_BOTS) — a random player who accepts a /tpa or /tpahere gets swarmed while the main player and bots stay untouched. Hits are spread out around vanilla\'s 10-tick damage-immunity window: first hit KOS_ENGAGE_DELAY_MS (500) after the target comes in reach, then one fleet hit per KOS_STAGGER_MS (550, +KOS_STAGGER_JITTER_MS) per target, rotating across bots; each bot recharges KOS_BOT_COOLDOWN_MS (600, +KOS_BOT_COOLDOWN_JITTER_MS) between its own hits — vanilla 3-block reach, no reach extension, hits go through walls. /all /kos arms the whole fleet',
-'/new-gen-maintain [botnumber|stop|status]': 'Maintain the fleet at <botnumber> usable bots (default 25) via /new-gen without removing bots',
+'/new-gen-maintain [botnumber|stop|status]': 'Maintain the fleet at <botnumber> usable bots (default LIFESTEAL_TARGET_BOTS=20) via /new-gen without removing bots — the only thing that tops the roster up automatically',
 '/find <name> ["name" …]': 'Search EVERY bot\'s inventory and open window for an item by display, custom, registry name, or NBT text — multiple quoted terms are OR\'d (same matching as /dump filters)',
   '/use-book [name]': `Scan the open GUI (or, with none open, the inventory) for a book, swap it into hotbar slot 1, select it and run /use && /use — every step ${settings.get('BOOK_USE_DELAY_MS')}ms apart (BOOK_USE_DELAY_MS) so the server is never spammed. [name] overrides the scan term (default "${settings.get('BOOK_ITEM_QUERY')}"). /use-book auto on|off (BOOK_AUTO) runs it automatically whenever a GUI opens with a book in it — no book in the GUI, nothing happens`,
   '/copy [name]': 'Everything about the held item — the exact name with unicode intact (clean, and raw with colour codes), registry name, type, count, slot, enchants, lore and NBT — printed AND copied to the clipboard. /copy name copies just the name',
@@ -5047,7 +5155,7 @@ const COMMANDS = {
 '/reconnect-all-slow': 'Reconnect ALL bots (online or offline) with a 30s delay between each to avoid rate limits',
 '/new-bot <n> [host] [port] [ver]': 'Create and connect a new bot',
 '/new-gen [count] [group=auto|direct|N]': 'Generate unique Minecraft names, atomically save to .env and balanced proxy groups, then connect with the default startup connect delay (1–100).',
-'/lifesteal-start': 'Restarts Tor first (scripts/restart-tor.sh --tor-only, LIFESTEAL_TOR_RESTART_CMD override — brew services restart tor is NOT this repo\'s Tor and has no control port 9051), then requests NEWNYM on every local control port so reconnecting bots get fresh circuits, then: random bot /duelsroomqueue + random bot /queue (replaced on death, same bot allowed), one non-queue bot loops /warp arena → 5s → forward-until-hit, one bot spams /tpa until deathban (24h park), rest /warp afk (role sizes are configurable: LIFESTEAL_DUELS_BOTS / LIFESTEAL_QUEUE_BOTS / LIFESTEAL_ARENA_BOTS / LIFESTEAL_TPA_BOTS, default 1 each, 0 disables). Banned bots are replaced via /new-gen so the loop continues; roster tops up to LIFESTEAL_TARGET_BOTS=20 (never removes; counts saved names so a pending connect wave is never duplicated)',
+'/lifesteal-start': 'Restarts Tor first (scripts/restart-tor.sh --tor-only, LIFESTEAL_TOR_RESTART_CMD override — brew services restart tor is NOT this repo\'s Tor and has no control port 9051), then requests NEWNYM on every local control port so reconnecting bots get fresh circuits, then: random bot /duelsroomqueue + random bot /queue (replaced on death, same bot allowed), one non-queue bot loops /warp arena → 5s → forward-until-hit, one bot spams /tpa until deathban (24h park), rest /warp afk (role sizes are configurable: LIFESTEAL_DUELS_BOTS / LIFESTEAL_QUEUE_BOTS / LIFESTEAL_ARENA_BOTS / LIFESTEAL_TPA_BOTS, default 1 each, 0 disables). Banned bots are replaced via /new-gen so the loop continues (a dead name is recycled in place — its slot becomes a fresh name, so replacements never grow the fleet). Starting never creates bots on its own: the roster only grows via /new-gen or an explicit /new-gen-maintain (LIFESTEAL_TARGET_BOTS=20 is its default target; healthy names are never removed)',
 '/lifesteal-stop': 'Stop lifesteal automation and release held forward keys',
 '/lifesteal-status': 'Show lifesteal roles (duels/queue/arena/tpa holders), role counts, online/total counts and deathbanned bots',
 '/tpa-roundrobin [stop [all]]': 'Standalone: spam /tpa <player> round-robin bound to THIS bot only — one independent round-robin per bot (own cursor, own stop), so only the bound bot ever sends. Run it on more bots or /all to run several; "stop" unbinds this bot ("stop all" every bot). No roster top-up, no /new-gen, no Tor restart; LIFESTEAL_TPA_INTERVAL_MS paces it',
@@ -8826,7 +8934,7 @@ result.assignments.forEach(({ name, group }) => {
 const at = connectAt
 connectAt += CONNECT_DELAY_MS + Math.floor(Math.random() * (CONNECT_DELAY_RANDOM_MS + 1))
 logInfo(`${name}: ${group == null ? 'default/direct route' : `proxy group ${group}`} — connecting in ${(at / 1000).toFixed(1)}s`)
-setTimeout(() => { if (!Object.hasOwn(bots, name) && !connectBlockReason(name)) createBotInstance(name) }, at)
+setTimeout(() => { if (!Object.hasOwn(bots, name) && !connectBlockReason(name)) createBotInstance(name, null, null, null, { force: true }) }, at)
 })
 return result
 } catch (err) { logError(`No accounts connected: generation/save failed (${sanitize(err.code || err.message)}).`); return }
@@ -9461,7 +9569,7 @@ if (trimmed === '/env' || trimmed.startsWith('/env ')) {
   if (sub === 'list') {
     const filter = (parts[1] || '').toLowerCase()
     const groups = settings.grouped()
-    logInfo(`{bold}── Settings ──{/bold} {gray-fg}${settings.overrideCount()} temporary override(s); nothing here is written to .env{/gray-fg}`)
+    logInfo(`{bold}── Settings ──{/bold} {gray-fg}${settings.overrideCount()} temporary override(s); /env set saves to the physical .env and survives restarts{/gray-fg}`)
     for (const group of groups) {
       const rows = group.rows.filter(row => !filter || row.key.toLowerCase().includes(filter) || group.group.toLowerCase().includes(filter))
       if (!rows.length) continue
@@ -9472,7 +9580,7 @@ if (trimmed === '/env' || trimmed.startsWith('/env ')) {
         log(`  ${row.key} = ${value}${marks}`)
       }
     }
-    log(` {gray-fg}/env set KEY VALUE · /env reset KEY · /env reset-all · the dashboard .ENV tab is the same thing with inputs{/gray-fg}`)
+    log(` {gray-fg}/env set KEY VALUE (saved to .env) · /env reset KEY (restores the old line) · /env reset-all · the dashboard .ENV tab is the same thing with inputs{/gray-fg}`)
     return
   }
   if (sub === 'get') {
@@ -9501,21 +9609,32 @@ if (trimmed === '/env' || trimmed.startsWith('/env ')) {
     }
     const result = settings.set(key, value)
     if (!result.ok) { logError(`Could not set ${sanitize(key)}: ${sanitize(result.error)}`); return }
-    logSuccess(result.secret ? `${result.key} updated (temporary — not saved; value withheld)` : `${result.key} = ${String(result.value)} {gray-fg}(temporary — not saved){/gray-fg}`)
-    if (!result.live) logWarn(`${result.key} is read once at startup, so the running process keeps its old value. Edit the file and restart for that one.`)
+    // Persist to the physical .env too — the fix for Docker, where the task
+    // definition force-loads the environment and a run-only change evaporates.
+    let saved = true
+    try { persistEnvSetting(result.key, value) } catch (err) { saved = false; logWarn(`${result.key} is live for this run, but saving it to .env failed (${sanitize(err.code || err.message)}) — it will not survive a restart.`) }
+    logSuccess(result.secret ? `${result.key} updated (${saved ? 'saved to .env; value withheld' : 'this run only; value withheld'})` : `${result.key} = ${String(result.value)} {gray-fg}(${saved ? 'saved to .env — survives restarts' : 'this run only'}){/gray-fg}`)
+    if (!result.live) logWarn(`${result.key} is read once at startup, so the running process keeps its old value. The .env line is saved; restart to apply it.`)
     return
   }
   if (sub === 'reset') {
     const key = parts[1]
     if (!key) { logWarn('Usage: /env reset KEY — or /env reset-all'); return }
+    const canonical = settings.canonicalKey(key)
     const result = settings.reset(key)
-    if (!result.ok) { logWarn(`${sanitize(key)}: ${sanitize(result.error || 'not overridden')}`); return }
-    logSuccess(`${key} is back to ${result.secret ? '(set)' : String(result.value)} {gray-fg}(${result.source}){/gray-fg}`)
+    // Reset means "back to before the set" — so undo the saved .env line too.
+    let undone = null
+    try { undone = restoreEnvSetting(canonical) } catch (err) { logWarn(`Could not restore the .env line for ${sanitize(canonical)} (${sanitize(err.code || err.message)})`) }
+    if (!result.ok && !undone) { logWarn(`${sanitize(key)}: ${sanitize(result.error || 'not overridden')}`); return }
+    if (!result.ok) { logSuccess(`${canonical} is back to its previous .env line (${undone}) {gray-fg}— saved by an earlier /env set{/gray-fg}`); return }
+    logSuccess(`${key} is back to ${result.secret ? '(set)' : String(result.value)} {gray-fg}(${result.source}${undone ? `; .env ${undone}` : ''}){/gray-fg}`)
     return
   }
   if (sub === 'reset-all') {
     const cleared = settings.resetAll()
-    logSuccess(`Cleared ${cleared.length} temporary override(s)${cleared.length ? `: ${cleared.join(', ')}` : ''}.`)
+    let undone = 0
+    for (const key of [...envLineOriginals.keys()]) { try { if (restoreEnvSetting(key)) undone++ } catch (_) {} }
+    logSuccess(`Cleared ${cleared.length} temporary override(s)${cleared.length ? `: ${cleared.join(', ')}` : ''}${undone ? ` and reverted ${undone} saved .env line(s)` : ''}.`)
     return
   }
   logWarn('Usage: /env [list [filter] | get KEY | set KEY VALUE | reset KEY | reset-all]')

@@ -446,7 +446,7 @@ test('new-gen saves generated roster and proxy groups before staggered connectio
   assert.ok(saved.BOT_NAMES.includes(directFlagged[0].slice('BOT_DIRECT_'.length)))
   assert.equal(r.createdBots.length, 0, 'saving precedes every connection')
   assert.ok(names.every(name => saved.BOT_NAMES.includes(name) && /^[A-Za-z0-9_]{3,16}$/.test(name)))
-  const timer = [...r.timers.keys()].find(t => t.delay === 0 && String(t.fn).includes('createBotInstance(name)'))
+  const timer = [...r.timers.keys()].find(t => t.delay === 0 && String(t.fn).includes('createBotInstance(name'))
   timer.fn()
   assert.equal(r.createdBots.length, 1)
   assert.equal(r.run('PROXY_GROUPS[0].index'), 2)
@@ -459,6 +459,29 @@ test('new-gen saves generated roster and proxy groups before staggered connectio
     .map(t => t.delay)
     .sort((a, b) => a - b)
   assert.deepEqual(genDelays, [0, 22571, 45142], 'generated connects pace on the default connect delay')
+})
+
+test('BOT_MAX caps new connections; /new-gen is the deliberate way past it', () => {
+  // The harness already holds A, B and C, so the fleet is at BOT_MAX=3.
+  const r = runtime({ TEST_CREATE_BOTS: true, LOGIN_PASSWORD: 'pw', BOT_MAX: '3' })
+  r.run("createBotInstance('D')")
+  assert.equal(r.createdBots.length, 0, 'D waits: BOT_MAX=3 is already reached')
+  assert.match(logsText(r), /BOT_MAX=3 reached/)
+  assert.equal(r.run('Object.keys(bots).length'), 3, 'the cap never trims the roster')
+
+  // /new-gen is exempt — generating more bots is how the user asks for more.
+  r.run("handleCommand('/new-gen 1')")
+  const timer = [...r.timers.keys()].find(t => t.delay === 0 && String(t.fn).includes('createBotInstance(name'))
+  assert.ok(timer, 'the generated name schedules its connect')
+  timer.fn()
+  assert.equal(r.createdBots.length, 1, 'the /new-gen bot connects past BOT_MAX')
+})
+
+test('below BOT_MAX, new names connect normally', () => {
+  const r = runtime({ TEST_CREATE_BOTS: true, BOT_MAX: '5' })
+  r.run("createBotInstance('D')")
+  assert.equal(r.createdBots.length, 1)
+  assert.equal(r.run('Object.keys(bots).length'), 4, 'D joined the fleet; nothing was removed')
 })
 test('all-slow dispatches crates-solo once per target and refuses nested fleet commands', async () => {
   const r = runtime()
@@ -2684,11 +2707,14 @@ test('/env lists the registry and marks the keys a restart is needed for', () =>
   assert.match(logs, /temporary override\(s\)/)
 })
 
-test('/env set applies immediately and /env reset removes it', () => {
+test('/env set applies immediately, saves to the physical .env, and /env reset undoes both', () => {
   const r = runtime(dataEnv())
   r.run("handleCommand('/env set COINFLIP_WAGER_MIN 5000', { selectedId: 'A' })")
   assert.equal(r.run("settings.get('COINFLIP_WAGER_MIN')"), 5000)
-  assert.match(channelLogs(r, 'A'), /temporary — not saved/)
+  assert.match(channelLogs(r, 'A'), /saved to \.env/)
+  // The Docker fix: a set is durable — a real .env line written by the same
+  // atomic save the roster uses — instead of evaporating on the next restart.
+  assert.match(r.fakeFiles.get('.env'), /^COINFLIP_WAGER_MIN=5000$/m)
 
   r.run("handleCommand('/env get COINFLIP_WAGER_MIN', { selectedId: 'A' })")
   assert.match(channelLogs(r, 'A'), /COINFLIP_WAGER_MIN: 5000/)
@@ -2696,6 +2722,18 @@ test('/env set applies immediately and /env reset removes it', () => {
 
   r.run("handleCommand('/env reset COINFLIP_WAGER_MIN', { selectedId: 'A' })")
   assert.equal(r.run("settings.get('COINFLIP_WAGER_MIN')"), 10000)
+  assert.doesNotMatch(r.fakeFiles.get('.env'), /COINFLIP_WAGER_MIN/, 'reset removes the saved line too')
+})
+
+test('/env set over an existing .env line restores that exact line on reset', () => {
+  const r = runtime(dataEnv())
+  r.fakeFiles.set('.env', 'COINFLIP_WAGER_MIN=12345\nBOT_NAMES=A,B,C\n')
+  r.run("handleCommand('/env set COINFLIP_WAGER_MIN 5000', { selectedId: 'A' })")
+  assert.match(r.fakeFiles.get('.env'), /^COINFLIP_WAGER_MIN=5000$/m)
+  r.run("handleCommand('/env reset COINFLIP_WAGER_MIN', { selectedId: 'A' })")
+  const saved = require('dotenv').parse(r.fakeFiles.get('.env'))
+  assert.equal(saved.COINFLIP_WAGER_MIN, '12345', 'the line the user had is put back')
+  assert.equal(saved.BOT_NAMES, 'A,B,C', 'unrelated lines survive')
 })
 
 test('a value that cannot be parsed is refused by /env instead of silently reverting', () => {
@@ -3270,6 +3308,20 @@ test('/new-gen-maintain maintains the requested bot count via /new-gen', () => {
   assert.equal(names.length, 6, 'tops up from 3 to 6 configured bots')
   r.run("handleCommand('/new-gen-maintain stop')")
   assert.match(logsText(r), /\/new-gen-maintain stopped/)
+})
+
+test('roster replacement recycles dead slots instead of growing the fleet', () => {
+  const r = runtime({ TEST_CREATE_BOTS: true, LOGIN_PASSWORD: 'pw' })
+  // A is dead (deathbanned) but still holds a BOT_NAMES slot — the exact
+  // shape a ban leaves behind. The replacement must swap it in place.
+  r.run("recordDeathbannedBot('A', 'test deathban')")
+  r.run("handleCommand('/new-gen-maintain 3')")
+  const saved = require('dotenv').parse(r.fakeFiles.get('.env'))
+  const names = saved.BOT_NAMES.split(',').map(s => s.trim()).filter(Boolean)
+  assert.equal(names.length, 3, 'a replacement swaps the dead name in place — the fleet never grows')
+  assert.ok(!names.includes('A'), 'the dead name is retired from the roster')
+  assert.equal(names.filter(n => n !== 'B' && n !== 'C').length, 1, "exactly one fresh name takes A's slot")
+  assert.match(logsText(r), /Recycled 1 dead roster slot/)
 })
 
 test('deathbanned bots are closed (/closeBot), blocked from reconnecting, and kept in a separate offline deathbanned section', () => {

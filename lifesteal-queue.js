@@ -330,7 +330,7 @@ function createLifestealQueue (deps) {
       try { onDeathban(id, cleanReason, expiresAt) } catch (_) {}
     }
     if ((state.running && !state.solo && !state.pinnedRuns.size) || state.maintainRunning) {
-      requestTopUp(1, `deathban replacement for ${id}`)
+      requestTopUp(1, `deathban replacement for ${id}`, false)
     }
   }
 
@@ -697,11 +697,14 @@ function createLifestealQueue (deps) {
     }
   }
 
-  function requestTopUp (missing, why) {
+  // grow=false is a replacement order (the ban/deathban events): dead names
+  // are swapped in place and the fleet size never changes. Only an explicit
+  // /new-gen-maintain passes grow and may add names to the roster.
+  function requestTopUp (missing, why, grow = true) {
     if (!(missing > 0)) return
-    log(null, `roster ${why} — requesting ${missing} via /new-gen (never removes)`)
+    log(null, `roster ${why} — ${grow ? `requesting ${missing} via /new-gen (dead names recycled in place)` : `replacing ${missing} in place via /new-gen (fleet size unchanged)`}`)
     try {
-      const out = ensureRoster(missing)
+      const out = ensureRoster(missing, { grow })
       if (out && typeof out.then === 'function') out.catch(err => log(null, `roster top-up failed: ${err && err.message ? err.message : err}`))
     } catch (err) { log(null, `roster top-up failed: ${err && err.message ? err.message : err}`) }
   }
@@ -710,6 +713,13 @@ function createLifestealQueue (deps) {
     const t = now()
     if (t - state.lastRosterCheck < state.cfg.rosterTickMs) return
     state.lastRosterCheck = t
+    // Fleet growth is opt-in: only an explicit /new-gen-maintain tops the
+    // roster up to its target. A plain /lifesteal-start must never create
+    // bots by itself ("does every single start it /new-gen new bots? IT
+    // shouldn't do that") — the ban/deathban events order their own
+    // one-for-one in-place replacement, and that is the only automation
+    // allowed to touch the roster without /new-gen-maintain.
+    if (!state.maintainRunning || !(state.maintainTarget > 0)) return
     state.cfg = readConfig(getEnv())
     // Count CONFIGURED accounts (live bots plus names already saved in
     // BOT_NAMES), not just connected ones — a generated name is saved before
@@ -727,10 +737,10 @@ function createLifestealQueue (deps) {
       if (bad) unavailable++
     }
     const effective = roster.length - unavailable
-    const target = state.maintainRunning && state.maintainTarget > 0 ? state.maintainTarget : state.cfg.targetBots
+    const target = state.maintainTarget
     const missing = target - effective
     if (missing > 0) {
-      requestTopUp(missing, `${effective}/${target} usable (${unavailable} banned/deathbanned)`)
+      requestTopUp(missing, `${effective}/${target} usable (${unavailable} banned/deathbanned)`, true)
     }
   }
 
@@ -1001,7 +1011,7 @@ function createLifestealQueue (deps) {
     state.afkSent.delete(id)
     // Standalone routines never create accounts — only the managed loop
     // or /new-gen-maintain orders a /new-gen replacement for a banned bot.
-    if (canReplace) requestTopUp(1, `ban replacement for ${id}`)
+    if (canReplace) requestTopUp(1, `ban replacement for ${id}`, false)
     if (state.running) { try { tick() } catch (_) {} }
   }
 

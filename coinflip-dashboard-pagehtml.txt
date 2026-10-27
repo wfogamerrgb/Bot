@@ -496,7 +496,7 @@ fetch('/api/settings',{credentials:'same-origin',cache:'no-store'}).then(functio
 function envSave(key,value){
 fetch('/api/settings',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:key,value:value})}).then(function(r){return r.json()}).then(function(m){
 if(!m.ok){toast(m.error||('could not set '+key),'bad');return}
-toast(key+(m.value==null?' updated (temporary)':(' = '+m.value+' (temporary)')),'good');envLoad()
+toast(key+(m.value==null?' updated (saved to .env)':(' = '+m.value+' (saved to .env)')),'good');envLoad()
 }).catch(function(){toast('could not reach the console','bad')})
 }
 function envReset(key){

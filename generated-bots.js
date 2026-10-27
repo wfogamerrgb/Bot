@@ -227,4 +227,4 @@ function persistRegeneratedName({ file = path.join(__dirname, '.env'), env = pro
   return { name: replacement, taken: victim, group, direct }
 }
 
-module.exports = { generateNames, updateEnvText, persistGeneratedBots, persistRegeneratedName }
+module.exports = { generateNames, updateEnvText, saveEnvFile, persistGeneratedBots, persistRegeneratedName }

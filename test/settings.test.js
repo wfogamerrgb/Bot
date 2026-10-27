@@ -37,6 +37,23 @@ test('file reload supersedes changed overrides only and reset returns latest fil
     assert.equal(s.get('DELAY_MS'), 2000, 'transient deletion must not erase effective settings')
   } finally { s.stopWatching(); fs.rmSync(directory, { recursive: true, force: true }) }
 })
+test('a .env that never existed is an empty one, not a reload failure (Docker force-loads the env)', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'docker-env-'))
+  const file = path.join(directory, '.env')
+  const env = { KEEP: 'from-the-task-definition' }
+  const s = isolatedSettings(env)
+  s.define('DELAY_MS', { type: 'ms', def: 1 })
+  try {
+    assert.equal(s.watch(file).ok, true, 'boot without a .env must not abort /env')
+    assert.equal(s.reload().ok, true)
+    assert.equal(env.KEEP, 'from-the-task-definition', 'force-loaded values survive without a file')
+    fs.writeFileSync(file, 'DELAY_MS=2s\n')
+    assert.equal(s.reload().ok, true)
+    assert.equal(s.get('DELAY_MS'), 2000)
+    fs.unlinkSync(file)
+    assert.equal(s.reload().ok, false, 'a file that existed and vanished is still a transient error')
+  } finally { s.stopWatching(); fs.rmSync(directory, { recursive: true, force: true }) }
+})
 test('watcher follows atomic replacement of .env and updates running values', async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'watch-env-'))
   const file = path.join(directory, '.env')

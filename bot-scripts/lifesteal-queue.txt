@@ -23,7 +23,7 @@
 #     one is parked. LIFESTEAL_TPA_CMD switches the command to /tpahere so
 #     each player gets pulled to the bot instead
 #   - every other bot stays /warp afk (sent once)
-#   - roster tops up to LIFESTEAL_TARGET_BOTS=20 via /new-gen, never removes
+#   - the roster never grows on its own: only /new-gen or an explicit /new-gen-maintain (LIFESTEAL_TARGET_BOTS=20 target) adds bots; healthy names are never removed, and dead (banned/deathbanned) names are recycled in place — replacements never grow the fleet
 #   - banned bots count as missing: replaced with fresh /new-gen names so the
 #     loop continues like nothing happened
 #

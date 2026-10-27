@@ -694,7 +694,7 @@ The Docker helper adds the Linux host-gateway mapping when the default
 
 The `.ENV` button in the sidebar opens the settings panel described under
 [Coinflip data collection, time series and analytics](#coinflip-data-collection-time-series-and-analytics):
-every tunable value, editable for the current run only, nothing written to disk.
+every tunable value, editable live — `/env set` also saves it to the physical `.env`, so it survives a restart.
 
 The web dashboard is enabled by default. It provides:
 
@@ -937,7 +937,7 @@ pool). Every role is also available **standalone** — see the command table.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `LIFESTEAL_TARGET_BOTS` | `20` | Fleet size the roster tops up to via `/new-gen`; bots are never removed |
+| `LIFESTEAL_TARGET_BOTS` | `20` | Target fleet size for `/new-gen-maintain`; a plain `/lifesteal-start` never grows the roster |
 | `LIFESTEAL_DUELS_BOTS` | `1` | Bots spamming the duels-room command (`0` disables the role) |
 | `LIFESTEAL_QUEUE_BOTS` | `1` | Bots holding `/queue` (`0` disables the role) |
 | `LIFESTEAL_ARENA_BOTS` | `1` | Bots looping `/warp arena` → wait → forward-until-hit (`0` disables) |

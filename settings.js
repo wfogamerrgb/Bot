@@ -11,11 +11,12 @@
  *      with `live: false` so the .env tab can still show and set them, while
  *      saying plainly that a running process will not pick the change up.
  *
- * Nothing here ever writes to disk. The point of the tab is to try a value out
- * (a wager range, a bigger delay) and let it evaporate on the next restart,
- * which is exactly the opposite of an edit to `.env` — so an override is only
- * ever kept in memory, and `process.env` is mutated in memory too (never
- * written back) so any code that reads `process.env.X` late still sees it.
+ * This module itself never writes to disk: an override is kept in memory, and
+ * `process.env` is mutated in memory too (never written back) so any code that
+ * reads `process.env.X` late still sees it. Callers that want durability — the
+ * /env command and the dashboard .ENV tab — persist the same key into the
+ * physical `.env` themselves, which under Docker wins over the force-loaded
+ * task-definition environment at boot and so survives a restart.
  *
  * Secrets are never echoed back: `list()` reports them as set/unset with the
  * value withheld, and `set()` accepts a new one without returning it. That is
@@ -37,6 +38,11 @@ const dotenv = require('dotenv')
 const environment = process.env
 let envFile = null
 let fileValues = null
+// Whether a .env has ever been read successfully. A file that never existed is
+// a normal state (Docker force-loads the environment instead) and must not fail
+// the reload — while a file that existed and then vanished is an atomic replace
+// mid-flight and must not erase what is already loaded.
+let sawEnvFile = false
 let fileWatcher = null
 const reloadListeners = new Set()
 
@@ -44,8 +50,12 @@ const reloadListeners = new Set()
 function reload () {
   if (!envFile) return { ok: true, changed: [] }
   let next
-  try { next = dotenv.parse(fs.readFileSync(envFile, 'utf8')) } catch (err) {
-    return { ok: false, error: `Cannot reload .env (${err.code || 'parse error'})` }
+  try {
+    next = dotenv.parse(fs.readFileSync(envFile, 'utf8'))
+    sawEnvFile = true
+  } catch (err) {
+    if (err.code === 'ENOENT' && !sawEnvFile) next = {}
+    else return { ok: false, error: `Cannot reload .env (${err.code || 'parse error'})` }
   }
   const changed = []
   const previous = fileValues || {}
@@ -65,6 +75,7 @@ function watch (file = path.join(__dirname, '.env')) {
   stopWatching()
   envFile = file
   fileValues = null
+  sawEnvFile = false
   const result = reload()
   // Poll the path, not the inode: editors often replace .env atomically.
   fileWatcher = setInterval(reload, 1000)

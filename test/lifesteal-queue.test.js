@@ -103,10 +103,10 @@ test('deathban parks the tpa bot for 24h and promotes a fresh bot', () => {
   h.q.stop()
 })
 
-test('roster maintainer asks for missing bots but never removes', () => {
+test('only /new-gen-maintain tops the fleet up to its target, and it never removes', () => {
   const h = makeHarness(['A', 'B'], { env: { LIFESTEAL_TARGET_BOTS: '20', LIFESTEAL_ROSTER_TICK_MS: '0' } })
   h.q.start()
-  h.q.tick()
+  h.q.startMaintain(20)
   assert.ok(h.rosterAsked.length >= 1, 'should request top-up when below target')
   assert.equal(h.rosterAsked[0], 18)
   // above target: no request
@@ -115,6 +115,7 @@ test('roster maintainer asks for missing bots but never removes', () => {
   h.advance(70000)
   h.q.tick()
   assert.equal(h.rosterAsked.length, 0, 'must never remove when above target')
+  h.q.stopMaintain()
   h.q.stop()
 })
 
@@ -144,20 +145,26 @@ test('banned bots are excluded from roles and replaced via /new-gen', () => {
   h.q.tick()
   h.advance(70000)
   h.q.tick()
-  // 6 total - 2 banned = 4 effective < 20 target -> top-up asked
-  assert.ok(h.rosterAsked.length >= 1, 'banned bots should count as missing')
+  // Even 4 usable bots against a target of 20 must NOT grow the roster from a
+  // plain run — that runaway is exactly how the fleet ballooned past 150 bots
+  // ("does every single start it /new-gen new bots? IT shouldn't do that").
+  // Replacements are per-event: each ban orders exactly one in-place swap.
+  assert.equal(h.rosterAsked.length, 0, 'a plain run never orders roster top-ups')
+  h.q.onBan('A', 'banned: test wave')
+  assert.deepEqual(h.rosterAsked, [1], 'each ban is replaced one-for-one')
   h.q.stop()
 })
 
 test('saved-but-unconnected names count toward the target — a pending wave is never duplicated', () => {
   const h = makeHarness(['A', 'B'], { env: { LIFESTEAL_TARGET_BOTS: '5', LIFESTEAL_ROSTER_TICK_MS: '0' } })
   h.q.start()
-  h.q.tick()
+  h.q.startMaintain(5)
   h.advance(70000)
   h.q.tick()
   h.advance(70000)
   h.q.tick()
   assert.deepEqual(h.rosterAsked, [3], 'later roster ticks must see names already saved to BOT_NAMES')
+  h.q.stopMaintain()
   h.q.stop()
 })
 
@@ -318,7 +325,7 @@ test('standalone tpa-roundrobin runs on N bots, never creates bots, and is mutua
   assert.equal(h.q.start().ok, true)
   assert.equal(h.q.startSolo('tpa', 2).ok, false, 'solo refuses while the managed loop runs')
   h.q.stop()
-  h.rosterAsked.length = 0 // the managed phase legitimately ordered a top-up
+  h.rosterAsked.length = 0 // the managed phase may have ordered a top-up
 
   const r = h.q.startSolo('tpa', 2)
   assert.equal(r.ok, true)
