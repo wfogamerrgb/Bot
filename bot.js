@@ -1991,8 +1991,24 @@ if (secret.length >= 4) text = text.split(secret).join('••••')
 // Block terminal escape/control injection from remote server text.
 return text.replace(/\x1b\][^\x07]*(?:\x07|$)/g, '').replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '')
 }
+// /proxy-set's credential is an optional user:pass token AFTER the host, so it
+// is the last colon-bearing token that is not the host and not a bare port.
+// Redacting it here (not in the handler) covers every path a command takes into
+// a log: the console echo, the stored history, the browser and Discord feeds.
+function redactProxySetCredentials(command) {
+const match = String(command).match(/^(\s*\/proxy-set)([\s\S]*)$/i)
+if (!match) return command
+const tokens = match[2].trim().split(/\s+/).filter(Boolean)
+for (let i = tokens.length - 1; i > 0; i--) {
+if (!tokens[i].includes(':') || /^\d+$/.test(tokens[i]) || /^(socks5|socks4|https?)$/i.test(tokens[i]) || /^--?reconnect$/i.test(tokens[i])) continue
+tokens[i] = '••••'
+break
+}
+return `${match[1]}${tokens.length ? ' ' + tokens.join(' ') : ''}`
+}
 function commandForLog(trimmed) {
-const redacted = String(trimmed).replace(/(\/env\s+set\s+\S+)\s+([^;&]*)/gi, (whole, prefix) => settings.isSecret(prefix.split(/\s+/).pop()) ? `${prefix} ••••` : whole)
+let redacted = String(trimmed).replace(/(\/env\s+set\s+\S+)\s+([^;&]*)/gi, (whole, prefix) => settings.isSecret(prefix.split(/\s+/).pop()) ? `${prefix} ••••` : whole)
+redacted = redactProxySetCredentials(redacted)
 return safeDisplayText(redacted)
 }
 function recordHistory(trimmed) {
@@ -5199,7 +5215,8 @@ const COMMANDS = {
 '/reconnect': 'Reconnect the active bot',
 '/reconnect-all': 'Reconnect every currently disconnected bot',
 '/reconnect-all-slow': 'Reconnect ALL bots (online or offline) with a 30s delay between each to avoid rate limits',
-'/new-bot <n> [host] [port] [ver]': 'Create and connect a new bot',
+'/restart [--now]': 'Rerun the connect loop for every roster name that is NOT already online — the fix for a fleet sitting below BOT_MAX after the cap was raised (blocked/failed names never retry by themselves). Online bots are skipped, never disconnected, so no session or login is wasted. Pacing matches startup (CONNECT_DELAY_MS + jitter); --now connects immediately',
+'/new-bot bot1,bot2,bot3 [instant|spread]': 'Create and connect several named bots at once. spread (default) paces the connects at CONNECT_DELAY_MS like startup; instant connects them all now. Names are saved to BOT_NAMES in .env so they survive a restart; BOT_MAX still caps the fleet and the overflow waits in the queue',
 '/new-gen [count] [group=auto|direct|N]': 'Generate unique Minecraft names, atomically save to .env and balanced proxy groups, then connect with the default startup connect delay (1–100).',
 '/lifesteal-start': 'Restarts Tor first (scripts/restart-tor.sh --tor-only, LIFESTEAL_TOR_RESTART_CMD override — brew services restart tor is NOT this repo\'s Tor and has no control port 9051), then requests NEWNYM on every local control port so reconnecting bots get fresh circuits, then: random bot /duelsroomqueue + random bot /queue (replaced on death, same bot allowed), one non-queue bot loops /warp arena → 5s → forward-until-hit, one bot spams /tpa until deathban (24h park), rest /warp afk (role sizes are configurable: LIFESTEAL_DUELS_BOTS / LIFESTEAL_QUEUE_BOTS / LIFESTEAL_ARENA_BOTS / LIFESTEAL_TPA_BOTS, default 1 each, 0 disables). Banned bots are replaced via /new-gen so the loop continues (a dead name is recycled in place — its slot becomes a fresh name, so replacements never grow the fleet). Starting never creates bots on its own: the roster only grows via /new-gen or an explicit /new-gen-maintain (LIFESTEAL_TARGET_BOTS=20 is its default target; healthy names are never removed)',
 '/lifesteal-stop': 'Stop lifesteal automation and release held forward keys',
@@ -5214,6 +5231,7 @@ const COMMANDS = {
 '/switch <id>': 'Switch view to a different bot by name or number',
 '/uptime': 'Show uptime for all bots',
 '/proxy': 'Show the currently configured outbound proxy',
+'/proxy-set [host[:port]] [type] [user:pass] | direct | off': 'Set the outbound proxy for the proxy GROUP the active bot belongs to (every bot on that endpoint), or the default route when it has no group. Saved to .env and applied to new connections; --reconnect reconnects the affected bots now. Bare shows the current route; direct pins this bot to a direct connection; off clears the group/default endpoint',
 '/tor-newnym [group|bot|all] [--no-reconnect]': 'Request fresh Tor circuits and staggered-reconnect the chosen scope so the new path takes effect NOW (SIGNAL NEWNYM alone keeps live connections on their old circuit): a proxy group number, a bot name (its group), "default" for ungrouped bots, or "all"; --no-reconnect only signals',
 '/spawner-drop ["term"] [duration=60s] [cooldown=10s] [mode=duration|once|until-stop] [scope=all|inventory|gui]': 'Open the nearest in-reach spawner without walking or public chat; drop matching whole stacks from its GUI and/or carried inventory, including existing items. Default bones, 60s, one stack per 10s. Stop with /spawner-drop stop. GUI drops may be rejected by server plugins; stop on failure rather than retry',
 '/evidence': 'Persistent per-bot observed connection events, last 3 dump runs with outcome messages, and recent death observations. Full JSON: /api/evidence?bot=<name>; no inferred ban cause',
@@ -8887,6 +8905,115 @@ logInfo('No outbound proxy configured — bots connect directly. Set PROXY_HOST 
 return
 }
 
+// ── /proxy-set [host[:port]] [type] [user:pass] | direct | off ──────────────
+// Changes the outbound proxy for the proxy GROUP this bot belongs to — every
+// bot that shares that endpoint — and for the default route when the bot has no
+// group. The scope is derived from the bot instead of typed: that is the whole
+// point of running it "on" a bot, and it keeps a 40-bot group from being
+// half-migrated by a typo in a group number.
+if (trimmed === '/proxy-set' || /^\/proxy-set(?:\s|$)/i.test(trimmed)) {
+const target = activeId
+if (!target) { logWarn('No active bot — /proxy-set changes the group of the bot you are on, so select one first (/switch <name>).'); return }
+const rawArgs = trimmed.slice('/proxy-set'.length).trim().split(/\s+/).filter(Boolean)
+const reconnect = rawArgs.some(arg => /^--?reconnect$/i.test(arg))
+const args = rawArgs.filter(arg => !/^--?reconnect$/i.test(arg))
+const group = PROXY_GROUPS.find(candidate => candidate.bots.some(name => name.toLowerCase() === target.toLowerCase()))
+const scope = group ? `proxy group ${group.index} (${group.bots.length} bot(s))` : 'the default route (every bot without its own group)'
+const keyOf = suffix => (group ? `PROXY_GROUP_${group.index}_${suffix}` : `PROXY_${suffix}`)
+const directKey = `BOT_DIRECT_${target}`
+const pinnedDirect = String(process.env[directKey] || '').toLowerCase() === 'true'
+const current = resolveBotProxy(target, PROXY_GROUPS, PROXY_DEFAULT)
+// set + save in one step: the value is live for the next connection and the
+// .env line is what makes it survive a restart (Docker force-loads env unless
+// the file has the line).
+const applyKey = (key, value) => {
+const result = settings.set(key, value)
+if (!result.ok) throw new Error(`${key}: ${result.error}`)
+persistEnvSetting(key, String(value))
+}
+const reconnectAffected = () => {
+if (!reconnect) return
+// Only the bots this route governs. If a group endpoint is swapped, the rest
+// of the fleet is already talking to a working proxy and has no reason to
+// re-login; 1.5s apart so the swap does not become a login burst.
+const names = group ? group.bots : Object.keys(bots).filter(name => !PROXY_GROUPS.some(candidate => candidate.bots.some(bot => bot.toLowerCase() === name.toLowerCase())))
+let queued = 0
+for (const name of names) {
+const id = Object.keys(bots).find(key => key.toLowerCase() === name.toLowerCase())
+if (!id) continue
+const { host, port, version } = bots[id]
+const at = queued++ * 1500
+setTimeout(() => {
+  try { bots[id].disconnectManually() } catch (_) {}
+  setTimeout(() => { if (!connectBlockReason(id)) createBotInstance(id, host, port, version) }, 1000)
+}, at)
+}
+if (queued) logInfo(`Reconnecting ${queued} bot(s) on ${group ? `group ${group.index}` : 'the default route'} so they leave through the new endpoint.`)
+}
+if (!args.length) {
+logInfo(`{bold}${sanitize(target)}{/bold} → ${describeProxy(current)} {gray-fg}(${scope}${pinnedDirect ? `; ${directKey}=true pins it direct` : ''}){/gray-fg}`)
+logInfo('{gray-fg}/proxy-set <host[:port]> [socks5|http] [user:pass] · /proxy-set direct · /proxy-set off · append --reconnect to apply now{/gray-fg}')
+return
+}
+const verb = args[0].toLowerCase()
+try {
+if (verb === 'direct') {
+applyKey(directKey, 'true')
+refreshRuntimeConfig()
+logSuccess(`${sanitize(target)} now connects directly — ${directKey}=true saved to .env.`)
+reconnectAffected()
+return
+}
+if (verb === 'off') {
+// A group with no HOST is a bot grouping, not a route: its bots fall back to
+// the default. Clearing the default's HOST is how "no proxy at all" is spelled.
+applyKey(keyOf('HOST'), '')
+refreshRuntimeConfig()
+logSuccess(group ? `Proxy group ${group.index} no longer has its own endpoint — its ${group.bots.length} bot(s) use the default route (saved to .env).` : 'Default route cleared — bots without a group connect directly (saved to .env).')
+reconnectAffected()
+return
+}
+let host = verb
+let portArg = null
+const hostPort = host.match(/^(.*):(\d+)$/)
+if (hostPort && hostPort[1]) { host = hostPort[1]; portArg = Number(hostPort[2]) }
+let index = 1
+if (portArg == null && /^\d+$/.test(args[index] || '')) portArg = Number(args[index++])
+const typeArg = args[index] && /^(socks5|socks4|http|https)$/i.test(args[index]) ? args[index++].toLowerCase() : null
+const credential = args[index]
+if (!host || /\s/.test(host)) throw new Error(`"${sanitize(verb)}" is not a host — /proxy-set <host[:port]> [type] [user:pass]`)
+if (args[index + 1]) throw new Error('too many arguments — credentials are one token, user:pass')
+const port = portArg == null ? (group ? group.port : PROXY_DEFAULT ? PROXY_DEFAULT.port : 1080) : portArg
+if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`${sanitize(String(port))} is not a valid port`)
+const type = typeArg || (group ? group.type : PROXY_DEFAULT ? PROXY_DEFAULT.type : 'socks5')
+let user = ''
+let pass = ''
+if (credential) {
+const at = credential.indexOf(':')
+if (at <= 0) throw new Error('credentials are written as one user:pass token')
+user = credential.slice(0, at)
+pass = credential.slice(at + 1)
+}
+applyKey(keyOf('HOST'), host)
+applyKey(keyOf('PORT'), String(port))
+applyKey(keyOf('TYPE'), type)
+// A new endpoint is a different provider. Carrying the previous operator's
+// password over to it is wrong even though it is still "configured", so an
+// omitted credential clears the pair instead of silently inheriting it.
+applyKey(keyOf('USER'), user)
+applyKey(keyOf('PASS'), pass)
+if (pinnedDirect) applyKey(directKey, 'false')
+refreshRuntimeConfig()
+logSuccess(`${sanitize(target)} → ${describeProxy(resolveBotProxy(target, PROXY_GROUPS, PROXY_DEFAULT))} {gray-fg}(${scope}; saved to .env${pinnedDirect ? `; ${directKey} unpinned` : ''}){/gray-fg}`)
+logInfo(user ? 'Proxy credentials saved for this endpoint (values withheld).' : 'No proxy credentials set — add them with the user:pass token.')
+logInfo('{gray-fg}Applies to new connections: live sessions keep their socket until they reconnect (--reconnect applies it now).{/gray-fg}')
+reconnectAffected()
+} catch (err) {
+logError(`Could not set the proxy: ${sanitize(err.message)}`)
+}
+return
+}
+
 // ── /tor-newnym [group|bot|all] [--no-reconnect] ──
 if (/^\/tor-newnym(?:\s|$)/.test(trimmed)) {
 const args = trimmed.slice('/tor-newnym'.length).trim().split(/\s+/).filter(Boolean)
@@ -8948,6 +9075,73 @@ logSuccess(`Staggered reconnect started for ${count} bot(s) (${delayMs / 1000}s 
 return
 }
 
+// ── /restart [--now] ────────────────────────
+// Reruns the startup connect loop over the roster, skipping every bot that is
+// already online. The gap this closes: a name that was blocked by BOT_MAX (or
+// whose attempt failed) never retries itself, so raising the cap to 100 while
+// 60 bots are up could leave the other 40 sitting there indefinitely. /restart
+// guarantees the attempt — and because online bots are skipped, it never
+// disconnects a healthy session or spends a login just to say "already up".
+if (trimmed === '/restart' || /^\/restart(?:\s|$)/i.test(trimmed)) {
+const flags = trimmed.slice('/restart'.length).trim().split(/\s+/).filter(Boolean)
+const badFlag = flags.find(flag => !/^--?now$/i.test(flag))
+if (badFlag) { logWarn(`Usage: /restart [--now] — "${sanitize(badFlag)}" is not a flag /restart understands.`); return }
+const immediately = flags.length > 0
+// Anything already waiting for a slot gets its chance first: the queue is the
+// same connect loop, just deferred.
+try { flushWaitingForSlot() } catch (_) {}
+// The roster is everything that has ever been asked to connect here: the .env
+// list (re-read from process.env so /new-bot's additions count), the proxy-group
+// assignments, and the bots this run already knows about.
+const roster = [...new Map([...BOT_NAMES, ...parseNameList(process.env.BOT_NAMES), ...PROXY_GROUPS.flatMap(group => group.bots), ...Object.keys(bots)]
+.filter(Boolean).map(name => [String(name).toLowerCase(), String(name)])).values()]
+const pending = []
+let online = 0
+let connecting = 0
+let blocked = 0
+for (const name of roster) {
+const id = Object.keys(bots).find(key => key.toLowerCase() === name.toLowerCase()) || name
+const entry = bots[id]
+if (botOnline(entry)) { online++; continue }
+// A connection already in flight IS the connect loop. Restarting it would
+// throw away a login mid-handshake — the waste this command must avoid.
+if (entry && entry.connectionState === 'connecting') { connecting++; continue }
+if (connectBlockReason(id)) { blocked++; continue }
+// Existing entries carry their own destination; new names take the default.
+pending.push({ id, host: entry?.host || HOST, port: entry?.port || PORT, version: entry?.version || VERSION })
+}
+const skipped = [online ? `${online} already online` : '', connecting ? `${connecting} still connecting` : '', blocked ? `${blocked} blocked (removed list/deathban)` : ''].filter(Boolean).join(' · ')
+if (!pending.length) {
+logInfo(`Nothing to restart — every roster name is up or already connecting${blocked ? ` (${blocked} blocked)` : ''}.`)
+return
+}
+let at = 0
+for (const { id, host, port, version } of pending) {
+const delay = immediately ? 0 : at
+// Same pacing as startup (/new-gen and lifesteal top-ups share it): a burst of
+// 40 logins is exactly what CONNECT_DELAY_MS exists to prevent.
+if (!immediately) at += CONNECT_DELAY_MS + Math.floor(Math.random() * (CONNECT_DELAY_RANDOM_MS + 1))
+const fire = () => {
+// It may have come up on its own since the plan was made (a queue flush or a
+// pending reconnect timer) — never take a live session down for this.
+if (botOnline(bots[id]) || connectBlockReason(id)) return
+if (bots[id]) {
+// Tear the dead socket down first, then reconnect, the same way /reconnect
+// does: a half-closed client would otherwise fight the new one.
+try { bots[id].disconnectManually() } catch (_) {}
+setTimeout(() => { if (!botOnline(bots[id])) createBotInstance(id, host, port, version) }, 1000)
+return
+}
+createBotInstance(id, host, port, version)
+}
+if (delay > 0) setTimeout(fire, delay)
+else fire()
+}
+logSuccess(`Connect loop restarted for ${pending.length} bot(s)${immediately ? ' immediately' : ` — same ${(CONNECT_DELAY_MS / 1000).toFixed(1)}s+ pacing as startup`}${skipped ? ` (skipped: ${skipped})` : ''}.`)
+logInfo(`{gray-fg}BOT_MAX ${settings.get('BOT_MAX')} · ${Object.keys(bots).length} bot(s) held · names over the cap wait in the queue and connect as slots free.{/gray-fg}`)
+return
+}
+
 // ── /chat ───────────────────────────────────
 if (trimmed.startsWith('/chat ')) {
 const msg = trimmed.slice(6).trim()
@@ -9002,17 +9196,66 @@ if (refresh) return refreshServerCommands(activeId).then(show).catch(err => logW
 return show()
 }
 
-// ── /new-bot ────────────────────────────────
-if (trimmed.startsWith('/new-bot ')) {
-const args = trimmed.slice(9).trim().split(/\s+/).filter(Boolean)
-const username = args[0]
-if (!username) { logWarn('Usage: /new-bot <username> [host] [port] [version]'); return }
-if (bots[username]) { logWarn(`Bot "${username}" already exists.`); return }
-const h = args[1] || HOST
-const p = args[2] ? parseInt(args[2], 10) : PORT
-const v = args[3] || VERSION
-logInfo(`Creating new bot: ${username} @ ${h}:${p} (v${v})`)
-createBotInstance(username, h, p, v)
+// ── /new-bot bot1,bot2,bot3 [instant|spread] ──
+// Creates the named accounts and connects them: "spread" (default) paces them
+// at the normal startup gap, "instant" starts them all at once. The names are
+// added to BOT_NAMES in .env first, so a restart brings the same bots back
+// instead of losing them with the process. BOT_MAX still governs: names over
+// the cap wait in the queue and connect as slots free (/restart drains it).
+if (trimmed === '/new-bot' || /^\/new-bot(?:\s|$)/i.test(trimmed)) {
+const args = trimmed.slice('/new-bot'.length).trim().split(/\s+/).filter(Boolean)
+const requested = (args[0] || '').split(',').map(name => name.trim()).filter(Boolean)
+const mode = (args[1] || 'spread').toLowerCase()
+if (!requested.length) { logWarn('Usage: /new-bot bot1,bot2,bot3 [instant|spread] — spread (default) connects over time, instant connects at once.'); return }
+if (args.length > 2 || !['instant', 'spread'].includes(mode)) {
+logWarn(args.length > 2 ? 'Usage: /new-bot bot1,bot2,bot3 [instant|spread] — names are a comma list, then the mode.' : `Usage: /new-bot bot1,bot2,bot3 [instant|spread] — "${sanitize(args[1])}" is not a mode.`)
+return
+}
+const invalid = requested.filter(name => !/^[A-Za-z0-9_]{1,16}$/.test(name) || ['__proto__', 'constructor', 'prototype'].includes(name))
+if (invalid.length) { logError(`${invalid.map(sanitize).join(', ')}: Minecraft usernames are 1–16 letters, digits or underscores. Nothing was created.`); return }
+const known = new Set(Object.keys(bots).map(id => id.toLowerCase()))
+const unique = [...new Map(requested.map(name => [name.toLowerCase(), name])).values()]
+const duplicates = unique.filter(name => known.has(name.toLowerCase()))
+const names = unique.filter(name => !known.has(name.toLowerCase()))
+if (!names.length) { logWarn(`Nothing new — ${duplicates.map(sanitize).join(', ')} already exist${duplicates.length === 1 ? 's' : ''}.`); return }
+// Roster first, connect second: a name saved but not connected comes back at
+// the next start, while one that connected but was never saved vanishes with
+// the process — the worse of the two failures when the account exists.
+let saved = false
+try {
+const file = path.join(__dirname, '.env')
+let text = ''
+try { text = fs.readFileSync(file, 'utf8') } catch (err) { if (err.code !== 'ENOENT') throw err }
+const roster = [...new Map([...parseNameList(process.env.BOT_NAMES), ...unique].map(name => [name.toLowerCase(), name])).values()]
+saveEnvFile(file, text, { BOT_NAMES: roster.join(',') }, fs)
+process.env.BOT_NAMES = roster.join(',')
+saved = true
+} catch (err) {
+logWarn(`Could not save the new name(s) to .env (${sanitize(err.code || err.message)}) — they connect now, but will not survive a restart.`)
+}
+const notes = `${saved ? ' Added to BOT_NAMES in .env.' : ''}${duplicates.length ? ` Skipped already-known: ${duplicates.map(sanitize).join(', ')}.` : ''}`
+const blockedNames = names.filter(name => connectBlockReason(name))
+for (const name of blockedNames) logWarn(`${sanitize(name)} is ${sanitize(connectBlockReason(name))} — it will not connect until that is cleared (/unban ${sanitize(name)}).`)
+const connectable = names.filter(name => !connectBlockReason(name))
+if (!connectable.length) { logWarn(`Nothing to connect.${notes}`); return }
+if (mode === 'instant') {
+connectable.forEach(name => createBotInstance(name, HOST, PORT, VERSION))
+logSuccess(`Created ${connectable.length} bot(s) at once: ${connectable.map(sanitize).join(', ')}.${notes}`)
+return
+}
+let at = 0
+let lastAt = 0
+connectable.forEach(name => {
+const delay = at
+lastAt = delay
+at += CONNECT_DELAY_MS + Math.floor(Math.random() * (CONNECT_DELAY_RANDOM_MS + 1))
+const fire = () => { if (!Object.hasOwn(bots, name) && !connectBlockReason(name)) createBotInstance(name, HOST, PORT, VERSION) }
+// The first connect is immediate; the rest wait for the startup gap.
+if (delay > 0) setTimeout(fire, delay)
+else fire()
+})
+// Report when the LAST one connects, not the next unpaced gap.
+logSuccess(`Created ${connectable.length} bot(s), spread over the next ${(lastAt / 1000).toFixed(0)}s: ${connectable.map(sanitize).join(', ')}.${notes}`)
 return
 }
 

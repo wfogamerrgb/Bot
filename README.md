@@ -1431,8 +1431,9 @@ Any unrecognized input is sent as a Minecraft chat message or command.
 | `/players` | List players visible to the active bot |
 | `/uptime` | Show uptime for every bot |
 | `/proxy` | Show proxy and stall-watchdog configuration |
+| `/proxy-set [host[:port]] [type] [user:pass]` \| `direct` \| `off` | Set the proxy for the proxy **group the active bot belongs to** — or the default route when it has no group — and save it to `.env`. Bare shows the current route, `direct` pins this bot to a direct connection, `off` clears the group/default endpoint, `--reconnect` reconnects the affected bots now |
 | `/switch <id>` | Select a bot by name or list number |
-| `/new-bot <name> [host] [port] [version]` | Create a bot at runtime |
+| `/new-bot bot1,bot2,bot3 [instant\|spread]` | Create and connect several named bots in one go. `spread` (default) paces them at `CONNECT_DELAY_MS` like startup; `instant` connects them all at once. Names are saved to `BOT_NAMES` in `.env`, so a restart brings them back; `BOT_MAX` still caps the fleet and the overflow waits in the queue |
 | `/chat <message>` | Send a chat message without local command parsing |
 | `/all <command>` | Run a local command on every bot or broadcast a server command to all. `ALL_CHAT_GUARD` (on by default) refuses plain chat so a typo cannot make every bot say it — prefix with `!` for deliberate chat (`/all !hello`) |
 | `/repeat [n\|duration] [delay] <cmd>` | Re-run a command with time between the runs (`REPEAT_DELAY_MS`, or an explicit delay like `/repeat 5 30s /spawners`); `/repeat stop` cancels pending runs |
@@ -1443,6 +1444,7 @@ Any unrecognized input is sent as a Minecraft chat message or command.
 | `/reconnect` | Reconnect the active bot |
 | `/reconnect-all` | Reconnect currently offline bots |
 | `/reconnect-all-slow` | Reconnect all bots with a configurable stagger |
+| `/restart [--now]` | Rerun the connect loop for every roster name that is **not already online**. This is the fix for a fleet sitting below `BOT_MAX` after the cap was raised: names blocked by the cap or by a failed attempt never retry by themselves. Online bots are skipped and never disconnected, so no session or login is wasted. Pacing matches startup (`CONNECT_DELAY_MS` + jitter); `--now` connects immediately |
 | `/removed` | List the removed / permanently-banned bots |
 | `/auth-retry <bot>` | Clear a recorded login/register failure and reconnect so it can authenticate again |
 | `/unban <bot>` | Take a bot off the removed list and reconnect it |

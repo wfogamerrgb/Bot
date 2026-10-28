@@ -3387,3 +3387,116 @@ test('BOT_MAX: capped names wait in queue and a raised cap connects them (/env w
   assert.equal(r.run('Object.keys(bots).includes("D")'), true, 'raising BOT_MAX connects the queued name')
   assert.equal(r.run('waitingForSlot.size'), 0, 'the queue drains')
 })
+
+// /restart exists for one job: a fleet below BOT_MAX that will not fill itself.
+// The two halves that matter are "connect what is down" and "never touch what is
+// up" — a restart that disconnects 60 healthy bots to reconnect them would cost
+// 60 logins and could not be run casually on a live fleet.
+test('/restart reruns the connect loop for offline bots only and never disturbs a live session', () => {
+  const r = runtime({ TEST_CREATE_BOTS: true, CONNECT_DELAY_MS: '5000' })
+  r.run(`
+    __disc = 0
+    for (const id of ['A', 'B', 'C']) bots[id].disconnectManually = () => { __disc++ }
+    bots.E = { bot: null, logs: [], connectionState: 'connecting', host: 'h', port: 1, version: 'v' }
+    process.env.BOT_NAMES = 'A,B,C,D,E'
+  `)
+  r.timers.clear()
+  r.run(`handleCommand('/switch A'); handleCommand('/restart --now')`)
+  const out = channelLogs(r, 'A')
+
+  // D is the only roster name that needed a connection…
+  assert.equal(r.run(`Object.hasOwn(bots, 'D')`), true, 'D connects')
+  // …the three live bots were never disconnected…
+  assert.equal(r.run('__disc'), 0, 'an online bot is never disconnected by /restart')
+  // …and the one mid-handshake name was left alone rather than restarted.
+  assert.equal(r.run(`bots.E.connectionState`), 'connecting')
+  assert.match(out, /Connect loop restarted for 1 bot/)
+  assert.match(out, /3 already online/)
+  assert.match(out, /1 still connecting/)
+
+  // With everything up or in flight, repeating it is a no-op — the command must
+  // not manufacture reconnect work for its own sake.
+  r.run(`handleCommand('/restart')`)
+  assert.match(channelLogs(r, 'A'), /Nothing to restart/)
+})
+
+// The scope of /proxy-set is the bot you are on, because that is the thing the
+// caller actually knows. A group endpoint belongs to every bot on it; the
+// default belongs to the ungrouped ones. Editing the wrong one silently
+// migrates half a fleet onto a dead proxy.
+test('/proxy-set edits the group of the active bot, or the default route, and never prints credentials', () => {
+  const r = runtime({
+    PROXY_GROUP_1_BOTS: 'A,B', PROXY_GROUP_1_HOST: '1.2.3.4',
+    PROXY_GROUP_2_BOTS: 'C', PROXY_GROUP_2_HOST: '5.6.7.8'
+  })
+  r.timers.clear()
+  r.run(`handleCommand('/switch A'); handleCommand('/proxy-set 9.9.9.9:1080 socks5 bob:s3cret')`)
+
+  const saved = require('dotenv').parse(r.fakeFiles.get('.env'))
+  assert.equal(saved.PROXY_GROUP_1_HOST, '9.9.9.9')
+  assert.equal(saved.PROXY_GROUP_1_PORT, '1080')
+  assert.equal(saved.PROXY_GROUP_1_USER, 'bob')
+  assert.equal(saved.PROXY_GROUP_1_PASS, 's3cret')
+  // The live runtime sees the new endpoint without a restart…
+  assert.equal(r.run('PROXY_GROUPS.find(g => g.index === 1).host'), '9.9.9.9')
+  // …and group 2 is untouched.
+  assert.equal(saved.PROXY_GROUP_2_HOST, undefined, 'a group edit must not rewrite another group')
+  const out = channelLogs(r, 'A')
+  assert.match(out, /proxy group 1 \(2 bot\(s\)\)/)
+  assert.ok(!out.includes('s3cret'), 'proxy password leaked into /proxy-set output')
+  assert.ok(!out.includes('bob:'), 'proxy credentials leaked into /proxy-set output')
+  // The echo is redacted too, so the password cannot reach stored history,
+  // the browser console or the Discord feed either.
+  assert.ok(!r.run('commandHistory.join("|")').includes('s3cret'), 'proxy password leaked into command history')
+  assert.match(out, /\/proxy-set 9\.9\.9\.9:1080 socks5 ••••/)
+
+  // A bot in no group edits the default route instead of inventing a group.
+  r.run(`bots.D = { bot: { entity: {} }, logs: [], disconnectManually() {} }`)
+  r.run(`handleCommand('/switch D'); handleCommand('/proxy-set 7.7.7.7 http')`)
+  const fallback = require('dotenv').parse(r.fakeFiles.get('.env'))
+  assert.equal(fallback.PROXY_HOST, '7.7.7.7')
+  assert.equal(fallback.PROXY_TYPE, 'http')
+  assert.equal(fallback.PROXY_GROUP_2_HOST, undefined)
+
+  // `direct` is per bot (a pin), `off` clears the scope's endpoint.
+  r.run(`handleCommand('/proxy-set direct')`)
+  assert.equal(require('dotenv').parse(r.fakeFiles.get('.env')).BOT_DIRECT_D, 'true')
+  r.run(`handleCommand('/switch A'); handleCommand('/proxy-set off')`)
+  assert.equal(require('dotenv').parse(r.fakeFiles.get('.env')).PROXY_GROUP_1_HOST, '')
+  assert.match(channelLogs(r, 'A'), /no longer has its own endpoint/)
+})
+
+// The old /new-bot took exactly one name and connected it immediately. The
+// requested interface takes a list plus a mode, and the mode is a real
+// behavioural difference: `spread` paces the logins at the startup gap,
+// `instant` fires them together.
+test('/new-bot takes a comma list, spreads by default and connects instantly on request', () => {
+  const r = runtime({ TEST_CREATE_BOTS: true, CONNECT_DELAY_MS: '1000' })
+  r.timers.clear()
+  r.run(`handleCommand('/new-bot D1,D2,D3')`)
+
+  // spread: the first connect happens now, the next two at the startup gap.
+  assert.equal(r.run(`Object.hasOwn(bots, 'D1')`), true)
+  const delays = [...r.timers.values()].map(timer => timer.delay).filter(delay => delay >= 1000).sort((a, b) => a - b)
+  assert.deepEqual(delays.slice(0, 2), [1000, 2000], 'spread paces the connects')
+  // The roster is saved BEFORE connecting, so a restart brings them back.
+  assert.equal(require('dotenv').parse(r.fakeFiles.get('.env')).BOT_NAMES, 'A,B,C,D1,D2,D3')
+  assert.match(channelLogs(r, 'A'), /Created 3 bot\(s\), spread over the next 2s/)
+
+  // instant: every name in the same tick.
+  r.timers.clear()
+  r.run(`handleCommand('/new-bot E1,E2 instant')`)
+  assert.equal(r.run(`Object.hasOwn(bots, 'E1') && Object.hasOwn(bots, 'E2')`), true)
+  assert.match(channelLogs(r, 'A'), /Created 2 bot\(s\) at once/)
+
+  // Known names are skipped rather than reconnected behind the user's back.
+  r.run(`handleCommand('/new-bot D1')`)
+  assert.match(channelLogs(r, 'A'), /Nothing new — D1 already exists/)
+
+  // Invalid usernames are refused before anything is written or connected.
+  const before = r.fakeFiles.get('.env')
+  r.run(`handleCommand('/new-bot bad-name')`)
+  assert.match(channelLogs(r, 'A'), /letters, digits or underscores/)
+  assert.equal(r.fakeFiles.get('.env'), before, 'a rejected name writes nothing')
+  assert.equal(r.run(`Object.hasOwn(bots, 'bad-name')`), false)
+})
