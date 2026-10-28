@@ -3901,6 +3901,29 @@ function isTrustedTpaName (name) {
   return TPA_TRUSTED_BOTS.some(trusted => trusted.toLowerCase() === lower)
 }
 
+// ── BOT_MAX waiting queue ───────────────────────────────────────────────────
+// New names blocked by the fleet ceiling are QUEUED — the setting's docs always
+// said "new names wait for a free slot" — and connect automatically when a slot
+// frees or BOT_MAX rises. This is what makes `/env set BOT_MAX higher` actually
+// connect more bots instead of silently doing nothing.
+const waitingForSlot = new Map() // id -> { id, host, port, version, queuedAt }
+
+function flushWaitingForSlot () {
+if (!waitingForSlot.size) return
+const cap = Math.floor(Number(settings.get('BOT_MAX')) || 0)
+for (const [id, req] of [...waitingForSlot]) {
+if (Object.hasOwn(bots, id) || connectBlockReason(id)) { waitingForSlot.delete(id); continue }
+if (cap > 0 && Object.keys(bots).length >= cap) return // still full — keep waiting
+waitingForSlot.delete(id)
+logFor(SYSTEM_ID, `{cyan-fg}› BOT_MAX has room — connecting queued ${sanitize(id)}.{/cyan-fg}`)
+createBotInstance(id, req.host, req.port, req.version)
+}
+}
+// Slots also free up whenever a bot closes; sweep so queued names do not need
+// a settings change to notice. Unref'd — never keeps the process alive.
+const waitingSweepTimer = setInterval(() => { try { flushWaitingForSlot() } catch (_) {} }, 30000)
+if (waitingSweepTimer && waitingSweepTimer.unref) waitingSweepTimer.unref()
+
 function createBotInstance(username, host, port, version, options = {}) {
 refreshRuntimeConfig()
 host = host || HOST
@@ -3916,7 +3939,10 @@ if (blocked) { logFor(SYSTEM_ID, `{yellow-fg}⚠ ${sanitize(id)}: ${sanitize(blo
 if (!options.force && !Object.hasOwn(bots, id)) {
 const cap = Math.floor(Number(settings.get('BOT_MAX')) || 0)
 if (cap > 0 && Object.keys(bots).length >= cap) {
-logFor(SYSTEM_ID, `{yellow-fg}⛔ ${sanitize(id)} not connected — BOT_MAX=${cap} reached (${Object.keys(bots).length} bots live). Close a bot, /env set BOT_MAX higher, or /new-gen for more.{/yellow-fg}`)
+if (!waitingForSlot.has(id)) {
+waitingForSlot.set(id, { id, host, port, version, queuedAt: Date.now() })
+logFor(SYSTEM_ID, `{yellow-fg}⛔ ${sanitize(id)} not connected — BOT_MAX=${cap} reached (${Object.keys(bots).length} bots live). Queued — it connects on its own when a slot frees or BOT_MAX rises (/env set BOT_MAX higher).{/yellow-fg}`)
+}
 return null
 }
 }
@@ -4395,6 +4421,7 @@ bot.acceptResourcePack(); // For older versions it still works fine
 
 bot.once('spawn', () => {
 if (bots[id] !== entry || fatalConnectionError || manualDisconnect) return
+entry.diedAwaitingRespawn = false // a fresh connection has its own startup send
 trackServerCommands() // chat plugin is injected asynchronously on initial login
 connected = true
 const recoveredAfter = bots[id]?.reconnectAttempts || 0
@@ -4437,6 +4464,24 @@ i(`Sending server command after spawn: ${spawnCommand}`)
 sendNormalStartup()
 }, 3000 + Math.random() * 2000)
 }
+})
+
+// Death respawns re-emit mineflayer's 'spawn' (health.js: dead -> alive), but
+// the one-shot startup above is already consumed by then. Previously the only
+// thing that nudged a respawned bot back onto the server was the 10-minute
+// chat watchdog — at a random moment or never. This makes it deterministic:
+// after every death -> respawn, re-send the server command shortly after.
+bot.on('spawn', () => {
+if (bots[id] !== entry || fatalConnectionError || manualDisconnect) return
+if (!entry.diedAwaitingRespawn) return // plain dimension-change spawns are not deaths
+entry.diedAwaitingRespawn = false
+if (entry.rtpRunning || entry.spawnerDropRunning) return // an active routine owns this bot
+const respawnCommand = SERVER_COMMAND || '/server lifesteal'
+pushT(() => {
+if (bots[id] !== entry || !botOnline(entry)) return
+i(`Sending server command after respawn: ${respawnCommand}`)
+try { bot.chat(respawnCommand) } catch (err) { e(`Server command failed: ${sanitize(err.message)}`) }
+}, 3000 + Math.random() * 2000)
 })
 
 bot.on('windowOpen', (window) => {
@@ -4561,6 +4606,7 @@ bot.on('message', (jsonMsg) => { try { c(jsonMsg.toString()) } catch (_) {} })
 bot.on('messagestr', (text) => { try { lifestealQueue.onMessage(id, String(text || '')) } catch (_) {} })
 
 bot.on('death', () => {
+  entry.diedAwaitingRespawn = true // the respawn must re-run the server command
   try { lifestealQueue.onDeath(id) } catch (_) {}
   stopFreeForAll(id, true)
   kos.stop(id, true)
@@ -9615,6 +9661,8 @@ if (trimmed === '/env' || trimmed.startsWith('/env ')) {
     try { persistEnvSetting(result.key, value) } catch (err) { saved = false; logWarn(`${result.key} is live for this run, but saving it to .env failed (${sanitize(err.code || err.message)}) — it will not survive a restart.`) }
     logSuccess(result.secret ? `${result.key} updated (${saved ? 'saved to .env; value withheld' : 'this run only; value withheld'})` : `${result.key} = ${String(result.value)} {gray-fg}(${saved ? 'saved to .env — survives restarts' : 'this run only'}){/gray-fg}`)
     if (!result.live) logWarn(`${result.key} is read once at startup, so the running process keeps its old value. The .env line is saved; restart to apply it.`)
+    // A raised BOT_MAX must connect the queued names right away.
+    try { flushWaitingForSlot() } catch (_) {}
     return
   }
   if (sub === 'reset') {
@@ -9714,6 +9762,9 @@ if (CHAT_WATCHDOG_ENABLED) {
 
 // ── Interface startup ─────────────────────────────────────────────────────────
 settings.onChange(refreshRuntimeConfig)
+// Any settings change (also the dashboard .ENV tab) may free fleet capacity —
+// a raised BOT_MAX connects the waiting names instead of doing nothing.
+settings.onChange(() => { try { flushWaitingForSlot() } catch (_) {} })
 const watchedEnv = settings.watch(path.join(__dirname, '.env'))
 if (!watchedEnv.ok) logWarn(watchedEnv.error)
 tui = startTUI()

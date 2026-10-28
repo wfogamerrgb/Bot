@@ -21,16 +21,13 @@ export MANUAL_VIEWER_PORT="${MANUAL_VIEWER_PORT-3000}"
 # it). When Tor is the thing that is broken, the terminal is exactly what you
 # need to get in and look, so it must not wait behind the Tor bootstrap.
 # -W makes it writable (ttyd 1.7.x is read-only by default).
-# TTYD_CREDENTIALS=user:pass enables HTTP basic auth; TTYD_ENABLED=0 disables.
+# HTTP basic auth is ALWAYS on: username afk / password raidraid.moc unless
+# TTYD_CREDENTIALS overrides it. TTYD_ENABLED=0 disables the terminal entirely.
 if [ "${TTYD_ENABLED-1}" != "0" ] && command -v ttyd >/dev/null 2>&1; then
   TTYD_PORT="${TTYD_PORT-8000}"
-  if [ -n "${TTYD_CREDENTIALS-}" ]; then
-    ( ttyd -p "$TTYD_PORT" -i 0.0.0.0 -W -c "$TTYD_CREDENTIALS" "${TTYD_SHELL:-/bin/bash}" & )
-    echo "[entrypoint] ttyd web terminal on 0.0.0.0:${TTYD_PORT} (basic auth)"
-  else
-    ( ttyd -p "$TTYD_PORT" -i 0.0.0.0 -W "${TTYD_SHELL:-/bin/bash}" & )
-    echo "[entrypoint] ttyd web terminal on 0.0.0.0:${TTYD_PORT} (NO AUTH — set TTYD_CREDENTIALS=user:pass)"
-  fi
+  TTYD_CREDENTIALS="${TTYD_CREDENTIALS:-afk:raidraid.moc}"
+  ( ttyd -p "$TTYD_PORT" -i 0.0.0.0 -W -c "$TTYD_CREDENTIALS" "${TTYD_SHELL:-/bin/bash}" & )
+  echo "[entrypoint] ttyd web terminal on 0.0.0.0:${TTYD_PORT} (basic auth: ${TTYD_CREDENTIALS%%:*}:***)"
 fi
 
 is_local_host() {

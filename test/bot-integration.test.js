@@ -3344,3 +3344,46 @@ test('deathbanned bots are closed (/closeBot), blocked from reconnecting, and ke
   assert.match(logsText(r), /Offline Death Banned Bots \(1\)/)
 })
 
+test('death respawn deterministically re-sends the server command — and only after a death', () => {
+  const r = runtime({ TEST_CREATE_BOTS: true, CLICK_COMPASS: 'false' })
+  r.run("createBotInstance('D')")
+  const bot = r.createdBots[0]
+  const sent = []; bot.chat = cmd => sent.push(cmd)
+  bot.entity = { position: { x: 1, y: 64, z: 1 } }
+  r.run(`bots.D.connectionState = 'online'`)
+
+  // First spawn: the normal startup path sends the server command.
+  bot.emit('spawn')
+  for (const t of [...r.timers.keys()].filter(t => t.delay >= 2000 && t.delay <= 5000)) { r.timers.delete(t); t.fn() }
+  assert.deepEqual(sent, ['/server lifesteal'], 'first spawn sends the server command')
+
+  // A re-spawn WITHOUT a death (dimension change etc.) must not nudge.
+  r.timers.clear()
+  sent.length = 0
+  bot.emit('spawn')
+  assert.equal(r.timers.size, 0, 'no respawn nudge without a death')
+
+  // Death -> respawn (mineflayer re-emits 'spawn'): exactly one nudge.
+  bot.emit('death')
+  bot.emit('spawn')
+  assert.equal(r.timers.size, 1, 'one respawn nudge scheduled after the death')
+  for (const t of [...r.timers.keys()]) { r.timers.delete(t); t.fn() }
+  assert.deepEqual(sent, ['/server lifesteal'], 'respawn re-sends the server command')
+
+  // And the nudge fires once per death, not on every later spawn.
+  bot.emit('spawn')
+  assert.equal(r.timers.size, 0, 'no second nudge without another death')
+})
+
+test('BOT_MAX: capped names wait in queue and a raised cap connects them (/env works while viewing a bot)', () => {
+  const r = runtime({ TEST_CREATE_BOTS: true, BOT_MAX: '1' })
+  r.run('for (const k of Object.keys(bots)) delete bots[k]') // start with an empty fleet
+  r.run("createBotInstance('A')")
+  r.run("createBotInstance('D')")
+  assert.equal(r.run('Object.keys(bots).join(",")'), 'A', 'the second name is held back at BOT_MAX=1')
+  assert.equal(r.run('waitingForSlot.size'), 1, 'the capped name waits for a slot instead of being dropped')
+  // /env must work with a bot selected — the web GUI sends { selectedId }
+  r.run("handleCommand('/env set BOT_MAX 2', { selectedId: 'A' })")
+  assert.equal(r.run('Object.keys(bots).includes("D")'), true, 'raising BOT_MAX connects the queued name')
+  assert.equal(r.run('waitingForSlot.size'), 0, 'the queue drains')
+})
