@@ -70,6 +70,7 @@ const http = require('http')
 const crypto = require('crypto')
 const { decodeCommandTree, decodeCompletions } = require('./server-commands')
 const { persistGeneratedBots, persistRegeneratedName, saveEnvFile } = require('./generated-bots')
+const directPool = require('./direct-pool')
 const { namesFromText } = require(path.join(__dirname, 'robot-login'))
 const zlib = require('zlib')
 const { exec, execFile, spawn } = require('child_process')
@@ -251,10 +252,70 @@ const proxy = process.env[`BOT_DIRECT_${id}`] === 'true' ? null : selectedRoute 
   const socket = entry?.bot?._client?.socket
   const peer = socket?.remoteAddress || null
   return { target: entry?.host || HOST, port: entry?.port || PORT, route: proxy ? 'proxied' : 'direct', proxy: proxy ? `${proxy.type || 'socks5'} ${proxy.host}:${proxy.port}` : 'direct', tcpPeer: peer, tcpPeerPort: socket?.remotePort || null, serverIp: !proxy && botOnline(entry) ? peer : (net.isIP(entry?.host || HOST) ? entry?.host || HOST : null), note: proxy ? 'TCP peer is the proxy; destination IP behind proxy is unknown unless the target is an IP literal. Public egress IP is not checked.' : 'TCP peer is the directly connected server; a hostname alone is not proof of its IP.' }
+}function persistData () {
+dataState.updatedAt = new Date().toISOString()
+dataStore.saveState(DATA_FILE, dataState)
 }
-function persistData () {
-  dataState.updatedAt = new Date().toISOString()
-  dataStore.saveState(DATA_FILE, dataState)
+
+// ── Direct-route pool ───────────────────────────────────────────────────────
+// Bots outside every PROXY_GROUP ride the direct connection, which shares one
+// IP: DIRECT_MAX caps how many of them run at once, a ban hands its slot to the
+// next unused direct name, and the dashboard is told when the whole route is
+// banned so "the fleet is fine" can never be a lie about the direct cohort.
+function directRows () {
+  const rows = []
+  for (const id of Object.keys(bots)) {
+    const entry = bots[id]
+    const proxy = Object.hasOwn(entry, 'torProxy') ? entry.torProxy : resolvedProxy(id)
+    if (!proxy) rows.push({ id, direct: true, online: botOnline(entry), connecting: entry?.connectionState === 'connecting', banned: rosterNameIsDead(id) })
+  }
+  return rows
+}
+function directFleetStatus () {
+  return directPool.directStatus({
+    config: process.env,
+    rows: directRows(),
+    limit: settings.get('DIRECT_MAX'),
+    banned: rosterNameIsDead,
+    removed: name => Boolean(removedEntryFor(name))
+  })
+}
+// One line per blocked name, not one per startup pass: a big roster with a small
+// DIRECT_MAX would otherwise print the same refusal for every spare name.
+const directCeilingReported = new Set()
+let directAllBannedAnnounced = false
+/** Log/announce the all-banned verdict once per episode, and clear it on recovery. */
+function sweepDirectRoute () {
+  let status
+  try { status = directFleetStatus() } catch (_) { return }
+  if (status.allBanned && !directAllBannedAnnounced) {
+    directAllBannedAnnounced = true
+    logFor(SYSTEM_ID, `{red-fg}⛔ Every direct-route bot is banned (${status.banned}/${status.poolSize}) — the direct IP is flagged. Proxy-group bots are unaffected; group bots keep running.{/red-fg}`)
+    try { monitoring?.onDirectAllBanned?.(status) } catch (_) {}
+  } else if (!status.allBanned && directAllBannedAnnounced) {
+    directAllBannedAnnounced = false
+    logFor(SYSTEM_ID, `{green-fg}✓ Direct route recovered — ${status.usable} direct bot(s) usable again (${status.connected} online).{/green-fg}`)
+  }
+  return status
+}
+/** A banned direct bot hands its slot to the next unused direct name. */
+function replaceDirectBot (bannedId) {
+  try {
+    const blocked = [...Object.keys(bots), ...(removedBots.bots || []).map(row => row.bot), ...(deathbannedBots.bots || []).map(row => row.bot)]
+    const next = directPool.nextDirectCandidate({ config: process.env, rows: directRows(), blocked: [...blocked, ...directPool.directPool(process.env).filter(rosterNameIsDead)] })
+    const status = directFleetStatus()
+    if (!next) {
+      logFor(SYSTEM_ID, `{red-fg}⛔ Direct route: ${sanitize(bannedId)} is banned and no unused direct name is left (${status.banned}/${status.poolSize} banned, ${status.connected} online). Add names with /new-gen direct.{/red-fg}`)
+      sweepDirectRoute()
+      return null
+    }
+    logFor(SYSTEM_ID, `{yellow-fg}↻ Direct route: ${sanitize(bannedId)} is banned — connecting ${sanitize(next)} into the freed slot (${status.live}/${status.limit} direct connections live).{/yellow-fg}`)
+    createBotInstance(next, null, null, null, { force: true })
+    return next
+  } catch (err) {
+    logFor(SYSTEM_ID, `{red-fg}✗ Direct replacement failed: ${sanitize(err.message)}{/red-fg}`)
+    return null
+  }
 }
 
 // ── Removed / permanently-banned list ───────────────────────────────────────
@@ -1250,6 +1311,7 @@ cfDefine('CONNECT_DELAY_MS', { type: 'ms', def: 22571, min: 0, group: 'Timing', 
 // simply stay unconnected until a slot frees up. /new-gen is deliberately
 // exempt: generating more bots is how the user asks for more than the cap.
 cfDefine('BOT_MAX', { type: 'int', def: 80, min: 1, group: 'Server', desc: 'How many bots this run holds at once — new names wait for a free slot; /new-gen and lifesteal top-ups may exceed it (live)' })
+cfDefine('DIRECT_MAX', { type: 'int', def: 20, min: 0, group: 'Server', desc: 'How many bots may be connected on the DIRECT route (no proxy group) at once — a banned direct bot hands its freed slot to the next unused direct name (live)' })
 // Routine defaults refresh on file changes and temporary overrides. Only
 // roster/listener wiring remains restart-only; per-run flags still take priority.
 cfDefine('CRATES_ALL_DUMP', { type: 'string', def: 'tpa', group: 'Crates', desc: 'Live default dump step for /crates-all (off|tpa|home|hidden|player:<name>)' })
@@ -1392,6 +1454,25 @@ function rosterNameIsDead (id) {
     return Boolean(row?.banned && dataStore.isBanActive(row).held)
   } catch (_) { return false }
 }
+
+// Reboot-aware /server requeue: after a "Server Reboot" announcement the
+// generic startup/respawn send lands in the proxy's "Please wait" window, so
+// this module owns that window instead — wait for the server to reach 'play',
+// settle REBOOT_REQUEUE_DELAY_MS (default 10s), send the server command, retry
+// while the server says "Please wait", and treat the configuration handshake
+// (registry_data/select_known_packs) as the only proof the transfer started.
+const rebootRequeue = require(path.join(__dirname, 'reboot-requeue')).createRebootRequeue({
+  sendChat: (id, msg) => {
+    const entry = bots[id]
+    if (!entry || !entry.bot) return false
+    try { entry.bot.chat(msg); return true } catch (_) { return false }
+  },
+  log: (id, msg) => logFor(id || SYSTEM_ID, `{yellow-fg}[reboot] ${sanitize(msg)}{/yellow-fg}`),
+  now: () => Date.now(),
+  setTimer: (fn, ms) => setTimeout(fn, Math.max(0, ms)),
+  clearTimer: (t) => clearTimeout(t),
+  getEnv: () => process.env,
+})
 
 const lifestealQueue = require(path.join(__dirname, 'lifesteal-queue')).createLifestealQueue({
   getBots: () => bots,
@@ -1857,6 +1938,9 @@ shardsPerMinute: Object.keys(bots).reduce((sum, id) => {
   return rate == null ? sum : (sum == null ? 0 : sum) + rate
 }, null),
 shardsRateBots: Object.keys(bots).filter(id => botOnline(bots[id]) && shardTracker.snapshot(id).shardsPerMinute != null).length,
+// The direct cohort's health travels with every stats frame so the dashboard
+// can warn when that route is fully banned (the proxy groups keep running).
+direct: (() => { try { return directFleetStatus() } catch (_) { return null } })(),
 memory: monitoring ? monitoring.getMemorySnapshot() : null
 }
 }
@@ -2817,7 +2901,20 @@ var items=[['bots',(s.online||0)+'/'+(s.bots||0)],['mem',(s.rssMB||0)+'M'],['lag
 ['logs',(s.logPerSec||0)+'/s'],['shards/min ≈',(s.shardsPerMinute==null?'—':Number(s.shardsPerMinute).toFixed(1))+' ('+(s.shardsRateBots||0)+' sampled)'],['viewers',(s.clients||0)],['up',fmtUp(Math.floor(s.uptimeSec||0))]]
 for(var i=0;i<items.length;i++){var c=document.createElement('div');c.className='chip'
 var b=document.createElement('b');b.textContent=items[i][1]
-c.appendChild(document.createTextNode(items[i][0]+' '));c.appendChild(b);el('chips').appendChild(c)}}
+c.appendChild(document.createTextNode(items[i][0]+' '));c.appendChild(b);el('chips').appendChild(c)}
+// The direct cohort runs on one shared IP: when every direct bot is banned the
+// chip turns red and a one-shot toast says so. Proxy-group bots are unaffected,
+// so the fleet can look healthy while this route is dead — that is the lie this
+// warns about.
+if(s && s.direct){var dc=document.createElement('div');dc.className='chip'
+var db=document.createElement('b');db.textContent=(s.direct.connected||0)+'/'+(s.direct.limit||0)
+dc.appendChild(document.createTextNode('direct '));dc.appendChild(db)
+dc.title='Direct route ('+(s.direct.poolSize||0)+' bots in the pool): '+(s.direct.connected||0)+' online of a '+(s.direct.limit||0)+' ceiling, '+(s.direct.banned||0)+' banned, '+(s.direct.freeSlots||0)+' free slot(s). A banned direct bot is replaced by the next unused direct name.'
+if(s.direct.allBanned){dc.style.color='var(--red)';dc.style.borderColor='var(--red)'
+if(!window.__directAllBannedWarned){window.__directAllBannedWarned=true
+toast('Every direct-route bot is banned ('+(s.direct.banned||0)+'/'+(s.direct.poolSize||0)+') — the direct IP is flagged. Proxy-group bots keep running.','bad')}}
+else window.__directAllBannedWarned=false
+el('chips').appendChild(dc)}}
 function toast(text,kind){var d=document.createElement('div');d.className='toast '+(kind||'');d.textContent=text
 el('toasts').appendChild(d)
 setTimeout(function(){d.classList.add('out');setTimeout(function(){d.remove()},500)},6000)}
@@ -3930,6 +4027,14 @@ const cap = Math.floor(Number(settings.get('BOT_MAX')) || 0)
 for (const [id, req] of [...waitingForSlot]) {
 if (Object.hasOwn(bots, id) || connectBlockReason(id)) { waitingForSlot.delete(id); continue }
 if (cap > 0 && Object.keys(bots).length >= cap) return // still full — keep waiting
+// A queued DIRECT name must not slip past the direct ceiling: drop it instead
+// of leaving it in the queue to be retried every 30 s forever.
+const queuedDirect = directPool.mayConnectDirect({ name: id, config: process.env, rows: directRows(), limit: settings.get('DIRECT_MAX') })
+if (!queuedDirect.ok) {
+waitingForSlot.delete(id)
+logFor(SYSTEM_ID, `{yellow-fg}⛔ Queued ${sanitize(id)} dropped — ${sanitize(queuedDirect.error)}.{/yellow-fg}`)
+continue
+}
 waitingForSlot.delete(id)
 logFor(SYSTEM_ID, `{cyan-fg}› BOT_MAX has room — connecting queued ${sanitize(id)}.{/cyan-fg}`)
 createBotInstance(id, req.host, req.port, req.version)
@@ -3937,7 +4042,7 @@ createBotInstance(id, req.host, req.port, req.version)
 }
 // Slots also free up whenever a bot closes; sweep so queued names do not need
 // a settings change to notice. Unref'd — never keeps the process alive.
-const waitingSweepTimer = setInterval(() => { try { flushWaitingForSlot() } catch (_) {} }, 30000)
+const waitingSweepTimer = setInterval(() => { try { flushWaitingForSlot() } catch (_) {} try { sweepDirectRoute() } catch (_) {} }, 30000)
 if (waitingSweepTimer && waitingSweepTimer.unref) waitingSweepTimer.unref()
 
 function createBotInstance(username, host, port, version, options = {}) {
@@ -3961,6 +4066,20 @@ logFor(SYSTEM_ID, `{yellow-fg}⛔ ${sanitize(id)} not connected — BOT_MAX=${ca
 }
 return null
 }
+}
+// DIRECT_MAX: everyone without a proxy group shares one IP, so only that many
+// of them are connected at once. A reconnect (the entry already exists) is not
+// a new direct bot and is never held back. Deliberately NOT exempted by
+// options.force: force exists to bypass BOT_MAX for replacements, not to
+// stampede the shared IP.
+const directRoute = resolvedProxy(id)
+const directGate = directPool.mayConnectDirect({ name: id, config: process.env, routeIsDirect: !directRoute, rows: directRows(), limit: settings.get('DIRECT_MAX') })
+if (!directGate.ok) {
+if (!directCeilingReported.has(id)) {
+directCeilingReported.add(id)
+logFor(SYSTEM_ID, `{yellow-fg}⛔ ${sanitize(id)} not connected — ${sanitize(directGate.error)}. Direct bots share one IP; a freed slot is filled by the next direct name, and /env set DIRECT_MAX higher lifts the cap.{/yellow-fg}`)
+}
+return null
 }
 rtpRoaming.stop(id)
 robotLogin.reconnect(id)
@@ -4088,6 +4207,10 @@ if (robotLogin.isAdmitting(id)) {
 if (!entry.authenticated || entry.admissionSetupStarted) return
 entry.admissionSetupStarted = true
 }
+// A reboot requeue owns the next server command for this bot: firing the
+// generic startup send here is what used to hit "Please wait" and leave the
+// bot on the hub. Stay quiet until the requeue has sent and verified.
+if (rebootRequeue.suppressesStartup(id)) return
 if (CLICK_COMPASS_ENABLED) {
 try { bot.activateItem() } catch (err) { if (!robotLogin.fail(id, err.message)) e(`activateItem failed: ${sanitize(err.message)}`) }
 } else {
@@ -4219,6 +4342,9 @@ const IMPORTANT_CONFIG = new Set(['cookie_request', 'custom_payload', 'feature_f
 
 bot._client.on('state', (newState) => {
 logFor(id, `{magenta-fg}[state] -> ${newState}{/magenta-fg}`)
+// Armed reboot requeue consumes this: 'play' starts the 10s settle, and a
+// 'configuration' after we sent the command is the success signal.
+try { rebootRequeue.onState(id, newState) } catch (_) {}
 
 // --- RECONFIGURE FIX ---
 // Some auth plugins (and 1.21+ Velocity backends in general) push the client
@@ -4495,6 +4621,7 @@ if (entry.rtpRunning || entry.spawnerDropRunning) return // an active routine ow
 const respawnCommand = SERVER_COMMAND || '/server lifesteal'
 pushT(() => {
 if (bots[id] !== entry || !botOnline(entry)) return
+if (rebootRequeue.suppressesStartup(id)) return // reboot requeue drives this one
 i(`Sending server command after respawn: ${respawnCommand}`)
 try { bot.chat(respawnCommand) } catch (err) { e(`Server command failed: ${sanitize(err.message)}`) }
 }, 3000 + Math.random() * 2000)
@@ -4620,6 +4747,8 @@ notifyBotsChanged()
 
 bot.on('message', (jsonMsg) => { try { c(jsonMsg.toString()) } catch (_) {} })
 bot.on('messagestr', (text) => { try { lifestealQueue.onMessage(id, String(text || '')) } catch (_) {} })
+// Reboot announcements and "please wait" replies drive the requeue above.
+bot.on('messagestr', (text) => { try { rebootRequeue.onChat(id, String(text || '')) } catch (_) {} })
 
 bot.on('death', () => {
   entry.diedAwaitingRespawn = true // the respawn must re-run the server command
@@ -4731,6 +4860,11 @@ if (PERMANENT_BAN_ACTION === 'remove' && dropFromRoster(id)) logFor(id, `{yellow
 if (banVerdict.banned) {
   if (banVerdict.kind !== 'temporary') robotLogin.fail(id, `Kicked during admission: ${text}`)
   try { lifestealQueue.onBan(id, banVerdict.reason || text) } catch (_) {}
+  // A direct bot cannot come back on a banned IP, so its slot is handed to the
+  // next unused direct name immediately (a suspected ban is left to the normal
+  // reconnect backoff — it may not be one).
+  if (banVerdict.kind !== 'suspected' && !entry.torProxy && directPool.isDirectRoute(id, process.env)) replaceDirectBot(id)
+  else sweepDirectRoute()
   autoTorRotation.check().catch(err => logFor(SYSTEM_ID, `{red-fg}[Tor] Check failed: ${sanitize(err.message)}{/red-fg}`))
 }
 monitoring?.onKick(id, text)
@@ -4873,7 +5007,9 @@ let currentConnectDelay = 0
 const initialConnectTimers = []
 let initialPending = 0
 let startupSettledAt = null
-const initialBotOrder = RANDOMIZE_BOT_ORDER ? shuffledCopy(BOT_NAMES) : BOT_NAMES.slice()
+const initialBotOrder = process.env.DIRECT_MAX !== undefined
+  ? BOT_NAMES.slice()
+  : (RANDOMIZE_BOT_ORDER ? shuffledCopy(BOT_NAMES) : BOT_NAMES.slice())
 initialBotOrder.forEach((name, index) => {
 // removed-bots.json is the only gate at startup too: a ban flag in the data
 // file does not stop a bot from coming up at restart.
@@ -5217,7 +5353,7 @@ const COMMANDS = {
 '/reconnect-all-slow': 'Reconnect ALL bots (online or offline) with a 30s delay between each to avoid rate limits',
 '/restart [--now]': 'Rerun the connect loop for every roster name that is NOT already online — the fix for a fleet sitting below BOT_MAX after the cap was raised (blocked/failed names never retry by themselves). Online bots are skipped, never disconnected, so no session or login is wasted. Pacing matches startup (CONNECT_DELAY_MS + jitter); --now connects immediately',
 '/new-bot bot1,bot2,bot3 [instant|spread]': 'Create and connect several named bots at once. spread (default) paces the connects at CONNECT_DELAY_MS like startup; instant connects them all now. Names are saved to BOT_NAMES in .env so they survive a restart; BOT_MAX still caps the fleet and the overflow waits in the queue',
-'/new-gen [count] [group=auto|direct|N]': 'Generate unique Minecraft names, atomically save to .env and balanced proxy groups, then connect with the default startup connect delay (1–100).',
+'/new-gen [count] [randomly|direct+random|direct|N]': 'Generate unique Minecraft names, atomically save to .env and route them, then connect with the default startup connect delay (1–100). randomly = proxy groups only, smallest group first; direct+random = weighted proxy groups AND direct (alias: auto); direct = direct only (BOT_DIRECT_<name>); N = that proxy group only.',
 '/lifesteal-start': 'Restarts Tor first (scripts/restart-tor.sh --tor-only, LIFESTEAL_TOR_RESTART_CMD override — brew services restart tor is NOT this repo\'s Tor and has no control port 9051), then requests NEWNYM on every local control port so reconnecting bots get fresh circuits, then: random bot /duelsroomqueue + random bot /queue (replaced on death, same bot allowed), one non-queue bot loops /warp arena → 5s → forward-until-hit, one bot spams /tpa until deathban (24h park), rest /warp afk (role sizes are configurable: LIFESTEAL_DUELS_BOTS / LIFESTEAL_QUEUE_BOTS / LIFESTEAL_ARENA_BOTS / LIFESTEAL_TPA_BOTS, default 1 each, 0 disables). Banned bots are replaced via /new-gen so the loop continues (a dead name is recycled in place — its slot becomes a fresh name, so replacements never grow the fleet). Starting never creates bots on its own: the roster only grows via /new-gen or an explicit /new-gen-maintain (LIFESTEAL_TARGET_BOTS=20 is its default target; healthy names are never removed)',
 '/lifesteal-stop': 'Stop lifesteal automation and release held forward keys',
 '/lifesteal-status': 'Show lifesteal roles (duels/queue/arena/tpa holders), role counts, online/total counts and deathbanned bots',
@@ -9160,8 +9296,11 @@ return
 
 // ── Persistent generated roster ──────────────────────────────────────────
 if (/^\/new-gen(?:\s|$)/i.test(trimmed)) {
-const match = trimmed.match(/^\/new-gen(?:\s+(\d+))?(?:\s+group=(auto|direct|\d+))?$/i)
-if (!match) { logWarn('Usage: /new-gen [1-100] [group=auto|direct|N]'); return }
+// Route modes: randomly (proxy groups only), direct, direct+random (groups AND
+// direct, the old "auto"), or a proxy group number. "group=" is optional, so
+// both `/new-gen 10 randomly` and `/new-gen 10 group=randomly` work.
+const match = trimmed.match(/^\/new-gen(?:\s+(\d+))?(?:\s+(?:group=)?(auto|randomly|random|direct\+random|direct|\d+))?$/i)
+if (!match) { logWarn('Usage: /new-gen [1-100] [randomly|direct+random|direct|<proxy group number>]'); return }
 try {
 const result = persistGeneratedBots({ file: path.join(__dirname, '.env'), env: process.env, existing: Object.keys(bots), blocked: (removedBots.bots || []).map(row => row.bot), count: Number(match[1] || 1), group: (match[2] || 'auto').toLowerCase(), io: fs })
 refreshRuntimeConfig()

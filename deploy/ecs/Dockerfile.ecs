@@ -1,0 +1,107 @@
+# syntax=docker/dockerfile:1
+# ── AFK Console image (ECS): Node app + one Tor instance per proxy port ──────
+# Build context = the Bot directory with these deploy/ecs files copied to the
+# root (Dockerfile.ecs, docker-entrypoint.sh, tor-fleet.sh). See deploy/ecs/README.md.
+#
+# Three proxy groups run from this one container, each on its own Tor SOCKS port
+# (9050 / 9150 / 9250, control = port + 1). The image previously baked a single
+# /etc/tor/torrc, so a second group pointed at :9150 simply had no proxy —
+# tor-fleet.sh starts, restarts and reports one instance per port instead.
+#
+# BUILD_WEB_CLIENT=0 skips the slow upstream client build; /play then shows the
+# "build not found" page until it is built. BOT_ONLY=1 also strips the Minecraft
+# extras (prismarine-viewer, mwc-proxy). Tor SOCKS5 is always kept.
+ARG BUILD_WEB_CLIENT=1
+ARG BOT_ONLY=0
+
+# ── Web client stage (deploy-only variant) ──────────────────────────────────
+# Reuse the byte-identical client build already serving /play in production
+# instead of a multi-hour upstream compile under amd64 emulation.
+FROM 638486126086.dkr.ecr.us-east-2.amazonaws.com/onayaprogrammer-myapi:v20261027-botmax AS webclient
+RUN mkdir -p /build/web-client && cp -a /app/web-client/dist /build/web-client/dist && test -f /build/web-client/dist/index.html
+
+# ── App stage ─────────────────────────────────────────────────────────────────
+FROM node:22-bookworm-slim
+
+# tor            → the SOCKS5 proxies every bot tunnels through (one process per
+#                  port; see tor-fleet.sh)
+# procps         → pkill for tor-fleet/restart-tor
+# tini           → PID 1 zombie reaper (restart-tor kills tor; without a reaper
+#                  the dead tor lingers as <defunct> forever since node never
+#                  wait()s on children it didn't spawn)
+# git + ca-certs → npm needs to fetch the mineflayer GitHub fork (plainprince/mineflayer)
+# curl           → the bounded HTTPS exit-IP probe through the SOCKS tunnel
+#                  (tor-fleet.js readTorExitIp)
+ARG APP_FILE=bot.js
+ARG BOT_ONLY=0
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends tor procps tini git ca-certificates curl \
+ && rm -rf /var/lib/apt/lists/*
+
+# ttyd web terminal: a browser shell into the container on TTYD_PORT (default
+# 8000), started by docker-entrypoint.sh. Static build — Debian bookworm has no
+# ttyd package. -W writable is opt-in at start time; TTYD_CREDENTIALS=user:pass
+# turns on basic auth (always on in the entrypoint — an open ttyd is an open shell).
+ARG TTYD_VERSION=1.7.7
+ARG TARGETARCH=amd64
+RUN TTYD_ARCH="$(case "${TARGETARCH}" in amd64) echo x86_64 ;; arm64) echo aarch64 ;; arm) echo armhf ;; *) echo x86_64 ;; esac)" \
+ && curl -fsSL -o /usr/local/bin/ttyd "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/ttyd.${TTYD_ARCH}" \
+ && chmod +x /usr/local/bin/ttyd \
+ && ttyd --version
+
+WORKDIR /app
+
+# Dependencies in their own layer so app edits don't trigger reinstalls.
+# patches* is a glob — copied only if present, BEFORE npm install so the
+# postinstall (npx patch-package) can apply them at build time.
+COPY package*.json patches* ./
+RUN npm install --omit=dev --no-audit --no-fund
+RUN if [ "$BOT_ONLY" = "1" ]; then npm uninstall prismarine-viewer mwc-proxy --no-audit --no-fund; fi
+
+# ALL top-level app modules in one glob — the hand-maintained per-file COPY list
+# drifted from the app's require()s and shipped an image that crashed on boot.
+COPY *.js ./
+COPY scripts/build-web-client.sh ./scripts/build-web-client.sh
+COPY scripts/patch-web-client-enchants.js ./scripts/patch-web-client-enchants.js
+COPY --from=webclient /build/web-client/dist ./web-client/dist
+COPY ${APP_FILE} ./index.js
+
+# ── Tor: one instance per SOCKS port ────────────────────────────────────────
+# tor-fleet.sh owns the instances (9050/9150/9250 by default, or whatever
+# TOR_PORTS says): each gets its own torrc + DataDirectory so circuits, guards
+# and exit IPs are genuinely independent, and control port = SOCKS + 1 with no
+# cookie auth (the same convention as scripts/restart-tor.sh and tor-fleet.js).
+COPY tor-fleet.sh /usr/local/bin/tor-fleet
+RUN chmod +x /usr/local/bin/tor-fleet \
+ && mkdir -p /etc/tor/instances /var/lib/tor \
+ && install -d -m 700 -o debian-tor -g debian-tor /var/lib/tor/9050 /var/lib/tor/9150 /var/lib/tor/9250
+
+# restart-tor: used by the app's proxy-stall watchdog (PROXY_RESTART_CMD) and by
+# hand: docker exec afk-console-1 restart-tor → fresh exits on every instance.
+# It restarts ALL of them and WAITS until each SOCKS port accepts again (bounded)
+# — a restart that silently leaves :9150 dead gives every group-2 bot
+# "ECONNREFUSED 127.0.0.1:9150" with no tor to be found.
+RUN printf '#!/bin/sh\n/usr/local/bin/tor-fleet restart\nPORTS="${TOR_PORTS:-9050 9150 9250}"\nfor port in $PORTS; do\n  i=0\n  while [ "$i" -lt 30 ]; do\n    if PORT="$port" node -e "const n=require(\\"net\\"),s=n.connect(process.env.PORT,\\"127.0.0.1\\",()=>{s.destroy();process.exit(0)});s.on(\\"error\\",()=>process.exit(1));setTimeout(()=>process.exit(1),1500)" 2>/dev/null; then\n      echo "[restart-tor] Tor is back on 127.0.0.1:${port}"\n      break\n    fi\n    i=$((i+1)); sleep 1\n  done\n  if [ "$i" -ge 30 ]; then\n    echo "[restart-tor] ERROR: Tor on :${port} did not return within 30s" >&2\n    exit 1\n  fi\ndone\nexit 0\n' > /usr/local/bin/restart-tor \
+ && chmod +x /usr/local/bin/restart-tor
+
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# Web GUI port (container-internal; the service maps it)
+EXPOSE 80
+# ttyd web terminal
+EXPOSE 8000
+# Self-hosted Minecraft web client (dashboard /play tab)
+EXPOSE 8090
+# Manual-mode 3D viewer ports (prismarine-viewer)
+EXPOSE 3000-3009
+
+# Liveness via the app's unauthenticated /health endpoint
+HEALTHCHECK --interval=60s --timeout=5s --start-period=180s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.WEB_PORT||80)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+
+# tini (PID 1) reaps the tor processes that restart-tor kills. They reparent to
+# it because every spawn site orphans tor, and tor's logs go to PID 1's fds so
+# they keep appearing in `docker logs`.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/docker-entrypoint.sh"]

@@ -116,14 +116,23 @@ starts automatically. Do not run the standalone `bot-rtp.js` for the same accoun
   Server commands also enter autocomplete; local names win collisions, and
   `/chat /command` bypasses the local router. Servers may hide commands, so this
   is everything advertised to that account, not an administrative command list.
-- **`/new-gen [count] [group=auto|direct|N]`** generates 1–100 unique Minecraft
-  usernames (default 1), atomically saves `BOT_NAMES` and proxy `_BOTS` lists in
-  `.env`, then connects with the default startup connect delay (`CONNECT_DELAY_MS`,
-  the same pacing as bots normally connect with). `auto` balances valid existing proxy groups;
-  without groups it uses the default route. `direct` explicitly bypasses a global
-  proxy; `N` selects an existing valid group. Unrelated secrets/comments remain
-  unchanged, `.env` is saved owner-only, and save failures create no connections.
-  Example: `/new-gen 5 group=2`. Names are locally unique; offline-mode server
+- **`/new-gen [count] [randomly|direct+random|direct|<N>]`** generates 1–100 unique
+  Minecraft usernames (default 1), atomically saves `BOT_NAMES` and proxy `_BOTS`
+  lists in `.env`, then connects with the default startup connect delay
+  (`CONNECT_DELAY_MS`, the same pacing as bots normally connect with). The route
+  word picks where the new names go:
+  - `randomly` — proxy groups only, smallest group first, so a run squares an
+    uneven split up (9/9/9 → 10/10/10) and never touches the direct IP;
+  - `direct+random` (alias `auto`) — weighted mix of every valid proxy group and
+    the direct route (direct at three shares against each group's one);
+  - `direct` — direct only, flagged with `BOT_DIRECT_<name>` so a global
+    `PROXY_HOST` cannot sweep it back onto a proxy;
+  - `N` — that existing valid proxy group only.
+
+  `group=` is optional and the old `group=` form still parses. Unrelated
+  secrets/comments remain unchanged, `.env` is saved owner-only, and save
+  failures create no connections. Example: `/new-gen 5 randomly`. Names are
+  locally unique; offline-mode server
   registration is not a guarantee that a name is available on Mojang.
 - The TUI has a compact online/total header, bounded scrollback, corrected Tab
   cycling, and **F2** for server commands. Ctrl-C uses the existing two-step
@@ -1005,8 +1014,36 @@ item matches, the bot falls back to `GUI_SLOT`.
 | `PROXY_GROUP_<N>_USER` | empty | Username for group `N`'s proxy |
 | `PROXY_GROUP_<N>_PASS` | empty | Password for group `N`'s proxy. `_PASSWORD` also works |
 | `PROXY_GROUP_<N>_LOGIN_PASSWORD` | empty | *Minecraft* password for group `N`'s bots — not a proxy credential |
+| `DIRECT_MAX` | `20` | Max concurrent bots on the direct route (see [Direct-route pool](#direct-route-pool-direct_max-ban-replacement-all-banned-warning)) |
 
 Bots not listed in any `PROXY_GROUP_<N>_BOTS` fall back to the global `PROXY_HOST` above (or connect directly if it's unset). `/proxy` reports both the configured groups and the fallback.
+
+### Direct-route pool (`DIRECT_MAX`, ban replacement, all-banned warning)
+
+Every bot outside all proxy groups rides the **direct route**, which means one
+shared IP for the whole cohort. `DIRECT_MAX` (default **20**) is the maximum
+number of direct bots that may hold a connection at once — new names past the
+ceiling are refused with one log line each (`Direct bots share one IP…`), never
+queued forever, and `BOT_MAX` still caps the fleet as a whole.
+
+When a direct bot is banned its slot is handed to the **next unused direct name**
+in `BOT_NAMES` order, so the cohort keeps its size instead of shrinking one ban
+at a time. Names that are already known, removed or deathbanned are skipped; if
+nothing is left the log says so and points at `/new-gen direct`.
+
+The dashboard carries the route's health with every stats frame: a `direct N/M`
+chip (live connections / ceiling, with banned and free-slot counts in its
+tooltip). When **every** direct name is banned the chip turns red and a one-shot
+toast says the direct IP is flagged — the proxy groups keep running, so without
+that warning a dead route could look like a healthy fleet.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `DIRECT_MAX` | `20` | Maximum concurrent direct-route connections; `0` disables direct bots entirely |
+
+The routing decisions live in `direct-pool.js` (pure functions: `directPool`,
+`directStatus`, `mayConnectDirect`, `nextDirectCandidate`) so the ceiling, the
+ban replacement and the all-banned verdict are unit-tested without a server.
 
 **A group is defined by its bot list, not by its host.** `PROXY_GROUP_<N>_BOTS` alone is enough, and a group without `PROXY_GROUP_<N>_HOST` is a legitimate *account* grouping: its `LOGIN_PASSWORD` applies and its bots use the default route. This used to be dropped in silence — the whole group, password included — so a group that only separated accounts appeared to work while every bot logged in with the wrong password.
 
@@ -1595,6 +1632,37 @@ If no player chat has been seen for a while, the bot runs a server command
 Note: short server replies that look like `<word>: value` (e.g. `Shards: 123`)
 can also reset the timer; the watchdog is meant for servers where the chat is
 otherwise completely silent.
+
+## Server reboot requeue
+
+The server announces restarts (`⚠ Server Reboot` / `The server will be
+rebooting soon` / `you will be returned automatically` / `Happening In: 1s`) and
+then drops the connection. Firing the server command the moment the socket is
+back lands in the proxy's rejection window (`Please wait … try again`), so the
+bot used to sit on the hub until the chat watchdog noticed.
+
+`reboot-requeue.js` owns that window instead. It is inert unless the
+announcement is seen, and the generic startup/respawn send is suppressed for
+that bot while it is armed:
+
+1. **arm** on the announcement in chat;
+2. **wait** while the server is down (a `configuration` state re-arms the wait);
+3. **settle** `REBOOT_REQUEUE_DELAY_MS` (default **10000**) after the first
+   `play` state — i.e. 10s after the reboot actually finished;
+4. **send** `REBOOT_REQUEUE_COMMAND` (default `SERVER_COMMAND`, else
+   `/server lifesteal`);
+5. **verify** — the only success signal is the `configuration` state arriving
+   *after* the command: that handshake (`select_known_packs` /
+   `registry_data` / `finish_configuration`) is the proxy actually moving the
+   session to the backend. Nothing else counts;
+6. **retry** on `Please wait` / `try again` (or if no handshake arrives at all)
+   every `REBOOT_REQUEUE_RETRY_MS` (default **5000**), up to
+   `REBOOT_REQUEUE_MAX_ATTEMPTS` (default **10**), then it logs that it gave up
+   and stands down.
+
+`REBOOT_REQUEUE_TTL_MS` (default 10 minutes) stops the wait if an announced
+reboot never happens, and `REBOOT_REQUEUE_ENABLED=0` turns the whole thing off.
+State per bot is observable in the console log as `[reboot] …` lines.
 
 ## `/ai-chat` — chat that answers the room
 

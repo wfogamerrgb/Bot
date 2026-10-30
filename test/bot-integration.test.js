@@ -122,6 +122,7 @@ function runtime(env = {}) {
       if (name === './pearl-stasis') return require('../pearl-stasis')
       if (name === './server-commands') return require('../server-commands')
       if (name === './generated-bots') return require('../generated-bots')
+      if (name === './direct-pool') return require('../direct-pool')
       if (name === './coinflip-dashboard-static') return require('../coinflip-dashboard-static')
       if (name === './xterm-static') return require('../xterm-static')
       if (name === './ai-chat') return require('../ai-chat')
@@ -475,6 +476,32 @@ test('BOT_MAX caps new connections; /new-gen is the deliberate way past it', () 
   assert.ok(timer, 'the generated name schedules its connect')
   timer.fn()
   assert.equal(r.createdBots.length, 1, 'the /new-gen bot connects past BOT_MAX')
+})
+
+test('direct cap and ban replacement use real lifecycle entries, including force and reconnect', () => {
+  const r = runtime({ TEST_CREATE_BOTS: true, TEST_CLASSIFY_KICK: true, TOR_AUTO_ROTATE_BANNED: 'false', BOT_NAMES: 'A,B,C,D,E', BOT_MAX: '50', DIRECT_MAX: '2', PROXY_GROUP_1_BOTS: 'A', PROXY_GROUP_1_HOST: 'localhost' })
+  r.run("delete bots.A; delete bots.B; delete bots.C; createBotInstance('B'); createBotInstance('C')")
+  assert.equal(r.createdBots.length, 2)
+  r.run("createBotInstance('D', null, null, null, { force: true })")
+  assert.equal(r.createdBots.length, 2, 'force cannot exceed the direct ceiling')
+  r.createdBots[0].emit('kicked', 'You are permanently banned for abuse')
+  assert.equal(r.createdBots.length, 3, 'one spare starts on a ban')
+  assert.equal(r.run('Boolean(bots.D)'), true)
+  r.run("createBotInstance('E', null, null, null, { force: true })")
+  assert.equal(r.createdBots.length, 3, 'replacement uses the freed slot, not an extra one')
+  assert.equal(r.run('directFleetStatus().live'), 2)
+})
+
+test('direct admission on a proxy-group name consumes a direct slot', () => {
+  const r = runtime({ TEST_CREATE_BOTS: true, DIRECT_MAX: '1', PROXY_GROUP_1_BOTS: 'D', PROXY_GROUP_1_HOST: 'localhost' })
+  r.run("delete bots.A; delete bots.B; delete bots.C; robotLogin.route = id => id === 'D' ? null : undefined; createBotInstance('D', null, null, null, { force: true }); createBotInstance('E', null, null, null, { force: true })")
+  assert.equal(r.createdBots.length, 1)
+  assert.equal(r.run('directFleetStatus().live'), 1)
+})
+
+test('DIRECT_MAX preserves planned startup order instead of shuffling the direct cohort', () => {
+  const r = runtime({ BOT_NAMES: 'G1,G2,D1,D2,Spare', DIRECT_MAX: '2', PROXY_GROUP_1_BOTS: 'G1,G2', PROXY_GROUP_1_HOST: 'localhost' })
+  assert.deepEqual(r.initialOrder, ['G1', 'G2', 'D1', 'D2', 'Spare'])
 })
 
 test('below BOT_MAX, new names connect normally', () => {
@@ -3499,4 +3526,74 @@ test('/new-bot takes a comma list, spreads by default and connects instantly on 
   assert.match(channelLogs(r, 'A'), /letters, digits or underscores/)
   assert.equal(r.fakeFiles.get('.env'), before, 'a rejected name writes nothing')
   assert.equal(r.run(`Object.hasOwn(bots, 'bad-name')`), false)
+})
+
+// A reboot announcement used to be handled by nothing: the generic 3-5s startup
+// send fired straight into the proxy's "Please wait" window, so the bot sat on
+// the hub until the 10-minute chat watchdog. This drives the whole sequence
+// through bot.js's real listeners.
+test('server reboot: waits out the restart, then re-queues, retries "Please wait", and verifies the handshake', () => {
+  const r = runtime({ TEST_CREATE_BOTS: true, CLICK_COMPASS: 'false' })
+  r.run("createBotInstance('D')")
+  const bot = r.createdBots[0]
+  const sent = []; bot.chat = cmd => sent.push(cmd)
+  bot.entity = { position: { x: 1, y: 64, z: 1 } }
+  r.run(`bots.D.connectionState = 'online'`)
+  r.timers.clear(); sent.length = 0
+
+  // The announcement, on the same messagestr listener the bot uses in game.
+  bot.emit('messagestr', '⚠ Server Reboot')
+  bot.emit('messagestr', 'The server will be rebooting soon')
+  bot.emit('messagestr', 'you will be returned automatically')
+
+  // The restart drops and restores the connection. The generic startup send
+  // must NOT fire into that window.
+  bot.emit('spawn')
+  for (const t of [...r.timers.keys()].filter(t => t.delay >= 2000 && t.delay <= 6000)) { r.timers.delete(t); t.fn() }
+  assert.deepEqual(sent, [], 'no server command while the reboot is still happening')
+
+  // Only timers this module created matter here — snapshot and diff, because
+  // pushT/robotLogin leave their own 5s timers around.
+  const newTimers = (before, delay) => [...r.timers.keys()].filter(t => !before.has(t) && t.delay === delay)
+  const fire = list => { for (const t of list) { r.timers.delete(t); t.fn() } }
+
+  // Restart handshake, then back in play: the 10s settle timer starts here.
+  let before = new Set(r.timers.keys())
+  bot._client.emit('state', 'configuration')
+  bot._client.emit('state', 'play')
+  const settle = newTimers(before, 10000)
+  assert.equal(settle.length, 1, 'one 10s settle timer after the server is back')
+  fire(settle)
+  assert.deepEqual(sent, ['/server lifesteal'], 'queued 10s after the reboot finished')
+
+  // Proxy refuses: retry on its own timer instead of waiting for the watchdog.
+  before = new Set(r.timers.keys())
+  bot.emit('messagestr', 'Please wait 30 seconds before trying again')
+  const retry = newTimers(before, 5000)
+  assert.equal(retry.length, 1, 'one retry timer after "Please wait"')
+  fire(retry)
+  assert.deepEqual(sent, ['/server lifesteal', '/server lifesteal'], 'retried once')
+
+  // SUCCESS: the configuration handshake that proves the transfer started.
+  bot._client.emit('state', 'configuration')
+  const sentBefore = sent.length
+  for (const t of [...r.timers.keys()]) { r.timers.delete(t); t.fn() }
+  assert.equal(sent.length, sentBefore, 'nothing is sent once the handshake arrived')
+  assert.equal(r.run("rebootRequeue.status('D').phase"), 'done')
+})
+
+// Without an announcement the requeue stays out of the way entirely.
+test('no reboot announcement: startup and respawn keep their own server command', () => {
+  const r = runtime({ TEST_CREATE_BOTS: true, CLICK_COMPASS: 'false' })
+  r.run("createBotInstance('D')")
+  const bot = r.createdBots[0]
+  const sent = []; bot.chat = cmd => sent.push(cmd)
+  bot.entity = { position: { x: 1, y: 64, z: 1 } }
+  r.run(`bots.D.connectionState = 'online'`)
+  r.timers.clear(); sent.length = 0
+
+  assert.equal(r.run("rebootRequeue.suppressesStartup('D')"), false)
+  bot.emit('spawn')
+  for (const t of [...r.timers.keys()].filter(t => t.delay >= 2000 && t.delay <= 6000)) { r.timers.delete(t); t.fn() }
+  assert.deepEqual(sent, ['/server lifesteal'], 'the normal startup send is untouched')
 })

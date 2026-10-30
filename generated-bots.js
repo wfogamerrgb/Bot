@@ -140,12 +140,29 @@ function usedNames(config, { file, io, existing, blocked }) {
 const DIRECT_SHARE = 3
 const GROUP_SHARE = 1
 
+// /new-gen route modes (the words the command accepts, normalised here so the
+// CLI and any caller agree):
+//   randomly       every new name goes to a proxy group, the smallest one first,
+//                  so an even 10/10/10 split needs no arithmetic from the user
+//   direct         every new name connects direct (flags BOT_DIRECT_<name>)
+//   direct+random  weighted mix of proxy groups AND direct (the old "auto")
+//   <number>       that proxy group only
+const ROUTE_MODES = { randomly: 'randomly', random: 'randomly', direct: 'direct', 'direct+random': 'auto', auto: 'auto' }
+function normaliseRouteMode (group) {
+  const raw = String(group == null ? 'auto' : group).trim().toLowerCase()
+  if (Object.hasOwn(ROUTE_MODES, raw)) return ROUTE_MODES[raw]
+  if (/^\d+$/.test(raw)) return Number(raw)
+  throw new Error(`Unknown /new-gen route "${raw}" — use randomly, direct, direct+random, or a proxy group number`)
+}
+
 function persistGeneratedBots({ file = path.join(__dirname, '.env'), env = process.env, existing = [], blocked = [], count = 1, group = 'auto', io = fs, randomInt = crypto.randomInt }) {
   let text = ''
   try { text = io.readFileSync(file, 'utf8') } catch (err) { if (err.code !== 'ENOENT') throw err }
   const disk = dotenv.parse(text), config = { ...env, ...disk }
   const routes = admissionRoutes(config).filter(Boolean)
-  if (group !== 'auto' && group !== 'direct' && !routes.some(route => route.index === Number(group))) throw new Error('Proxy group must have a valid HOST/PORT/TYPE')
+  group = normaliseRouteMode(group)
+  if (typeof group === 'number' && !routes.some(route => route.index === group)) throw new Error('Proxy group must have a valid HOST/PORT/TYPE')
+  if (group === 'randomly' && !routes.length) throw new Error('No proxy group is configured — /new-gen randomly needs PROXY_GROUP_<N>_HOST/PORT')
   const used = usedNames(config, { file, io, existing, blocked })
   const names = generateNames(count, used, randomInt)
   const updates = { BOT_NAMES: [...new Set([...parseNameList(config.BOT_NAMES), ...names])].join(',') }
@@ -163,6 +180,13 @@ function persistGeneratedBots({ file = path.join(__dirname, '.env'), env = proce
       selected = shares.length
         ? shares.sort((a, b) => a.share - b.share || (a.index === null ? -1 : b.index === null ? 1 : a.index - b.index))[0].index
         : null
+    } else if (group === 'randomly') {
+      // Groups only — the smallest group takes the name, so a run of names
+      // squares up an uneven 9/9/9 into 10/10/10 without ever touching direct.
+      const order = [...groups]
+        .map(([index, members]) => ({ index, size: members.length }))
+        .sort((a, b) => a.size - b.size || a.index - b.index)
+      selected = order[0].index
     } else {
       selected = group === 'direct' ? null : Number(group)
     }
@@ -227,4 +251,4 @@ function persistRegeneratedName({ file = path.join(__dirname, '.env'), env = pro
   return { name: replacement, taken: victim, group, direct }
 }
 
-module.exports = { generateNames, updateEnvText, saveEnvFile, persistGeneratedBots, persistRegeneratedName }
+module.exports = { generateNames, updateEnvText, saveEnvFile, persistGeneratedBots, persistRegeneratedName, normaliseRouteMode }

@@ -79,6 +79,35 @@ test('generated roster survives reload with weighted sparse proxy groups and res
     assert.equal(dotenv.parse(fs.readFileSync(file, 'utf8'))['BOT_DIRECT_' + direct.names[0]], 'true')
   } finally { fs.rmSync(dir, { recursive: true, force: true }) }
 })
+test('/new-gen route modes: randomly fills the smallest proxy group and never direct', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'generated-bots-'))
+  try {
+    const file = path.join(dir, '.env'), env = {}
+    fs.writeFileSync(file, [
+      'BOT_NAMES=Old',
+      'PROXY_GROUP_1_HOST=localhost', 'PROXY_GROUP_1_PORT=9050', 'PROXY_GROUP_1_BOTS=G1a,G1b,G1c',
+      'PROXY_GROUP_2_HOST=localhost', 'PROXY_GROUP_2_PORT=9150', 'PROXY_GROUP_2_BOTS=G2a',
+      'PROXY_GROUP_3_HOST=localhost', 'PROXY_GROUP_3_PORT=9250', 'PROXY_GROUP_3_BOTS=G3a,G3b'
+    ].join('\n') + '\n')
+    const result = persistGeneratedBots({ file, env, count: 6, group: 'randomly' })
+    const saved = dotenv.parse(fs.readFileSync(file, 'utf8'))
+    // 3 / 1 / 2 members: the smallest group takes each new name, so six names
+    // square the three groups up to 4/4/4 — and direct is never used.
+    assert.equal(result.assignments.filter(a => a.group != null).length, 6)
+    assert.equal(result.assignments.filter(a => a.group == null).length, 0, 'randomly never goes direct')
+    assert.equal(saved.PROXY_GROUP_1_BOTS.split(',').length, 4)
+    assert.equal(saved.PROXY_GROUP_2_BOTS.split(',').length, 4)
+    assert.equal(saved.PROXY_GROUP_3_BOTS.split(',').length, 4)
+    assert.equal(Object.keys(saved).filter(key => /^BOT_DIRECT_/.test(key)).length, 0, 'no direct flags are written')
+    // Aliases and explicit group numbers.
+    assert.equal(require('../generated-bots').normaliseRouteMode('random'), 'randomly')
+    assert.equal(require('../generated-bots').normaliseRouteMode('direct+random'), 'auto')
+    assert.equal(require('../generated-bots').normaliseRouteMode('3'), 3)
+    assert.throws(() => persistGeneratedBots({ file, env, group: 'sideways' }), /Unknown \/new-gen route/)
+    assert.throws(() => persistGeneratedBots({ file: path.join(dir, 'empty.env'), env: {}, group: 'randomly' }), /No proxy group/)
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
 test('save failures leave environment untouched and do not leave temporary credentials files', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'generated-bots-'))
   try {
