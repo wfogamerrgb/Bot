@@ -283,22 +283,24 @@ test('an ordinary kick still uses the plain kick alert', async () => {
   })
 })
 
-// The "not logged into your Minecraft account" kick is a dead session: every
-// reconnect gets the same kick. It carries no ban wording, but acting on it
-// like a permanent ban (disconnect, no auto reconnect) is what stops the
-// reconnect loop. classifyKick only runs on real kick packets, so this wording
-// typed into chat cannot trigger it.
-test('classifyKick treats a dead Minecraft session as a permanent ban', () => {
+// "You are not logged into your Minecraft account" used to be classified as a
+// permanent ban (a "dead session"). On a live fleet it is intermittent: the
+// same account joins later, while a burst of joins makes the server reject the
+// stragglers with exactly this text. The permanent verdict silently erased 14
+// healthy accounts, so it must stay a non-ban `auth` type: bot.js then retires
+// the name and replaces it (retrying the same name cannot work).
+test('classifyKick treats a rejected Minecraft session as a transient auth failure', () => {
   const AUTH_KICK = '{"color":"red","text":"You are not logged into your Minecraft account. If you are logged into your Minecraft account, try restarting your Minecraft client."}'
   const verdict = classifyKick(AUTH_KICK)
-  assert.equal(verdict.banned, true)
-  assert.equal(verdict.permanent, true)
-  assert.equal(verdict.kind, 'permanent')
+  assert.equal(verdict.banned, false, 'a failed session check is not a ban')
+  assert.equal(verdict.permanent, false)
+  assert.equal(verdict.kind, 'auth')
   assert.equal(verdict.durationMs, 0)
   assert.equal(verdict.expiresAt, 0)
   // plain-text variant of the same notice
-  assert.equal(classifyKick('You are not logged into your Minecraft account.').permanent, true)
+  assert.equal(classifyKick('You are not logged into your Minecraft account.').kind, 'auth')
   // ordinary non-ban kicks must not be caught by it
   assert.equal(classifyKick('You are not logged into the queue').banned, false)
+  assert.equal(classifyKick('You are not logged into the queue').kind, '')
   assert.equal(classifyKick('Outdated client!').banned, false)
 })

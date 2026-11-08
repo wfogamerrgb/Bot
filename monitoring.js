@@ -91,13 +91,20 @@ const PERM_WORD_RE = /permanent(?:ly)?[\s-]+bann?ed|permanent ban|permaban|banne
 // length makes the bot log "temporary" and then hold it forever anyway.
 const PERM_EXPIRES_IN_RE = /expires?\s+in\s*:?\s*(permanent(?:ly)?|forever|never|indefinite|eternal)/i
 const SUSPECT_RE = /alt (?:account )?detected|anti-?bot|bot detected|automatic(?:ally)? banned|suspicious (?:activity|connection)/i
-// A kick that reports a dead Minecraft session: "You are not logged into your
+// A kick that reports a failed Minecraft session: "You are not logged into your
 // Minecraft account. If you are logged into your Minecraft account, try
-// restarting your Minecraft client." The account's session is gone, so every
-// reconnect gets the exact same kick — there is nothing to retry and no expiry
-// to wait for. It is classified as a permanent ban below (disconnect, no auto
-// reconnect), and classifyKick only ever runs on real kick packets
-// (bot.on('kicked')), so typed chat cannot fake this path.
+// restarting your Minecraft client."
+//
+// This is NOT a ban and must never be treated as one. It is the server refusing
+// one login handshake, and on real fleets it is intermittent: the same account,
+// the same proxy and the same credentials join a minute later, while a burst of
+// joins makes the server reject the later ones with exactly this text. Treating
+// it as a permanent ban erased 14 healthy accounts from afk-fleet-5g in one
+// startup pass — but retrying the same name is just as useless, because the
+// server will not admit it. So it is an `auth` verdict, not a ban: no ban
+// record, and bot.js routes it through the name-taken recovery, which retires
+// the name and generates a Mojang-checked replacement in the same route. (The
+// admission blocklist is skipped too — see robot-login.fail.)
 const AUTH_FAIL_RE = /not\s+logged\s+into\s+your\s+(?:minecraft|premium|mojang|msa)?\s*account/i
 var BAN_DURATION_RE = /\bfor\s+(\d+\s*(?:second|minute|hour|day|week|month|year)s?)/i
 var BAN_EXPIRES_IN_RE = /expires?\s+in\s*:?\s*([0-9][^\n]*)/i
@@ -145,13 +152,15 @@ function classifyKick (message) {
   const empty = { banned: false, permanent: false, kind: '', duration: '', durationMs: 0, expiresAt: 0, reason: text || '', caseId: '', text: text || '' }
   if (!text || !text.trim()) return empty
 
-  // Dead session handling first: it carries no ban wording at all, so it would
-  // otherwise fall through as "not a ban" and be retried into a reconnect loop.
+  // A failed session check is a transient login rejection, not a ban (and it
+  // carries no ban wording, so without this branch it would be an ordinary
+  // kick anyway — the explicit kind is what tells bot.js not to blocklist the
+  // account for retrying).
   if (AUTH_FAIL_RE.test(text)) {
     return {
-      banned: true,
-      permanent: true,
-      kind: 'permanent',
+      banned: false,
+      permanent: false,
+      kind: 'auth',
       duration: '',
       durationMs: 0,
       expiresAt: 0,

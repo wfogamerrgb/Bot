@@ -6,7 +6,7 @@ const { Vec3 } = require('vec3')
 const fs = require('node:fs')
 const path = require('node:path')
 const os = require('node:os')
-const { parseBroadcastTargets, parseDumpArgs } = require('../bot-controls')
+const { parseBroadcastTargets, parseRunOnTargets, destructiveCommandEffect, parseDumpArgs } = require('../bot-controls')
 const { createEvidenceStore } = require('../evidence')
 const createManual = require('../bot-manual')
 const { parseOptions, createSpawnerDrop } = require('../spawner-drop')
@@ -18,6 +18,35 @@ test('selectors resolve exact names, inclusive displayed numbers, and hyphenated
   assert.deepEqual(parseBroadcastTargets('name:Beta-2..Gamma-3 /status', roster).ids, roster.slice(1))
   assert.ok(parseBroadcastTargets('3-1 /status', roster).error)
   assert.equal(parseBroadcastTargets('30 /status', roster).selected, false, 'old bare slow delay is preserved')
+})
+
+test('/run-on resolves names, lists, fragments and ranges, and never falls back to the whole roster', () => {
+  const roster = ['Alpha-1', 'Beta-2', 'Gamma-3', 'core_farm']
+  assert.deepEqual(parseRunOnTargets('Beta-2', roster).ids, ['Beta-2'])
+  assert.deepEqual(parseRunOnTargets('beta-2, Gamma-3', roster).ids, ['Beta-2', 'Gamma-3'])
+  assert.deepEqual(parseRunOnTargets('*core', roster).ids, ['core_farm'])
+  assert.deepEqual(parseRunOnTargets('*', roster).ids, roster)
+  assert.deepEqual(parseRunOnTargets('all', roster).ids, roster)
+  assert.deepEqual(parseRunOnTargets('1-2', roster).ids, roster.slice(0, 2))
+  assert.deepEqual(parseRunOnTargets('name:Beta-2..Gamma-3', roster).ids, ['Beta-2', 'Gamma-3'])
+  // A hyphenated exact-name pair is a range; a lone hyphenated name is not.
+  assert.deepEqual(parseRunOnTargets('Alpha-1-Gamma-3', roster).ids, roster.slice(0, 3))
+  assert.deepEqual(parseRunOnTargets('Alpha-1', roster).ids, ['Alpha-1'])
+  // Typos are reported, and they never widen the target set.
+  assert.deepEqual(parseRunOnTargets('Alhpa-1', roster), { ids: [], unknown: ['Alhpa-1'], error: null })
+  assert.deepEqual(parseRunOnTargets('Beta-2,Nope', roster).ids, ['Beta-2'])
+  assert.deepEqual(parseRunOnTargets('Beta-2,Nope', roster).unknown, ['Nope'])
+  assert.deepEqual(parseRunOnTargets('*nobody', roster).ids, [])
+  assert.ok(parseRunOnTargets('', roster).error)
+  assert.deepEqual(parseRunOnTargets('3-1', roster).unknown, ['3-1'])
+})
+
+test('a fleet-wide /run-on /dc needs the same confirmation as /all /dc', () => {
+  assert.equal(destructiveCommandEffect('/run-on * /dc'), 'disconnects every bot at once')
+  assert.equal(destructiveCommandEffect('/run-on all /disconnect'), 'disconnects every bot at once')
+  assert.equal(destructiveCommandEffect('/run-on Alpha,Bravo /dc'), null)
+  assert.equal(destructiveCommandEffect('/run-on *core /dc'), null)
+  assert.equal(destructiveCommandEffect('/run-on * /shardshop'), null)
 })
 
 test('manual direct actions stop automatically, never chat, and relative walk uses current position', async () => {

@@ -880,11 +880,19 @@ const NAME_TAKEN_PATTERNS = [
   /\bpremium\s+(?:account|name|username)\b/i
 ]
 
+// "You are not logged into your Minecraft account…" reads like an auth problem,
+// but for a generated name it is just as fatal: the server will not admit this
+// account, and every retry gets the same kick. There is nothing a password can
+// fix, so it retires the name and regenerates one — the same recovery as a
+// taken username, which is why it is detected here.
+const ACCOUNT_UNUSABLE_RE = /not\s+logged\s+into\s+your\s+(?:minecraft|premium|mojang|msa)?\s*account/i
+
 // Returns { reason } when the message reports a username that is already owned
 // by somebody else, or null for ordinary chat. The matched phrase is the
 // evidence that lands in the log and the removed list.
 function classifyNameTaken(message) {
   const text = String(message || '').replace(/\u00a7./g, '')
+  if (ACCOUNT_UNUSABLE_RE.test(text)) return { reason: 'server rejected the account session' }
   for (const re of NAME_TAKEN_PATTERNS) {
     const match = text.match(re)
     if (match) return { reason: match[0].replace(/\s+/g, ' ').trim() }
@@ -963,6 +971,64 @@ function parseBroadcastTargets (text, roster) {
   return { ids: roster.slice(ends[0], ends[1] + 1), body: rest, selected: true }
 }
 
+// ── /run-on targets ─────────────────────────────────────────────────────────
+// "/run-on <bots> <command>" names its targets the way an operator thinks of
+// them: one exact name, a comma/space-separated list, "*fragment" (every name
+// containing it, the /run-script convention), "*" or "all" for the roster, or
+// the inclusive ranges /all already accepts (1-5, name:A..B, Alpha-Bravo).
+//
+// Unlike /all, there is NO fallback to the whole roster: /all's parser treats an
+// unrecognised first token as a message for every bot, which for a targeted
+// command would turn one typo into a fleet-wide run. Unknown names come back in
+// `unknown` so the caller can report them and fail closed.
+function parseRunOnTargets (selector, roster) {
+  const names = Array.isArray(roster) ? roster : []
+  const tokens = String(selector ?? '').split(/[\s,]+/).filter(Boolean)
+  if (!tokens.length) {
+    return { ids: [], unknown: [], error: 'Usage: /run-on <bots> <command> — e.g. /run-on Alpha /shardshop, /run-on *core,*farm /status, /run-on 1-3 /spawners' }
+  }
+  const wanted = new Set()
+  const unknown = []
+  const exact = name => names.filter(n => n.toLowerCase() === name.toLowerCase())
+  for (const token of tokens) {
+    if (/^(?:all|everyone)$/i.test(token) || token === '*') {
+      names.forEach(n => wanted.add(n))
+      continue
+    }
+    if (token.startsWith('*')) {
+      const matches = selectScriptBots(token.slice(1), names)
+      if (!matches.length) unknown.push(token)
+      matches.forEach(n => wanted.add(n))
+      continue
+    }
+    const hits = exact(token)
+    if (hits.length) { hits.forEach(n => wanted.add(n)); continue }
+    // Ranges: displayed 1-N, name:A..B, or a hyphenated exact-name pair.
+    if (/^\d+-\d+$/.test(token) || token.startsWith('name:') || hyphenPair(token, names)) {
+      const ranged = parseBroadcastTargets(token, names)
+      if (ranged.error || !ranged.selected) { unknown.push(token); continue }
+      ranged.ids.forEach(n => wanted.add(n))
+      continue
+    }
+    unknown.push(token)
+  }
+  // Roster order, so the log reads like /list no matter how the selector was typed.
+  return { ids: names.filter(n => wanted.has(n)), unknown, error: null }
+}
+
+// "Alpha-Bravo" is a range only when both sides are real bot names; otherwise it
+// is just an unknown name (a bot may legitimately contain a hyphen).
+function hyphenPair (token, names) {
+  const lower = names.map(n => n.toLowerCase())
+  for (let i = 1; i < token.length - 1; i++) {
+    if (token[i] !== '-') continue
+    const a = lower.indexOf(token.slice(0, i).toLowerCase())
+    const b = lower.indexOf(token.slice(i + 1).toLowerCase())
+    if (a >= 0 && b >= 0) return true
+  }
+  return false
+}
+
 // ── Destructive-command confirmation ────────────────────────────────────────
 // /exit kills the whole process and `/all /dc` disconnects every bot at once.
 // Neither may happen on one keystroke or one typo: these commands warn first
@@ -972,6 +1038,16 @@ function destructiveCommandEffect(command) {
   const trimmed = String(command ?? '').trim()
   if (!trimmed) return null
   if (trimmed.toLowerCase() === '/exit') return 'kills the bot process and disconnects every bot'
+  // /run-on can reach the same fleet-wide disconnect: the selector is all or *.
+  const runOn = trimmed.match(/^\/run-on\s+([\s\S]+)$/i)
+  if (runOn) {
+    const splitAt = runOn[1].search(/(?:^|\s)[/!]/)
+    const selector = (splitAt < 0 ? runOn[1] : runOn[1].slice(0, splitAt)).trim()
+    const dispatched = splitAt < 0 ? '' : (runOn[1].slice(splitAt).trim().split(/\s+/)[0] || '').toLowerCase()
+    const everyone = selector.split(/[\s,]+/).filter(Boolean).every(t => /^(?:all|everyone)$/i.test(t) || t === '*')
+    if (everyone && (dispatched === '/dc' || dispatched === '/disconnect')) return 'disconnects every bot at once'
+    return null
+  }
   const m = trimmed.match(/^\/(all|all-slow)(?:\s+([\s\S]*))?$/)
   if (m) {
     // /all-slow's optional leading delay token ("30", "500ms") belongs to the
@@ -1344,7 +1420,7 @@ function createChatGameManager ({ setTimer = setTimeout, clearTimer = clearTimeo
 
 
 // ── Item allowlists (globs) ────────────────────────────────────────────────
-// The /ege dispose list names items as comma-separated globs: "golden_apple"
+// The /ege /disposal list names items as comma-separated globs: "golden_apple"
 // is an exact match (so enchanted_golden_apple is never touched) and
 // "*shulker_box" matches every coloured shulker. Matching is case-insensitive
 // and folds _/-/spaces into one separator, so a registry name (golden_apple)
@@ -1493,9 +1569,9 @@ function deriveTorControlTargets (groups, defaultProxy, offset = 1) {
 function resolveTorScope (arg, groups, knownIds) {
   const ids = Array.isArray(knownIds) ? knownIds : []
   const list = groups || []
-  const botsOf = g => ids.filter(id => g.bots.includes(id))
-  const grouped = new Set(list.flatMap(g => g.bots))
-  const ungrouped = ids.filter(id => !grouped.has(id))
+  const botsOf = g => ids.filter(id => g.bots.some(name => name.toLowerCase() === id.toLowerCase()))
+  const grouped = new Set(list.flatMap(g => g.bots.map(name => name.toLowerCase())))
+  const ungrouped = ids.filter(id => !grouped.has(id.toLowerCase()))
   const raw = String(arg == null ? '' : arg).trim()
   if (!raw || /^all$/i.test(raw)) return { ok: true, scope: 'all', label: 'every proxy', botIds: ids.slice() }
   if (/^default$/i.test(raw)) return { ok: true, scope: 'default', label: 'ungrouped bots', botIds: ungrouped }
@@ -1508,9 +1584,10 @@ function resolveTorScope (arg, groups, knownIds) {
     }
     return { ok: true, scope: g.index, label: `proxy group ${g.index}`, botIds: botsOf(g) }
   }
-  const g = list.find(x => x.bots.includes(raw))
+  const g = list.find(x => x.bots.some(name => name.toLowerCase() === raw.toLowerCase()))
   if (g) return { ok: true, scope: g.index, label: `proxy group ${g.index} (${raw})`, botIds: botsOf(g) }
-  if (ids.includes(raw)) return { ok: true, scope: 'default', label: `ungrouped bots (${raw})`, botIds: [raw] }
+  const id = ids.find(name => name.toLowerCase() === raw.toLowerCase())
+  if (id) return { ok: true, scope: 'default', label: `ungrouped bots (${id})`, botIds: [id] }
   return { ok: false, error: `unknown proxy group or bot "${raw}"` }
 }
 
@@ -1684,6 +1761,7 @@ module.exports = {
   parseScript,
   parseScriptLine,
   selectScriptBots,
+  parseRunOnTargets,
   listBotScripts,
   loadBotScript,
   parseTorControlPorts,

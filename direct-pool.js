@@ -6,7 +6,7 @@
 // one IP, so the whole cohort is banned together when that IP is flagged. Two
 // things have to work there and neither existed:
 //
-//   1. A CEILING. Only DIRECT_MAX (default 20) direct bots run at once, even if
+//   1. A CEILING. Only DIRECT_MAX (default 150) direct bots run at once, even if
 //      the roster lists a hundred of them — otherwise BOT_MAX alone decides and
 //      every spare name hammers the same IP.
 //   2. A REPLACEMENT. When a direct bot is banned, the next unused direct name
@@ -96,7 +96,7 @@ function rowMap (rows) {
  * its entry but not its connection, and its replacement has to be allowed to
  * take the freed slot.
  */
-function directStatus ({ config = {}, rows = [], limit = 20, banned = () => false, removed = () => false } = {}) {
+function directStatus ({ config = {}, rows = [], limit = 150, banned = () => false, removed = () => false } = {}) {
   const pool = directPool(config)
   const map = rowMap(rows)
   const ceiling = Math.max(0, Number(limit) || 0)
@@ -138,7 +138,7 @@ function directStatus ({ config = {}, rows = [], limit = 20, banned = () => fals
  * reconnect (a dropped socket is not a new bot); new direct names only while
  * the direct ceiling has room.
  */
-function mayConnectDirect ({ name, config = {}, rows = [], limit = 20, routeIsDirect } = {}) {
+function mayConnectDirect ({ name, config = {}, rows = [], limit = 150, routeIsDirect } = {}) {
   if (routeIsDirect === false || (routeIsDirect !== true && !isDirectRoute(name, config))) return { ok: true, direct: false }
   const map = rowMap(rows)
   const existing = map.get(String(name).toLowerCase())

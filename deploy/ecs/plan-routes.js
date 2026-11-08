@@ -2,7 +2,7 @@
 'use strict'
 // plan-routes — turn one roster into a STABLE fleet layout.
 //
-//   node plan-routes.js <roster-file> [--per-group 10] [--direct 20] [--bot-max 50]
+//   node plan-routes.js <roster-file> [--per-group 15] [--direct 15] [--bot-max 60]
 //
 // The roster file is one username per line (order irrelevant). The plan is
 // derived from a hash of the name, not from its position, so the same roster
@@ -13,7 +13,7 @@
 //
 //   BOT_NAMES                   groups first, then the direct cohort, then the
 //                               unassigned remainder (the replacement pool)
-//   PROXY_GROUP_<N>_BOTS        ten names each (--per-group)
+//   PROXY_GROUP_<N>_BOTS        fifteen names each (--per-group)
 //   PROXY_GROUP_<N>_HOST/PORT   127.0.0.1 on 9050 / 9150 / 9250 — one Tor per group
 //   DIRECT_MAX / BOT_MAX        ceiling so the direct cohort stays at --direct
 //
@@ -31,13 +31,13 @@ const flag = (name, def) => {
   return value
 }
 if (!file) {
-  console.error('usage: node plan-routes.js <roster-file> [--per-group 10] [--direct 20] [--bot-max 50]')
+  console.error('usage: node plan-routes.js <roster-file> [--per-group 15] [--direct 15] [--bot-max 60]')
   process.exit(2)
 }
 
-const perGroup = flag('per-group', 10)
-const directCount = flag('direct', 20)
-const botMax = flag('bot-max', 50)
+const perGroup = flag('per-group', 15)
+const directCount = flag('direct', 15)
+const botMax = flag('bot-max', 60)
 const groupCount = 3
 const ports = [9050, 9150, 9250]
 

@@ -27,12 +27,14 @@ const deep = analysis.deepAnalysis(flips)
 const report = analytics.buildReport({ coinflip: summary, deep, timeseries: store.snapshot({ warmupMs: 3000000 }) })
 const commandRows = [{ command: '/home', usages: ['/home', '/home <name>'] }, { command: '/rtp', usages: ['/rtp', '/rtp world <world>'] }, { command: '/warp', usages: ['/warp', '/warp <destination>'] }]
 const commands = { '/server-commands [filter] [--refresh]': 'Browse commands advertised to this account', '/new-gen [count] [group=auto|direct|N]': 'Save generated accounts before connecting' }
+const torGroups = [{ id: '1', label: 'group 1 (2 bots)' }, { id: '2', label: 'group 2 (1 bot)' }]
 const bots = [
   { id: 'Alpha', number: 1, state: 'online', online: true, health: 20, food: 20, ping: 45, pingHist: [20, 30] },
   { id: 'Bravo', number: 2, state: 'disconnected', online: false, disconnectReason: 'Connection lost', disconnectedAt: Date.now() },
   { id: 'Charlie', number: 3, state: 'banned', online: false, banned: true, kick: 'Banned by server', banKind: 'temporary' },
   { id: 'Removed', removed: true, state: 'banned', online: false, banned: true, kick: 'Permanent ban' }
 ]
+let rejectWebSockets = false
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://localhost')
   const send = (body, type = 'application/json') => { res.writeHead(200, { 'Content-Type': type }); res.end(type === 'application/json' ? JSON.stringify(body) : body) }
@@ -50,7 +52,21 @@ const server = http.createServer((req, res) => {
   if (url.pathname === '/api/coinflip/bot') return send({ rows: flips.filter(row => row.bot === url.searchParams.get('bot')), summary })
   if (url.pathname === '/api/coinflip/bots') return send({ bots: Object.fromEntries(summary.stats.bots.map(row => [row.bot, row])) })
   if (url.pathname === '/api/server-commands') return send({ bot: url.searchParams.get('bot') || 'Alpha', received: true, source: 'tree', updatedAt: 1, commands: commandRows })
-  if (url.pathname === '/api/state') return send({ bots, stats: { bots: 3, online: 1 }, commands, lines: [], terminalEnabled: true })
+  if (url.pathname === '/test/drop-ws') {
+    rejectWebSockets = true
+    for (const client of wss.clients) client.close()
+    return send({ ok: true })
+  }
+  if (url.pathname === '/api/state') return send({ bots, stats: { bots: 3, online: 1 }, commands, lines: [], terminalEnabled: true, torGroups })
+  if (url.pathname === '/api/tor/newnym' && req.method === 'POST') {
+    let body = ''
+    req.on('data', chunk => { body += chunk })
+    req.on('end', () => {
+      const { group } = JSON.parse(body)
+      send({ ok: true, label: `proxy group ${group}`, reconnected: 1, results: [{ port: 9151, ok: true, verified: true }] })
+    })
+    return
+  }
   res.writeHead(404); res.end('not found')
 })
 const wss = new WebSocketServer({ server })
@@ -58,7 +74,8 @@ const wss = new WebSocketServer({ server })
 // (colors, cursor moves, reverse video) so the xterm.js panel can be checked
 // in a browser without SSH: open → banner, input → echoed back.
 wss.on('connection', ws => {
-  ws.send(JSON.stringify({ t: 'hello', bots, stats: { bots: 3, online: 1 }, commands, cmdHistory: [], terminalEnabled: true }))
+  if (rejectWebSockets) { ws.close(); return }
+  ws.send(JSON.stringify({ t: 'hello', bots, stats: { bots: 3, online: 1 }, commands, cmdHistory: [], terminalEnabled: true, torGroups }))
   ws.on('message', raw => {
     let msg
     try { msg = JSON.parse(raw) } catch (_) { return }

@@ -42,6 +42,7 @@ const {
   itemMatchesGlobs,
   parseRewardSlots,
   selectScriptBots,
+  parseRunOnTargets,
   listBotScripts,
   loadBotScript,
   commandSuggestions,
@@ -60,7 +61,7 @@ const {
 } = require('./bot-controls')
 const os = require('os')
 const { createMonitoring, classifyKick } = require('./monitoring')
-const { createAllBannedTorRotation, readTorExitIp } = require('./tor-fleet')
+const { createAllBannedTorRotation, readTorExitIp, verifyTorRotation, torEndpoint } = require('./tor-fleet')
 const { createPearlStasis } = require('./pearl-stasis')
 const removedBotsStore = require('./removed-bots')
 const net = require('net')
@@ -69,7 +70,7 @@ const path = require('path')
 const http = require('http')
 const crypto = require('crypto')
 const { decodeCommandTree, decodeCompletions } = require('./server-commands')
-const { persistGeneratedBots, persistRegeneratedName, saveEnvFile } = require('./generated-bots')
+const { persistGeneratedBots, persistGeneratedBotsAvailable, persistRegeneratedName, persistRegeneratedNameAvailable, saveEnvFile } = require('./generated-bots')
 const directPool = require('./direct-pool')
 const { namesFromText } = require(path.join(__dirname, 'robot-login'))
 const zlib = require('zlib')
@@ -396,23 +397,22 @@ function handleTakenName (id, entry, detail) {
     return true
   }
   takenNameRegens++
-  let replacement
-  try {
-    replacement = persistRegeneratedName({ file: path.join(__dirname, '.env'), env: process.env, taken: id, existing: Object.keys(bots), blocked: (removedBots.bots || []).map(row => row.bot), io: fs })
-  } catch (err) {
-    logFor(id, `{red-fg}⛔ ${sanitize(id)} is taken (${sanitize(verdict.reason)}), and generating a replacement failed (${sanitize(err.code || err.message)}) — run /new-gen for fresh names.{/red-fg}`)
+  // The replacement is checked against Mojang before it is saved: handing the
+  // slot a name somebody already owns just reproduces the same rejection.
+  persistRegeneratedNameAvailable({ file: path.join(__dirname, '.env'), env: process.env, taken: id, existing: Object.keys(bots), blocked: (removedBots.bots || []).map(row => row.bot), io: fs }).then(replacement => {
+    refreshRuntimeConfig()
+    const route = replacement.direct ? 'direct route' : replacement.group != null ? `proxy group ${replacement.group}` : 'auto route'
+    logFor(id, `{yellow-fg}⚠ ${sanitize(id)} cannot join (${sanitize(verdict.reason)}) — retired, generated replacement ${sanitize(replacement.name)} (${route}).{/yellow-fg}`)
     retireRoster()
-    return true
-  }
-  refreshRuntimeConfig()
-  const route = replacement.direct ? 'direct route' : replacement.group != null ? `proxy group ${replacement.group}` : 'auto route'
-  logFor(id, `{yellow-fg}⚠ ${sanitize(id)} is taken (${sanitize(verdict.reason)}) — retired, generated replacement ${sanitize(replacement.name)} (${route}).{/yellow-fg}`)
-  retireRoster()
-  const delay = readDelayMs(process.env.ROBOT_CONNECT_DELAY_MS, 5000)
-  setTimeout(() => {
-    // A generated replacement is /new-gen naming, so it may pass BOT_MAX.
-    if (!Object.hasOwn(bots, replacement.name) && !connectBlockReason(replacement.name)) createBotInstance(replacement.name, host, port, version, { force: true })
-  }, delay)
+    const delay = readDelayMs(process.env.ROBOT_CONNECT_DELAY_MS, 5000)
+    setTimeout(() => {
+      // A generated replacement is /new-gen naming, so it may pass BOT_MAX.
+      if (!Object.hasOwn(bots, replacement.name) && !connectBlockReason(replacement.name)) createBotInstance(replacement.name, host, port, version, { force: true })
+    }, delay)
+  }).catch(err => {
+    logFor(id, `{red-fg}⛔ ${sanitize(id)} cannot join (${sanitize(verdict.reason)}), and generating a replacement failed (${sanitize(err.code || err.message)}) — run /new-gen for fresh names.{/red-fg}`)
+    retireRoster()
+  })
   return true
 }
 
@@ -724,9 +724,9 @@ function torGroupsInfo () {
   ]
 }
 
-// SIGNAL NEWNYM on the Tor instances serving `scope` ('all', 'default', or a
-// proxy group number): the NEXT connection leaves through a fresh circuit.
-// Reported per port: one dead instance must not hide the others' results.
+// Probe each configured local Tor SOCKS endpoint before and after NEWNYM.
+// A control acknowledgement alone does not prove that the exit changed. Explicit
+// control ports without a matching SOCKS endpoint can only be acknowledged.
 async function requestTorCircuits (scope = 'all', label = 'every proxy') {
   const targets = torTargets()
   const picked = scope === 'all' ? targets : targets.filter(t => t.keys.includes('*') || t.keys.includes(scope))
@@ -738,13 +738,17 @@ async function requestTorCircuits (scope = 'all', label = 'every proxy') {
     logFor(SYSTEM_ID, `{yellow-fg}⚠ No Tor control ports known — ${sanitize(hint)}.{/yellow-fg}`)
     return { ok: false, results: [], error: `no Tor control ports for ${label}` }
   }
-  const results = []
-  for (const port of ports) {
-    const r = await sendTorSignal(port)
-    results.push(r)
-    if (r.ok) logFor(SYSTEM_ID, `{green-fg}✓ Tor control :${port} — new circuits requested; reconnects leave through a new path.{/green-fg}`)
+  const endpoints = [...PROXY_GROUPS, PROXY_DEFAULT].map(torEndpoint).filter(Boolean)
+  const results = await Promise.all(ports.map(async port => {
+    const endpoint = endpoints.find(ep => ep.controlPort === port)
+    const r = endpoint
+      ? { ...(await verifyTorRotation(endpoint)), port, verified: true }
+      : { ...(await sendTorSignal(port)), verified: false }
+    if (r.ok && r.verified) logFor(SYSTEM_ID, `{green-fg}✓ Tor :${endpoint.port} — probe exit changed ${sanitize(r.before)} → ${sanitize(r.after)}. Other destinations may use a different exit.{/green-fg}`)
+    else if (r.ok) logFor(SYSTEM_ID, `{yellow-fg}⚠ Tor control :${port} acknowledged NEWNYM; exit change not verified (no matching local SOCKS endpoint).{/yellow-fg}`)
     else logFor(SYSTEM_ID, `{red-fg}✗ Tor control :${port} — ${sanitize(r.error)}{/red-fg}`)
-  }
+    return r
+  }))
   return { ok: results.every(r => r.ok), results }
 }
 
@@ -752,22 +756,32 @@ async function requestTorCircuits (scope = 'all', label = 'every proxy') {
 // actually take effect: SIGNAL NEWNYM alone changes nothing a user can see,
 // because every live connection keeps its old circuit and exit IP until it
 // reconnects. Accounts on the removed list are skipped (like /reconnect).
+const torReconnectPending = new Set()
 function reconnectBotsScoped (ids) {
   const delayMs = readDelayMs(settings.get('TOR_ROTATE_DELAY_MS'), 5000)
   let count = 0
   for (const id of ids) {
     const entry = bots[id]
-    if (!entry) continue
+    if (!entry || torReconnectPending.has(id)) continue
     const blocked = connectBlockReason(id)
     if (blocked) {
       logFor(id, `{yellow-fg}⚠ ${sanitize(id)} is ${sanitize(blocked)} — skipped during Tor rotation.{/yellow-fg}`)
       continue
     }
     const { host, port, version } = entry
+    torReconnectPending.add(id)
     setTimeout(() => {
+      if (bots[id] !== entry || connectBlockReason(id)) { torReconnectPending.delete(id); return }
       logInfo(`{yellow-fg}⚠ Tor rotation: reconnecting ${sanitize(id)}…{/yellow-fg}`)
-      try { entry.disconnectManually() } catch (_) {}
-      setTimeout(() => createBotInstance(id, host, port, version), 1000)
+      try { entry.disconnectManually() } catch (err) {
+        torReconnectPending.delete(id)
+        logFor(SYSTEM_ID, `{red-fg}✗ Tor rotation: could not disconnect ${sanitize(id)} — ${sanitize(err.message)}{/red-fg}`)
+        return
+      }
+      setTimeout(() => {
+        try { if (bots[id] === entry && !connectBlockReason(id)) createBotInstance(id, host, port, version) }
+        finally { torReconnectPending.delete(id) }
+      }, 1000)
     }, count * delayMs)
     count++
   }
@@ -777,7 +791,12 @@ function reconnectBotsScoped (ids) {
 // The one code path behind /tor-newnym and the dashboard's ⟳ tor button:
 // resolve the scope, signal its Tor instances, then reconnect its bots so the
 // fresh circuits are the ones actually in use.
+let torRotationRunning = false
 async function torRotate (scopeArg, { reconnect = true } = {}) {
+  if (torRotationRunning) return { ok: false, error: 'A Tor rotation is already in progress; wait for it to finish.' }
+  torRotationRunning = true
+  try {
+  refreshRuntimeConfig()
   const scope = resolveTorScope(scopeArg, PROXY_GROUPS, Object.keys(bots))
   if (!scope.ok) return { ok: false, error: scope.error }
   const result = await requestTorCircuits(scope.scope, scope.label)
@@ -788,10 +807,13 @@ async function torRotate (scopeArg, { reconnect = true } = {}) {
   const successfulKeys = new Set(torTargets().filter(t => successfulPorts.has(t.port)).flatMap(t => t.keys))
   const readyIds = scope.botIds.filter(id => {
     const group = PROXY_GROUPS.find(g => g.bots.some(name => name.toLowerCase() === id.toLowerCase()))
-    return successfulKeys.has('*') || successfulKeys.has(group ? group.index : 'default')
+    const route = Object.hasOwn(bots[id], 'torProxy') ? bots[id].torProxy : resolvedProxy(id)
+    const endpoint = torEndpoint(route)
+    return !!endpoint && successfulPorts.has(endpoint.controlPort) && (successfulKeys.has('*') || successfulKeys.has(group ? group.index : 'default'))
   })
   const reconnected = reconnect && readyIds.length ? reconnectBotsScoped(readyIds) : 0
   return { ...result, scope: scope.scope, label: scope.label, reconnected }
+  } finally { torRotationRunning = false }
 }
 
 // ── Proxy stall watchdog ────────────────────────────────────────────────────
@@ -1280,8 +1302,8 @@ cfDefine('CHAT_GAME_AUTO', { type: 'bool', def: false, group: 'Chat game', desc:
 cfDefine('CHAT_GAME_GUESS_MS', { type: 'ms', def: 1150, min: 25, group: 'Chat game', desc: 'Gap between guesses — 350 ms is about three numbers per second (live)' })
 cfDefine('CHAT_GAME_MAX_BOTS', { type: 'int', def: 10, min: 1, group: 'Chat game', desc: 'How many connected bots (roster order) are used as guessers (live)' })
 cfDefine('EAPPLE_KIT_SLOT', { type: 'int', def: 14, min: 0, group: 'Kits', desc: 'Slot clicked in the /kits GUI before the reward slot — /ege (live)' })
-cfDefine('EAPPLE_REWARD_SLOTS', { type: 'string', def: '21,15,13,11', group: 'Kits', desc: 'One /ege pass per slot: /kits → kit slot → this slot → /dispose (live)' })
-cfDefine('EAPPLE_DISPOSE_ITEMS', { type: 'string', def: 'experience_bottle,golden_apple,shield,totem_of_undying,*shulker_box', group: 'Kits', desc: 'Comma-separated globs moved into /dispose — exact names keep enchanted_golden_apple safe (live)' })
+cfDefine('EAPPLE_REWARD_SLOTS', { type: 'string', def: '21,15,13,11', group: 'Kits', desc: 'One /ege pass per slot: /kits → kit slot → this slot → /disposal (live)' })
+cfDefine('EAPPLE_DISPOSE_ITEMS', { type: 'string', def: 'experience_bottle,golden_apple,shield,totem_of_undying,*shulker_box', group: 'Kits', desc: 'Comma-separated globs moved into /disposal — exact names keep enchanted_golden_apple safe (live)' })
 cfDefine('EAPPLE_STEP_DELAY_MS', { type: 'ms', def: 1200, min: 100, group: 'Kits', desc: 'Pause between /ege GUI clicks and window opens (live)' })
 cfDefine('LOGIN_PASSWORD', { type: 'string', def: '123456', group: 'Auth', desc: 'Live global account password; per-bot and group credentials remain higher priority for .env roster bots' })
 cfDefine('HOST', { type: 'string', def: 'play.fatalmc.org', group: 'Server', desc: 'Host used for future new connections; live sockets unchanged' })
@@ -1311,7 +1333,7 @@ cfDefine('CONNECT_DELAY_MS', { type: 'ms', def: 22571, min: 0, group: 'Timing', 
 // simply stay unconnected until a slot frees up. /new-gen is deliberately
 // exempt: generating more bots is how the user asks for more than the cap.
 cfDefine('BOT_MAX', { type: 'int', def: 80, min: 1, group: 'Server', desc: 'How many bots this run holds at once — new names wait for a free slot; /new-gen and lifesteal top-ups may exceed it (live)' })
-cfDefine('DIRECT_MAX', { type: 'int', def: 20, min: 0, group: 'Server', desc: 'How many bots may be connected on the DIRECT route (no proxy group) at once — a banned direct bot hands its freed slot to the next unused direct name (live)' })
+cfDefine('DIRECT_MAX', { type: 'int', def: 150, min: 0, group: 'Server', desc: 'How many bots may be connected on the DIRECT route (no proxy group) at once — a banned direct bot hands its freed slot to the next unused direct name (live)' })
 // Routine defaults refresh on file changes and temporary overrides. Only
 // roster/listener wiring remains restart-only; per-run flags still take priority.
 cfDefine('CRATES_ALL_DUMP', { type: 'string', def: 'tpa', group: 'Crates', desc: 'Live default dump step for /crates-all (off|tpa|home|hidden|player:<name>)' })
@@ -1808,7 +1830,7 @@ function dispatchCommandToBot (msg, id) {
   }
   if (manual.routeCommand(command, id)) return true
   const verb = command.split(/\s+/)[0]
-  if (['/all', '/all-slow', '/start-login', '/new-gen', '/new-gen-maintain', '/crates-all', '/bot-coinflip-all', '/reconnect-all', '/unban-all', '/exit', '/cron'].includes(verb)) {
+  if (['/all', '/all-slow', '/run-on', '/start-login', '/new-gen', '/new-gen-maintain', '/crates-all', '/bot-coinflip-all', '/reconnect-all', '/unban-all', '/exit', '/cron'].includes(verb)) {
     logFor(id, '{yellow-fg}⚠ Fleet-wide command cannot be nested in a per-bot broadcast; run it directly.{/yellow-fg}')
     return false
   }
@@ -2317,9 +2339,16 @@ screen.render()
 return t
 }
 
+// ── Favicon ─────────────────────────────────────────────────────────────────
+// One tiny inline SVG — a pickaxe on the console's dark palette — served for
+// both /favicon.svg and /favicon.ico, so the tab has an icon without shipping a
+// binary asset in the image. The <link> below is added to every HTML page.
+const FAVICON_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="7" fill="#0f151d"/><rect x=".5" y=".5" width="31" height="31" rx="6.5" fill="none" stroke="#1d2836"/><path d="M6.6 13.4c3.6-5.9 15.2-5.9 18.8 0l-1.4 2.9c-3.4-4.6-12.6-4.6-16 0z" fill="#2dd4bf"/><rect x="14.7" y="12.4" width="2.7" height="15.6" rx="1.2" fill="#8fa3b5" transform="rotate(16 16 20)"/></svg>'
+const FAVICON_LINK = '<link rel="icon" type="image/svg+xml" href="/favicon.svg">'
+
 // ── Web GUI: login page ──────────────────────────────────────────────────────
 const LOGIN_HTML = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Sign in — ${DASHBOARD_TITLE}</title>
+<title>Sign in — ${DASHBOARD_TITLE}</title>${FAVICON_LINK}
 <style>
 body{background:#0a0e13;color:#c7d2dc;font:14px ui-monospace,'Cascadia Code','SF Mono',Menlo,Consolas,monospace;display:grid;place-items:center;height:100vh;margin:0}
 .card{background:#0f151d;border:1px solid #1d2836;border-radius:12px;padding:34px 38px;width:320px;text-align:center;box-shadow:0 12px 40px rgba(0,0,0,.45)}
@@ -2337,7 +2366,7 @@ button{width:100%;background:#2dd4bf;color:#04211d;border:0;border-radius:8px;pa
 
 // ── Web GUI: dashboard page ──────────────────────────────────────────────────
 const PAGE_HTML = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${DASHBOARD_TITLE}</title>
+<title>${DASHBOARD_TITLE}</title>${FAVICON_LINK}
 <style>
 :root{--bg:#0a0e13;--panel:#0f151d;--panel2:#131b25;--line:#1d2836;--txt:#c7d2dc;--dim:#5b6b7a;--acc:#2dd4bf;--red:#f87171;--grn:#4ade80;--yel:#fbbf24;--cyan:#67e8f9;--mag:#e879f9;--blu:#7db3f5}
 *{box-sizing:border-box;margin:0;padding:0}
@@ -2484,7 +2513,7 @@ button.tb:hover{color:var(--txt);border-color:var(--acc)}
 <main>
 <div id="loghead"><span id="channame">ALL CHANNELS</span><span id="newchip"></span>
 <input id="search" placeholder="filter logs…"><button class="tb" id="topbtn" type="button" title="scroll to top">↑ top</button><button class="tb" id="bottombtn" type="button" title="scroll to newest">↓ bottom</button><button class="tb" id="followbtn" type="button">⏸ pause</button>
-<button class="tb" id="clearbtn">clear</button><button class="tb" id="torbtn" type="button" title="Request fresh Tor circuits and staggered-reconnect the chosen proxy group so the new path takes effect now">⟳ tor</button><select id="torgroup" class="tb" title="proxy group to rotate"></select><button class="tb" id="docsbtn" type="button" title="Built-in documentation — commands, /dump grammar, troubleshooting">📚 docs</button><button class="tb" id="servercmdsbtn" type="button">server cmds</button><button class="tb" id="helpbtn">? local cmds</button></div>
+<button class="tb" id="clearbtn">clear</button><button class="tb" id="torbtn" type="button" title="Request new Tor circuits, check the probe exit IP, and stagger-reconnect the selected proxy group (does not restart Tor)">⟳ tor</button><select id="torgroup" class="tb" title="proxy group to rotate"></select><button class="tb" id="docsbtn" type="button" title="Built-in documentation — commands, /dump grammar, troubleshooting">📚 docs</button><button class="tb" id="servercmdsbtn" type="button">server cmds</button><button class="tb" id="helpbtn">? local cmds</button></div>
 <div id="logwrap"><div id="log"></div></div>
 <div id="guitui" hidden></div>
 <div id="manualbar" aria-label="Manual bot controls">
@@ -3015,13 +3044,14 @@ var b=document.createElement('b');b.textContent=k
 var sp=document.createElement('span');sp.textContent=cmds[k]||''
 r.appendChild(b);r.appendChild(sp);h.appendChild(r)})}
 function renderTorGroups(gs){torGroups=gs||[];var sel=el('torgroup');if(!sel)return
-sel.innerHTML='';var opts=[{id:'all',label:'⟳ all groups'}].concat(torGroups)
-for(var i=0;i<opts.length;i++){var o=document.createElement('option');o.value=opts[i].id;o.textContent=opts[i].label;sel.appendChild(o)}}
-el('torbtn').onclick=function(){var b=el('torbtn');b.disabled=true;var grp=(el('torgroup')&&el('torgroup').value)||'all';toast('requesting fresh Tor circuits…')
+var selected=sel.value;sel.innerHTML='';var opts=[{id:'all',label:'⟳ all groups'}].concat(torGroups)
+for(var i=0;i<opts.length;i++){var o=document.createElement('option');o.value=opts[i].id;o.textContent=opts[i].label;sel.appendChild(o)}
+if(opts.some(function(o){return String(o.id)===selected}))sel.value=selected}
+el('torbtn').onclick=function(){var b=el('torbtn');b.disabled=true;var grp=(el('torgroup')&&el('torgroup').value)||'all';toast('checking and rotating Tor circuits; this may take a minute…')
 fetch('/api/tor/newnym',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({group:grp})}).then(function(r){return r.json()}).then(function(m){
-var rs=m.results||[],ok=rs.filter(function(x){return x.ok}).length
+var rs=m.results||[],verified=rs.filter(function(x){return x.ok&&x.verified}).length,unverified=rs.filter(function(x){return x.ok&&!x.verified}).length
 if(m.error)toast(m.error,'bad')
-else toast((m.ok?'fresh circuits on all '+rs.length+' Tor instance(s)':'new circuits on '+ok+' of '+rs.length+' Tor instance(s) — see the system log')+' · reconnecting '+(m.reconnected||0)+' bot(s) for '+(m.label||'every proxy'),m.ok?'good':'bad')
+else toast('Probe exit changed on '+verified+'/'+rs.length+' Tor instance(s)'+(unverified?' ('+unverified+' acknowledged, exit unverified)':'')+' · '+(m.reconnected||0)+' bot reconnect(s) scheduled for '+(m.label||'every proxy')+(m.ok?'':' — see system log'),m.ok&&unverified===0?'good':'bad')
 b.disabled=false}).catch(function(){toast('could not request Tor circuits — see the system log','bad');b.disabled=false})}
 var docsData=null
 function renderDocs(){var body=el('docsbody'),nav=el('docsnav');body.innerHTML='';nav.innerHTML='';if(!docsData){referenceEmpty(body,'Documentation unavailable','Close and reopen the panel to try again.');return}
@@ -3118,7 +3148,7 @@ try { pageGz = zlib.gzipSync(pageBuf, { level: 6 }) } catch (_) {}
 function playPageHtml(base) {
 const clientUrl = webClientUrl({ base: base || MC_WEB_CLIENT_URL, ip: MC_WEB_SERVER, version: MC_WEB_VERSION, username: MC_WEB_USERNAME, proxy: MC_WEB_PROXY })
 const esc = s => String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">\n<title>Minecraft — AFK Console</title>\n<style>\nhtml,body{height:100%;margin:0;background:#0a0e13;color:#c7d2dc;font:13px/1.4 ui-monospace,'Cascadia Code','SF Mono',Menlo,Consolas,monospace;display:flex;flex-direction:column}\n.bar{display:flex;align-items:center;gap:12px;padding:8px 14px;background:linear-gradient(180deg,#101a24,#0d141c);border-bottom:1px solid #1d2836;flex-wrap:wrap}\n.bar b{color:#2dd4bf;letter-spacing:.5px}\n.bar a{color:#c7d2dc;text-decoration:none;border:1px solid #1d2836;border-radius:6px;padding:3px 10px;font-size:12px}\n.bar a:hover{border-color:#2dd4bf;color:#e8f0f6}\n.bar .hint{margin-left:auto;color:#5b6b7a;font-size:11px}\niframe{flex:1;border:0;width:100%;min-height:0}\n</style></head><body>\n<div class="bar"><b>⛏ Minecraft Web Client</b><a href="/">← dashboard</a><span class="hint">offline-mode (cracked) servers supported — set MC_WEB_* in .env to prefill</span></div>\n<iframe src="${esc(clientUrl)}" title="Minecraft Web Client" allow="fullscreen; pointer-lock; clipboard-write; gamepad; autoplay"></iframe>\n<script>\n(function () {\n  var ping = function () { try { fetch('/play-ping', { cache: 'no-store' }) } catch (e) {} }\n  ping()\n  setInterval(ping, 5000)\n  window.addEventListener('pagehide', function () {\n    try { navigator.sendBeacon('/play-stop') } catch (e) {\n      try { fetch('/play-stop', { method: 'POST', keepalive: true }) } catch (e2) {}\n    }\n  })\n})()\n</script>\n</body></html>`
+return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">\n<title>Minecraft — AFK Console</title>${FAVICON_LINK}\n<style>\nhtml,body{height:100%;margin:0;background:#0a0e13;color:#c7d2dc;font:13px/1.4 ui-monospace,'Cascadia Code','SF Mono',Menlo,Consolas,monospace;display:flex;flex-direction:column}\n.bar{display:flex;align-items:center;gap:12px;padding:8px 14px;background:linear-gradient(180deg,#101a24,#0d141c);border-bottom:1px solid #1d2836;flex-wrap:wrap}\n.bar b{color:#2dd4bf;letter-spacing:.5px}\n.bar a{color:#c7d2dc;text-decoration:none;border:1px solid #1d2836;border-radius:6px;padding:3px 10px;font-size:12px}\n.bar a:hover{border-color:#2dd4bf;color:#e8f0f6}\n.bar .hint{margin-left:auto;color:#5b6b7a;font-size:11px}\niframe{flex:1;border:0;width:100%;min-height:0}\n</style></head><body>\n<div class="bar"><b>⛏ Minecraft Web Client</b><a href="/">← dashboard</a><span class="hint">offline-mode (cracked) servers supported — set MC_WEB_* in .env to prefill</span></div>\n<iframe src="${esc(clientUrl)}" title="Minecraft Web Client" allow="fullscreen; pointer-lock; clipboard-write; gamepad; autoplay"></iframe>\n<script>\n(function () {\n  var ping = function () { try { fetch('/play-ping', { cache: 'no-store' }) } catch (e) {} }\n  ping()\n  setInterval(ping, 5000)\n  window.addEventListener('pagehide', function () {\n    try { navigator.sendBeacon('/play-stop') } catch (e) {\n      try { fetch('/play-stop', { method: 'POST', keepalive: true }) } catch (e2) {}\n    }\n  })\n})()\n</script>\n</body></html>`
 }
 
 // Local web client server: serves the self-hosted build (never a remote site).
@@ -3211,7 +3241,7 @@ return `http://${host}:${port}/`
 
 function clientNotBuiltHtml() {
 const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Minecraft \u2014 AFK Console</title>
+return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Minecraft \u2014 AFK Console</title>${FAVICON_LINK}
 <style>html,body{height:100%;margin:0;background:#0a0e13;color:#c7d2dc;font:13px/1.4 ui-monospace,Consolas,monospace;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:24px}
 code{background:#131b25;border:1px solid #1d2836;border-radius:6px;padding:2px 8px;color:#67e8f9}
 a{color:#2dd4bf}</style></head><body>
@@ -3226,7 +3256,7 @@ a{color:#2dd4bf}</style></head><body>
 function clientBuildingHtml(st) {
   const lines = (st.tail || []).slice(-14).map(l => escHtml(l)).join('\n')
   const seconds = st.startedAt ? Math.max(0, Math.round((Date.now() - st.startedAt) / 1000)) : 0
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Minecraft — building…</title>
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Minecraft — building…</title>${FAVICON_LINK}
 <meta http-equiv="refresh" content="10">
 <style>html,body{height:100%;margin:0;background:#0a0e13;color:#c7d2dc;font:13px/1.5 ui-monospace,Consolas,monospace;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:24px}
 pre{background:#0d141d;border:1px solid #1d2836;border-radius:8px;padding:12px 14px;color:#8fa3b5;max-width:min(860px,92vw);max-height:38vh;overflow:auto;margin:0;white-space:pre-wrap}
@@ -3244,7 +3274,7 @@ a{color:#2dd4bf}.b{color:#2dd4bf;font-weight:bold}.m{color:#5b6b7a}</style></hea
 // both ways forward, rather than a generic "build not found".
 function clientBuildFailedHtml(st) {
   const lines = (st.tail || []).slice(-24).map(l => escHtml(l)).join('\n')
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Minecraft — build failed</title>
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Minecraft — build failed</title>${FAVICON_LINK}
 <style>html,body{height:100%;margin:0;background:#0a0e13;color:#c7d2dc;font:13px/1.5 ui-monospace,Consolas,monospace;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:24px}
 pre{background:#0d141d;border:1px solid #3b1d22;border-radius:8px;padding:12px 14px;color:#c9a3a8;max-width:min(880px,92vw);max-height:38vh;overflow:auto;margin:0;white-space:pre-wrap}
 code{background:#131b25;border:1px solid #1d2836;border-radius:6px;padding:2px 8px;color:#67e8f9}
@@ -3414,7 +3444,10 @@ res.setHeader?.('X-Content-Type-Options', 'nosniff')
 res.setHeader?.('Referrer-Policy', 'no-referrer')
 webTrace(`${req.method} ${p} from ${req.socket.remoteAddress || '?'}`)
 if (p === '/health') { res.writeHead(200); res.end('ok'); return }
-if (p === '/favicon.ico') { res.writeHead(204); res.end(); return }
+if (p === '/favicon.svg' || p === '/favicon.ico' || p === '/favicon.png') {
+res.writeHead(200, { 'Content-Type': 'image/svg+xml; charset=utf-8', 'Cache-Control': 'public, max-age=86400' })
+res.end(FAVICON_SVG); return
+}
 if (p === '/api/internal/disconnect-slow' && req.method === 'POST') {
   const ip = req.socket.remoteAddress || ''
   const isLocal = ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1' || ip === ''
@@ -4777,9 +4810,15 @@ const banVerdict = classifyKick(text)
 // A taken username is neither a ban nor an auth failure: the name is owned by
 // a real player, so retire it and bring up a fresh generated one instead.
 if (!banVerdict.banned && handleTakenName(id, entry, text)) return
+// A rejected session check (kind `auth`) is the account being unusable on this
+// server, not a password problem: the taken-name path above has already retired
+// the name and scheduled a Mojang-checked replacement. The guard below is a
+// safety net for session wording the name-taken detector does not yet know — it
+// must never be written to the admission blocklist, or the name is lost.
+const authRejected = banVerdict.kind === 'auth'
 // Admission failures normally close immediately, but permanent bans must be
 // persisted and removed first so /start-login cannot admit the account again.
-if (!banVerdict.banned && robotLogin.fail(id, `Kicked during admission: ${text}`)) return
+if (!banVerdict.banned && !authRejected && robotLogin.fail(id, `Kicked during admission: ${text}`)) return
 if (bots[id]) {
 bots[id].lastKickReason = text
 bots[id].lastDisconnectReason = text
@@ -5303,8 +5342,9 @@ const COMMANDS = {
 '/stop-rtp [names|range|all]': 'Stop roaming; bare command stops all roam sessions. Disconnect/death also stops roaming; restart explicitly.',
 '/all-slow [first-last|name:first..last] [delay] <cmd>': `Optional inclusive bot range before the optional delay; range alone previews targets. Like /all (chat guard included), but starts each bot ${ALL_SLOW_DELAY_MS / 1000}s apart (ALL_SLOW_DELAY_MS). An optional leading delay overrides it for that run, in the same units as sleep: /all-slow 30 /spawners, /all-slow 500ms /status`,
 '/all-slow-cancel [id]': 'Cancel a specific running /all-slow broadcast task by ID (e.g. /all-slow-cancel 1), or all tasks if no ID is specified',
+'/run-on <bots> <command>': 'Run a command on ONLY the bots you name: an exact name, a comma/space list (Alpha,Bravo), *<fragment> for every name containing it, * or all for the roster, or an inclusive range (1-3, name:A..B). Local commands run on those bots; a server command is sent to them as chat (ALL_CHAT_GUARD applies — prefix the command with "!" to send a sentence). Unlike /all, an unknown name is an error and runs nothing. e.g. /run-on Alpha /shardshop',
 '/overview': 'Online-only dashboard of each bot\'s health, food, ping, rank (via /fix + /rank), shards, coins, balance, and inventory slots',
-'/enchanted-golden-apple-extract': 'The full kit-extract routine (alias /ege): one pass per EAPPLE_REWARD_SLOTS entry — /kits, click EAPPLE_KIT_SLOT, click the reward slot, /dispose — moving ONLY the EAPPLE_DISPOSE_ITEMS junk each pass so the enchanted golden apples stay in the inventory',
+'/enchanted-golden-apple-extract': 'The full kit-extract routine (alias /ege): one pass per EAPPLE_REWARD_SLOTS entry — /kits, click EAPPLE_KIT_SLOT, click the reward slot, /disposal — moving ONLY the EAPPLE_DISPOSE_ITEMS junk each pass so the enchanted golden apples stay in the inventory',
 '/ege': 'Alias for /enchanted-golden-apple-extract',
 '/scripts': 'List the bot-scripts/*.txt files available to /run-script',
 '/run-script <name>': 'Run bot-scripts/<name>.txt: one command per line, in order. \"*<fragment> <cmd>\" = every bot whose name contains the fragment, \"* <cmd>\" = all bots, a bare line = the invoking bot. &&, ; and sleep work inside a line',
@@ -5352,8 +5392,9 @@ const COMMANDS = {
 '/reconnect-all': 'Reconnect every currently disconnected bot',
 '/reconnect-all-slow': 'Reconnect ALL bots (online or offline) with a 30s delay between each to avoid rate limits',
 '/restart [--now]': 'Rerun the connect loop for every roster name that is NOT already online — the fix for a fleet sitting below BOT_MAX after the cap was raised (blocked/failed names never retry by themselves). Online bots are skipped, never disconnected, so no session or login is wasted. Pacing matches startup (CONNECT_DELAY_MS + jitter); --now connects immediately',
-'/new-bot bot1,bot2,bot3 [instant|spread]': 'Create and connect several named bots at once. spread (default) paces the connects at CONNECT_DELAY_MS like startup; instant connects them all now. Names are saved to BOT_NAMES in .env so they survive a restart; BOT_MAX still caps the fleet and the overflow waits in the queue',
-'/new-gen [count] [randomly|direct+random|direct|N]': 'Generate unique Minecraft names, atomically save to .env and route them, then connect with the default startup connect delay (1–100). randomly = proxy groups only, smallest group first; direct+random = weighted proxy groups AND direct (alias: auto); direct = direct only (BOT_DIRECT_<name>); N = that proxy group only.',
+'/restart-everything [--now]': 'Replay the startup connect loop over the WHOLE roster: online bots are disconnected first, then every name reconnects with the same CONNECT_DELAY_MS pacing. Nothing else restarts — Tor and the process keep running. Blocked names (removed list/deathban) stay blocked; --now skips the pacing',
+'/new-bot bot1,bot2,bot3 [instant|spread] [--force]': 'Create and connect several named bots at once. spread (default) paces the connects at CONNECT_DELAY_MS like startup; instant connects them all now. Names are saved to BOT_NAMES in .env so they survive a restart. BOT_MAX caps the fleet and the overflow waits in the queue, unless you add --force, which connects these names even at the ceiling (DIRECT_MAX still applies)',
+'/new-gen [count] [randomly|direct+random|direct|N]': 'Generate unique Minecraft names, check each against Mojang and skip any that a real account already owns, atomically save the free ones to .env and route them, then connect with the default startup connect delay (1–100). randomly = proxy groups only, smallest group first; direct+random = weighted proxy groups AND direct (alias: auto); direct = direct only (BOT_DIRECT_<name>); N = that proxy group only.',
 '/lifesteal-start': 'Restarts Tor first (scripts/restart-tor.sh --tor-only, LIFESTEAL_TOR_RESTART_CMD override — brew services restart tor is NOT this repo\'s Tor and has no control port 9051), then requests NEWNYM on every local control port so reconnecting bots get fresh circuits, then: random bot /duelsroomqueue + random bot /queue (replaced on death, same bot allowed), one non-queue bot loops /warp arena → 5s → forward-until-hit, one bot spams /tpa until deathban (24h park), rest /warp afk (role sizes are configurable: LIFESTEAL_DUELS_BOTS / LIFESTEAL_QUEUE_BOTS / LIFESTEAL_ARENA_BOTS / LIFESTEAL_TPA_BOTS, default 1 each, 0 disables). Banned bots are replaced via /new-gen so the loop continues (a dead name is recycled in place — its slot becomes a fresh name, so replacements never grow the fleet). Starting never creates bots on its own: the roster only grows via /new-gen or an explicit /new-gen-maintain (LIFESTEAL_TARGET_BOTS=20 is its default target; healthy names are never removed)',
 '/lifesteal-stop': 'Stop lifesteal automation and release held forward keys',
 '/lifesteal-status': 'Show lifesteal roles (duels/queue/arena/tpa holders), role counts, online/total counts and deathbanned bots',
@@ -5368,7 +5409,7 @@ const COMMANDS = {
 '/uptime': 'Show uptime for all bots',
 '/proxy': 'Show the currently configured outbound proxy',
 '/proxy-set [host[:port]] [type] [user:pass] | direct | off': 'Set the outbound proxy for the proxy GROUP the active bot belongs to (every bot on that endpoint), or the default route when it has no group. Saved to .env and applied to new connections; --reconnect reconnects the affected bots now. Bare shows the current route; direct pins this bot to a direct connection; off clears the group/default endpoint',
-'/tor-newnym [group|bot|all] [--no-reconnect]': 'Request fresh Tor circuits and staggered-reconnect the chosen scope so the new path takes effect NOW (SIGNAL NEWNYM alone keeps live connections on their old circuit): a proxy group number, a bot name (its group), "default" for ungrouped bots, or "all"; --no-reconnect only signals',
+'/tor-newnym [group|bot|all] [--no-reconnect]': 'Request new Tor circuits, verify a changed probe exit where possible, and stagger-reconnect the chosen scope: a proxy group number, a bot name (its group), "default" for ungrouped bots, or "all"; --no-reconnect does not reconnect. This does not restart Tor or guarantee the exit for other destinations.',
 '/spawner-drop ["term"] [duration=60s] [cooldown=10s] [mode=duration|once|until-stop] [scope=all|inventory|gui]': 'Open the nearest in-reach spawner without walking or public chat; drop matching whole stacks from its GUI and/or carried inventory, including existing items. Default bones, 60s, one stack per 10s. Stop with /spawner-drop stop. GUI drops may be rejected by server plugins; stop on failure rather than retry',
 '/evidence': 'Persistent per-bot observed connection events, last 3 dump runs with outcome messages, and recent death observations. Full JSON: /api/evidence?bot=<name>; no inferred ban cause',
 '/connection': 'Show configured Minecraft destination and port, verified destination IP when available, direct/proxy route and TCP peer separately; never equate proxy IP with server or public egress IP',
@@ -6434,7 +6475,7 @@ entry.inCrateRoutine = false
 
 // ── /enchanted-golden-apple-extract (/ege) ─────────────────────────────────
 // One pass per EAPPLE_REWARD_SLOTS entry: /kits → left-click the kit slot →
-// left-click the reward slot → /dispose → move ONLY the EAPPLE_DISPOSE_ITEMS
+// left-click the reward slot → /disposal → move ONLY the EAPPLE_DISPOSE_ITEMS
 // junk in → close. The enchanted golden apples stay in the inventory: the
 // "golden_apple" glob is exact, so enchanted_golden_apple is never matched.
 // All clicks are left-clicks; every wait is EAPPLE_STEP_DELAY_MS.
@@ -6511,7 +6552,7 @@ try {
 for (let pass = 0; pass < rewardSlots.length; pass++) {
 const rewardSlot = rewardSlots[pass]
 if (!bot.entity) { logFor(id, `{red-fg}✗ ${id} despawned — /ege stopped after ${pass} pass(es).{/red-fg}`); return false }
-logFor(id, `{cyan-fg}› /ege pass ${pass + 1}/${rewardSlots.length}: /kits → slot ${kitSlot} → slot ${rewardSlot} → /dispose.{/cyan-fg}`)
+logFor(id, `{cyan-fg}› /ege pass ${pass + 1}/${rewardSlots.length}: /kits → slot ${kitSlot} → slot ${rewardSlot} → /disposal.{/cyan-fg}`)
 closeWindow()
 bot.chat('/kits')
 const kitWin = await waitForWindowOpen(bot)
@@ -6527,12 +6568,12 @@ if (!(await clickLeft(rewardWin, rewardSlot, 'reward'))) return false
 await pause()
 closeWindow()
 
-bot.chat('/dispose')
+bot.chat('/disposal')
 const disposeWin = await waitForWindowOpen(bot)
-if (!disposeWin) { logFor(id, `{yellow-fg}⚠ /ege: no GUI opened after /dispose — skipping the dispose step.{/yellow-fg}`); continue }
+if (!disposeWin) { logFor(id, `{yellow-fg}⚠ /ege: no GUI opened after /disposal — skipping the dispose step.{/yellow-fg}`); continue }
 await pause()
 const { moved, kept, failed } = await moveItemsToDispose(bot, id, disposeWin, globs)
-logFor(id, `{green-fg}✓ /ege pass ${pass + 1}: moved ${moved} junk stack(s) into /dispose, kept ${kept}.{/green-fg}`)
+logFor(id, `{green-fg}✓ /ege pass ${pass + 1}: moved ${moved} junk stack(s) into /disposal, kept ${kept}.{/green-fg}`)
 closeWindow()
 if (failed) { logFor(id, `{yellow-fg}⚠ /ege: a click failed — stopping.{/yellow-fg}`); return false }
 await pause()
@@ -7706,7 +7747,7 @@ function listeningPort () {
 
 function analyticsSignInPage (port) {
   const host = escHtml(hostForLink())
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AFK Analytics — sign in</title>
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AFK Analytics — sign in</title>${FAVICON_LINK}
 <style>body{background:#0a0e13;color:#c7d2dc;font:14px ui-monospace,Menlo,Consolas,monospace;display:grid;place-items:center;height:100vh;margin:0}
 .card{background:#0f151d;border:1px solid #1d2836;border-radius:12px;padding:28px 32px;max-width:470px}
 h1{font-size:15px;margin:0 0 8px;color:#e8f0f6}h1 b{color:#2dd4bf}p{color:#5b6b7a;font-size:12px;line-height:1.7;margin:8px 0}a{color:#67e8f9}code{background:#131b25;border:1px solid #1d2836;border-radius:4px;padding:0 5px}</style></head><body>
@@ -8838,6 +8879,49 @@ logSuccess(`${isLocal ? 'Ran locally on' : 'Broadcasted to'} ${sent} bots.`)
 return
 }
 
+// ── /run-on <bots> <command> ─────────────────
+// The targeted sibling of /all: exactly the named bots, nothing else. Local
+// commands keep running through the per-bot router; anything else is sent to
+// those bots as a server command — with the same ALL_CHAT_GUARD, so a plain
+// sentence needs the deliberate "!" prefix. A typo in a name is an error, never
+// a silent fleet-wide run, and the command cannot nest another fleet command.
+const runOnMatch = trimmed.match(/^\/run-on(?:\s+([\s\S]*))?$/i)
+if (runOnMatch) {
+  const args = (runOnMatch[1] || '').trim()
+  // The selector ends where the command starts: the first token that begins with
+  // "/" or "!" (bot names never do). Everything before it is the target list.
+  const cmdAt = args.search(/(?:^|\s)[/!]/)
+  const selector = (cmdAt < 0 ? args : args.slice(0, cmdAt)).trim()
+  const body = cmdAt < 0 ? '' : args.slice(cmdAt).trim()
+  const usage = 'Usage: /run-on <bots> <command> — e.g. /run-on Alpha /shardshop, /run-on Alpha,Bravo /status, /run-on *core /spawners, /run-on 1-3 /spawners'
+  if (!selector || !body) { logWarn(usage); return }
+  const roster = Object.keys(bots)
+  const targets = parseRunOnTargets(selector, roster)
+  if (targets.error) { logWarn(targets.error); return }
+  if (targets.unknown.length) {
+    logWarn(`Unknown bot${targets.unknown.length === 1 ? '' : 's'}: ${sanitize(describeUnknownTargets(targets.unknown, roster))} — nothing was run. Known bots: ${roster.join(', ') || 'none'}`)
+    return
+  }
+  if (!targets.ids.length) { logWarn(`No bot matches "${sanitize(selector)}" — nothing was run. Known bots: ${roster.join(', ') || 'none'}`); return }
+  const guard = guardBroadcastText(body, '/run-on')
+  if (!guard.ok) { logWarn(guard.message); return }
+  const isLocal = LOCAL_COMMANDS.includes(guard.body.split(/\s+/)[0])
+  let sent = 0
+  const refused = []
+  for (const id of targets.ids) {
+    try {
+      if (dispatchCommandToBot(guard.body, id)) sent++
+      else refused.push(id)
+    } catch (err) {
+      refused.push(id)
+      logWarn(`${id}: ${sanitize(err.message)}`)
+    }
+  }
+  if (sent) logSuccess(`${isLocal ? 'Ran locally on' : 'Sent to'} ${sent} bot${sent === 1 ? '' : 's'}: ${targets.ids.filter(id => !refused.includes(id)).join(', ')}`)
+  if (refused.length) logWarn(`${isLocal ? 'Ran' : 'Sent'} on ${sent} of ${targets.ids.length} target(s); skipped ${refused.join(', ')} (offline, roaming, or refused).`)
+  return
+}
+
 // ── /data [check|status] ─────────────────────
 if (trimmed === '/data' || trimmed.startsWith('/data ')) {
   const dataArgs = parseDataArgs(trimmed.slice('/data'.length))
@@ -9159,10 +9243,10 @@ return torRotate(scopeArg, { reconnect }).then(result => {
 if (result.error) { logWarn(sanitize(result.error)); return result }
 const okCount = result.results.filter(r => r.ok).length
 if (!result.results.length) logWarn(`No Tor instance to signal for ${result.label} — the system log explains why.`)
-else if (result.ok) logSuccess(`New Tor circuits on all ${result.results.length} instance(s) for ${result.label}.`)
-else logWarn(`New circuits on ${okCount} of ${result.results.length} Tor instance(s) for ${result.label} — the system log says which one failed.`)
+else if (result.ok && result.results.every(r => r.verified)) logSuccess(`Probe exit changed on all ${result.results.length} Tor instance(s) for ${result.label}; other destinations may use different exits.`)
+else logWarn(`Tor request acknowledged or verified on ${okCount} of ${result.results.length} instance(s) for ${result.label}; see the system log for verified exits and failures.`)
 if (reconnect) {
-if (result.reconnected) logSuccess(`Reconnecting ${result.reconnected} bot(s) for ${result.label} — new connections leave through the fresh circuits.`)
+if (result.reconnected) logSuccess(`Scheduled reconnects for ${result.reconnected} bot(s) for ${result.label}.`)
 else logInfo(`No bots to reconnect for ${result.label}.`)
 }
 return result
@@ -9211,73 +9295,100 @@ logSuccess(`Staggered reconnect started for ${count} bot(s) (${delayMs / 1000}s 
 return
 }
 
-// ── /restart [--now] ────────────────────────
-// Reruns the startup connect loop over the roster, skipping every bot that is
-// already online. The gap this closes: a name that was blocked by BOT_MAX (or
-// whose attempt failed) never retries itself, so raising the cap to 100 while
-// 60 bots are up could leave the other 40 sitting there indefinitely. /restart
-// guarantees the attempt — and because online bots are skipped, it never
-// disconnects a healthy session or spends a login just to say "already up".
-if (trimmed === '/restart' || /^\/restart(?:\s|$)/i.test(trimmed)) {
-const flags = trimmed.slice('/restart'.length).trim().split(/\s+/).filter(Boolean)
-const badFlag = flags.find(flag => !/^--?now$/i.test(flag))
-if (badFlag) { logWarn(`Usage: /restart [--now] — "${sanitize(badFlag)}" is not a flag /restart understands.`); return }
-const immediately = flags.length > 0
-// Anything already waiting for a slot gets its chance first: the queue is the
-// same connect loop, just deferred.
-try { flushWaitingForSlot() } catch (_) {}
-// The roster is everything that has ever been asked to connect here: the .env
-// list (re-read from process.env so /new-bot's additions count), the proxy-group
-// assignments, and the bots this run already knows about.
-const roster = [...new Map([...BOT_NAMES, ...parseNameList(process.env.BOT_NAMES), ...PROXY_GROUPS.flatMap(group => group.bots), ...Object.keys(bots)]
-.filter(Boolean).map(name => [String(name).toLowerCase(), String(name)])).values()]
-const pending = []
-let online = 0
-let connecting = 0
-let blocked = 0
-for (const name of roster) {
-const id = Object.keys(bots).find(key => key.toLowerCase() === name.toLowerCase()) || name
-const entry = bots[id]
-if (botOnline(entry)) { online++; continue }
-// A connection already in flight IS the connect loop. Restarting it would
-// throw away a login mid-handshake — the waste this command must avoid.
-if (entry && entry.connectionState === 'connecting') { connecting++; continue }
-if (connectBlockReason(id)) { blocked++; continue }
-// Existing entries carry their own destination; new names take the default.
-pending.push({ id, host: entry?.host || HOST, port: entry?.port || PORT, version: entry?.version || VERSION })
-}
-const skipped = [online ? `${online} already online` : '', connecting ? `${connecting} still connecting` : '', blocked ? `${blocked} blocked (removed list/deathban)` : ''].filter(Boolean).join(' · ')
-if (!pending.length) {
-logInfo(`Nothing to restart — every roster name is up or already connecting${blocked ? ` (${blocked} blocked)` : ''}.`)
-return
-}
-let at = 0
-for (const { id, host, port, version } of pending) {
-const delay = immediately ? 0 : at
-// Same pacing as startup (/new-gen and lifesteal top-ups share it): a burst of
-// 40 logins is exactly what CONNECT_DELAY_MS exists to prevent.
-if (!immediately) at += CONNECT_DELAY_MS + Math.floor(Math.random() * (CONNECT_DELAY_RANDOM_MS + 1))
-const fire = () => {
-// It may have come up on its own since the plan was made (a queue flush or a
-// pending reconnect timer) — never take a live session down for this.
-if (botOnline(bots[id]) || connectBlockReason(id)) return
-if (bots[id]) {
-// Tear the dead socket down first, then reconnect, the same way /reconnect
-// does: a half-closed client would otherwise fight the new one.
-try { bots[id].disconnectManually() } catch (_) {}
-setTimeout(() => { if (!botOnline(bots[id])) createBotInstance(id, host, port, version) }, 1000)
-return
-}
-createBotInstance(id, host, port, version)
-}
-if (delay > 0) setTimeout(fire, delay)
-else fire()
-}
-logSuccess(`Connect loop restarted for ${pending.length} bot(s)${immediately ? ' immediately' : ` — same ${(CONNECT_DELAY_MS / 1000).toFixed(1)}s+ pacing as startup`}${skipped ? ` (skipped: ${skipped})` : ''}.`)
-logInfo(`{gray-fg}BOT_MAX ${settings.get('BOT_MAX')} · ${Object.keys(bots).length} bot(s) held · names over the cap wait in the queue and connect as slots free.{/gray-fg}`)
-return
+// ── /restart [--now] and /restart-everything [--now] ────────────────────────
+// Replays the startup connect pass over the roster. Startup pacing
+// (CONNECT_DELAY_MS + jitter) is reused verbatim: a burst of logins is exactly
+// what the server answers with "you are logging in too fast".
+//
+//   /restart             offline names only — online sessions are never touched
+//   /restart-everything  the WHOLE roster: online bots are disconnected first,
+//                        then everyone walks the same paced loop startup uses.
+//                        Nothing else restarts (no Tor, no process, no env
+//                        reload) — "everything" is every account on the roster.
+function runStartupConnectLoop ({ immediately = false, reconnectOnline = false } = {}) {
+  // Anything already waiting for a slot gets its chance first: the queue is the
+  // same connect loop, just deferred.
+  try { flushWaitingForSlot() } catch (_) {}
+  // The roster is everything that has ever been asked to connect here: the .env
+  // list (re-read from process.env so /new-bot's additions count), the proxy-group
+  // assignments, and the bots this run already knows about.
+  const roster = [...new Map([...BOT_NAMES, ...parseNameList(process.env.BOT_NAMES), ...PROXY_GROUPS.flatMap(group => group.bots), ...Object.keys(bots)]
+    .filter(Boolean).map(name => [String(name).toLowerCase(), String(name)])).values()]
+  const pending = []
+  let online = 0
+  let connecting = 0
+  let blocked = 0
+  let dropped = 0
+  for (const name of roster) {
+    const id = Object.keys(bots).find(key => key.toLowerCase() === name.toLowerCase()) || name
+    const entry = bots[id]
+    const isOnline = botOnline(entry)
+    if (isOnline) {
+      if (!reconnectOnline) { online++; continue }
+      dropped++
+    }
+    // A connection already in flight IS the connect loop. Restarting it would
+    // throw away a login mid-handshake — the waste this command must avoid.
+    if (!isOnline && entry && entry.connectionState === 'connecting') { connecting++; continue }
+    // Bans/deathbans/retired names are not "restarted": they are still blocked.
+    if (connectBlockReason(id)) { blocked++; continue }
+    // Existing entries carry their own destination; new names take the default.
+    pending.push({ id, host: entry?.host || HOST, port: entry?.port || PORT, version: entry?.version || VERSION })
+  }
+  const skipped = [online ? `${online} already online` : '', connecting ? `${connecting} still connecting` : '', blocked ? `${blocked} blocked (removed list/deathban)` : ''].filter(Boolean).join(' · ')
+  if (!pending.length) {
+    logInfo(`Nothing to restart — every roster name is up or already connecting${blocked ? ` (${blocked} blocked)` : ''}.`)
+    return
+  }
+  let at = 0
+  for (const { id, host, port, version } of pending) {
+    const delay = immediately ? 0 : at
+    // Same pacing as startup (/new-gen and lifesteal top-ups share it): a burst of
+    // 40 logins is exactly what CONNECT_DELAY_MS exists to prevent.
+    if (!immediately) at += CONNECT_DELAY_MS + Math.floor(Math.random() * (CONNECT_DELAY_RANDOM_MS + 1))
+    const fire = () => {
+      // It may have come up on its own since the plan was made (a queue flush or
+      // a pending reconnect timer) — never take a live session down for this.
+      if (botOnline(bots[id]) && !reconnectOnline) return
+      if (connectBlockReason(id)) return
+      if (bots[id]) {
+        // Tear the dead socket down first, then reconnect, the same way
+        // /reconnect does: a half-closed client would otherwise fight the new one.
+        try { bots[id].disconnectManually() } catch (_) {}
+        setTimeout(() => { if (!botOnline(bots[id]) && !connectBlockReason(id)) createBotInstance(id, host, port, version) }, reconnectOnline ? 1500 : 1000)
+        return
+      }
+      createBotInstance(id, host, port, version)
+    }
+    if (delay > 0) setTimeout(fire, delay)
+    else fire()
+  }
+  logSuccess(`${reconnectOnline ? 'Full connect loop restarted' : 'Connect loop restarted'} for ${pending.length} bot(s)${immediately ? ' immediately' : ` — same ${(CONNECT_DELAY_MS / 1000).toFixed(1)}s+ pacing as startup`}${dropped ? ` (${dropped} online session(s) closed and replayed)` : ''}${skipped ? ` (skipped: ${skipped})` : ''}.`)
+  logInfo(`{gray-fg}BOT_MAX ${settings.get('BOT_MAX')} · ${Object.keys(bots).length} bot(s) held · names over the cap wait in the queue and connect as slots free.{/gray-fg}`)
 }
 
+if (trimmed === '/restart' || /^\/restart(?:\s|$)/i.test(trimmed)) {
+  const flags = trimmed.slice('/restart'.length).trim().split(/\s+/).filter(Boolean)
+  const badFlag = flags.find(flag => !/^--?now$/i.test(flag))
+  if (badFlag) { logWarn(`Usage: /restart [--now] — "${sanitize(badFlag)}" is not a flag /restart understands.`); return }
+  runStartupConnectLoop({ immediately: flags.length > 0, reconnectOnline: false })
+  return
+}
+
+// ── /restart-everything [--now] ─────────────────────────────────────────────
+// The hard version of /restart: every online bot is disconnected and every
+// offline name gets a fresh attempt, all through the startup loop and its
+// pacing. Use it when half the fleet sits on dead circuits and "reconnect one"
+// is not the fix; a healthy session is deliberately given up here.
+if (trimmed === '/restart-everything' || /^\/restart-everything(?:\s|$)/i.test(trimmed)) {
+  const flags = trimmed.slice('/restart-everything'.length).trim().split(/\s+/).filter(Boolean)
+  const badFlag = flags.find(flag => !/^--?now$/i.test(flag))
+  if (badFlag) { logWarn(`Usage: /restart-everything [--now] — "${sanitize(badFlag)}" is not a flag /restart-everything understands.`); return }
+  const cap = settings.get('BOT_MAX')
+  logInfo(`{yellow-fg}↻ /restart-everything — replaying the startup connect loop for the whole roster (BOT_MAX ${cap}); Tor and the process keep running.{/yellow-fg}`)
+  runStartupConnectLoop({ immediately: flags.length > 0, reconnectOnline: true })
+  return
+}
 // ── /chat ───────────────────────────────────
 if (trimmed.startsWith('/chat ')) {
 const msg = trimmed.slice(6).trim()
@@ -9301,10 +9412,10 @@ if (/^\/new-gen(?:\s|$)/i.test(trimmed)) {
 // both `/new-gen 10 randomly` and `/new-gen 10 group=randomly` work.
 const match = trimmed.match(/^\/new-gen(?:\s+(\d+))?(?:\s+(?:group=)?(auto|randomly|random|direct\+random|direct|\d+))?$/i)
 if (!match) { logWarn('Usage: /new-gen [1-100] [randomly|direct+random|direct|<proxy group number>]'); return }
-try {
-const result = persistGeneratedBots({ file: path.join(__dirname, '.env'), env: process.env, existing: Object.keys(bots), blocked: (removedBots.bots || []).map(row => row.bot), count: Number(match[1] || 1), group: (match[2] || 'auto').toLowerCase(), io: fs })
+const options = { file: path.join(__dirname, '.env'), env: process.env, existing: Object.keys(bots), blocked: (removedBots.bots || []).map(row => row.bot), count: Number(match[1] || 1), group: (match[2] || 'auto').toLowerCase(), io: fs }
+const finish = result => {
 refreshRuntimeConfig()
-logSuccess(`Saved ${result.names.length} generated account(s) to .env before connecting.`)
+logSuccess(`Saved ${result.names.length} generated account(s) to .env before connecting${result.rejected ? ` — skipped ${result.rejected} name(s) already registered with Mojang` : ''}.`)
 // "Just the default one": generated connects use the default connect delay —
 // the same pacing as bots normally connect with at startup — not the
 // robot-admission ROBOT_CONNECT_DELAY_MS burst.
@@ -9315,7 +9426,17 @@ connectAt += CONNECT_DELAY_MS + Math.floor(Math.random() * (CONNECT_DELAY_RANDOM
 logInfo(`${name}: ${group == null ? 'default/direct route' : `proxy group ${group}`} — connecting in ${(at / 1000).toFixed(1)}s`)
 setTimeout(() => { if (!Object.hasOwn(bots, name) && !connectBlockReason(name)) createBotInstance(name, null, null, null, { force: true }) }, at)
 })
-return result
+}
+// Names are checked against Mojang before they are saved: a real player's name
+// can never join a premium-auth server, so handing one out just burns a login
+// and a ban-detection entry. Taken candidates are skipped, not returned.
+// NEW_GEN_MOJANG_CHECK=0 keeps the old synchronous generator for an offline
+// host or a Mojang rate-limit window; the default is on.
+const checkMojang = !/^(0|false|no|off)$/i.test(String(process.env.NEW_GEN_MOJANG_CHECK ?? 'true'))
+try {
+if (!checkMojang) { finish(persistGeneratedBots(options)); return }
+persistGeneratedBotsAvailable(options).then(finish).catch(err => logError(`No accounts connected: generation/save failed (${sanitize(err.code || err.message)}).`))
+return
 } catch (err) { logError(`No accounts connected: generation/save failed (${sanitize(err.code || err.message)}).`); return }
 }
 if (/^\/server-commands(?:\s|$)/i.test(trimmed)) {
@@ -9335,19 +9456,30 @@ if (refresh) return refreshServerCommands(activeId).then(show).catch(err => logW
 return show()
 }
 
-// ── /new-bot bot1,bot2,bot3 [instant|spread] ──
+// ── /new-bot bot1,bot2,bot3 [instant|spread] [--force] ──
 // Creates the named accounts and connects them: "spread" (default) paces them
 // at the normal startup gap, "instant" starts them all at once. The names are
 // added to BOT_NAMES in .env first, so a restart brings the same bots back
-// instead of losing them with the process. BOT_MAX still governs: names over
-// the cap wait in the queue and connect as slots free (/restart drains it).
+// instead of losing them with the process.
+//
+// --force lifts BOT_MAX for THIS command only: the names connect even when the
+// fleet is at the ceiling, which is the point of asking for them by name. It
+// reuses the same `options.force` path the generated replacements use, so it
+// never touches DIRECT_MAX — the shared direct IP still refuses to stampede,
+// and that is reported with the usual "raise DIRECT_MAX" hint.
 if (trimmed === '/new-bot' || /^\/new-bot(?:\s|$)/i.test(trimmed)) {
-const args = trimmed.slice('/new-bot'.length).trim().split(/\s+/).filter(Boolean)
+// --force / --override are accepted anywhere in the argument list so both
+// `/new-bot a,b --force` and `/new-bot a,b instant --force` read naturally.
+const FORCE_FLAG = /^(--force|--override|force|override)$/i
+const words = trimmed.slice('/new-bot'.length).trim().split(/\s+/).filter(Boolean)
+const forceBots = words.some(word => FORCE_FLAG.test(word))
+const args = words.filter(word => !FORCE_FLAG.test(word))
 const requested = (args[0] || '').split(',').map(name => name.trim()).filter(Boolean)
 const mode = (args[1] || 'spread').toLowerCase()
-if (!requested.length) { logWarn('Usage: /new-bot bot1,bot2,bot3 [instant|spread] — spread (default) connects over time, instant connects at once.'); return }
+const usage = 'Usage: /new-bot bot1,bot2,bot3 [instant|spread] [--force] — spread (default) connects over time, instant connects at once, --force connects past BOT_MAX.'
+if (!requested.length) { logWarn(usage); return }
 if (args.length > 2 || !['instant', 'spread'].includes(mode)) {
-logWarn(args.length > 2 ? 'Usage: /new-bot bot1,bot2,bot3 [instant|spread] — names are a comma list, then the mode.' : `Usage: /new-bot bot1,bot2,bot3 [instant|spread] — "${sanitize(args[1])}" is not a mode.`)
+logWarn(args.length > 2 ? usage : `Usage: /new-bot bot1,bot2,bot3 [instant|spread] [--force] — "${sanitize(args[1])}" is not a mode.`)
 return
 }
 const invalid = requested.filter(name => !/^[A-Za-z0-9_]{1,16}$/.test(name) || ['__proto__', 'constructor', 'prototype'].includes(name))
@@ -9377,9 +9509,12 @@ const blockedNames = names.filter(name => connectBlockReason(name))
 for (const name of blockedNames) logWarn(`${sanitize(name)} is ${sanitize(connectBlockReason(name))} — it will not connect until that is cleared (/unban ${sanitize(name)}).`)
 const connectable = names.filter(name => !connectBlockReason(name))
 if (!connectable.length) { logWarn(`Nothing to connect.${notes}`); return }
+const connectOptions = forceBots ? { force: true } : {}
+const connect = name => createBotInstance(name, HOST, PORT, VERSION, connectOptions)
+const forced = forceBots ? ' (past BOT_MAX)' : ''
 if (mode === 'instant') {
-connectable.forEach(name => createBotInstance(name, HOST, PORT, VERSION))
-logSuccess(`Created ${connectable.length} bot(s) at once: ${connectable.map(sanitize).join(', ')}.${notes}`)
+connectable.forEach(connect)
+logSuccess(`Created ${connectable.length} bot(s) at once${forced}: ${connectable.map(sanitize).join(', ')}.${notes}`)
 return
 }
 let at = 0
@@ -9388,13 +9523,13 @@ connectable.forEach(name => {
 const delay = at
 lastAt = delay
 at += CONNECT_DELAY_MS + Math.floor(Math.random() * (CONNECT_DELAY_RANDOM_MS + 1))
-const fire = () => { if (!Object.hasOwn(bots, name) && !connectBlockReason(name)) createBotInstance(name, HOST, PORT, VERSION) }
+const fire = () => { if (!Object.hasOwn(bots, name) && !connectBlockReason(name)) connect(name) }
 // The first connect is immediate; the rest wait for the startup gap.
 if (delay > 0) setTimeout(fire, delay)
 else fire()
 })
 // Report when the LAST one connects, not the next unpaced gap.
-logSuccess(`Created ${connectable.length} bot(s), spread over the next ${(lastAt / 1000).toFixed(0)}s: ${connectable.map(sanitize).join(', ')}.${notes}`)
+logSuccess(`Created ${connectable.length} bot(s)${forced}, spread over the next ${(lastAt / 1000).toFixed(0)}s: ${connectable.map(sanitize).join(', ')}.${notes}`)
 return
 }
 

@@ -7,10 +7,10 @@ group connect **direct**, capped at `DIRECT_MAX`.
 
 ```
 container
-├── tor @ 9050/9051  ── proxy group 1 (10 bots)
-├── tor @ 9150/9151  ── proxy group 2 (10 bots)
-├── tor @ 9250/9251  ── proxy group 3 (10 bots)
-└── direct (no proxy) ── up to DIRECT_MAX (20 bots), replaced one-for-one on ban
+├── tor @ 9050/9051  ── proxy group 1 (15 bots, group + fallback login passwords)
+├── tor @ 9150/9151  ── proxy group 2 (15 bots, group + fallback login passwords)
+├── tor @ 9250/9251  ── proxy group 3 (15 bots, group + fallback login passwords)
+└── direct (no proxy) ── DIRECT_MAX=150, replaced one-for-one on ban (BOT_MAX=200)
 ```
 
 ## Files
@@ -20,7 +20,7 @@ container
 | `Dockerfile.ecs` | App image; bakes `tor`, `ttyd`, the web-client build and `tor-fleet` |
 | `tor-fleet.sh` | Start/stop/restart/status one Tor per `TOR_PORTS` port |
 | `docker-entrypoint.sh` | Derives the Tor ports from `PROXY_GROUP_<N>_HOST/PORT`, starts them, waits for bootstrap, then execs the app |
-| `plan-routes.js` | Deterministic roster → 10/10/10 groups + direct cohort + spare pool |
+| `plan-routes.js` | Deterministic roster → 15/15/15 groups + direct cohort + spare pool |
 
 `restart-tor` in the image restarts **all** instances and waits for each SOCKS
 port, so the proxy-stall watchdog cannot leave `:9150` dead while `:9050` works.
@@ -49,7 +49,7 @@ docker push 638486126086.dkr.ecr.us-east-2.amazonaws.com/onayaprogrammer-myapi:<
 ## Route plan
 
 ```sh
-node deploy/ecs/plan-routes.js roster.txt [--per-group 10] [--direct 20] [--bot-max 50]
+node deploy/ecs/plan-routes.js roster.txt [--per-group 15] [--direct 15] [--bot-max 60]
 ```
 
 The order is `sha1(lowercased name)`, not roster position, so the same roster
@@ -72,7 +72,7 @@ app, so bots never race the bootstrap.
 
 ## Runtime behaviour that goes with this layout
 
-- `DIRECT_MAX` (default 20) caps concurrent **connections** on the direct route.
+- `DIRECT_MAX` caps concurrent **connections** on the direct route (the ECS task sets its own value; the live fleets use 150 so the direct cohort is not the bottleneck).
   A banned direct bot frees its slot and the next unused direct name takes it;
   spare names stay in `BOT_NAMES` as the replacement pool.
 - When every direct name is banned the dashboard's `direct` chip turns red and a

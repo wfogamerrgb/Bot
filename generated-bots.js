@@ -89,6 +89,48 @@ function generateNames(count, existing = [], randomInt = crypto.randomInt) {
   return names
 }
 
+// ── Mojang availability (so /new-gen never hands out a real player's name) ──
+// A generated name can collide with an existing Minecraft account, and a server
+// that requires premium auth for registered names then rejects the bot on every
+// join ("You are not logged into your Minecraft account"). Checking before the
+// name is written to .env is cheaper than discovering it through a kick loop.
+//
+// 200 -> the name exists (taken) · 204/404 -> nobody owns it · anything else
+// (rate limit, DNS, timeout) -> unknown, and unknown must NOT block generation:
+// /new-gen called offline still works, it just cannot pre-filter.
+const MOJANG_PROFILE_URL = 'https://api.mojang.com/users/profiles/minecraft/'
+// NEW_GEN_MOJANG_CHECK=0 turns the lookup off for an offline host or a Mojang
+// rate-limit window; everything else defaults to checking.
+const mojangCheckEnabled = env => !/^(0|false|no|off)$/i.test(String((env || {}).NEW_GEN_MOJANG_CHECK ?? 'true'))
+
+async function mojangNameTaken (name, { fetchImpl = globalThis.fetch, timeoutMs = 8000 } = {}) {
+  if (typeof fetchImpl !== 'function') return false
+  try {
+    const res = await fetchImpl(MOJANG_PROFILE_URL + encodeURIComponent(name), { signal: AbortSignal.timeout(timeoutMs) })
+    return res.status === 200
+  } catch (_) {
+    return false
+  }
+}
+
+// Like generateNames, but every candidate is checked first and a taken one is
+// dropped instead of returned. `check` is injectable so tests never hit Mojang.
+async function generateAvailableNames (count, existing = [], { randomInt = crypto.randomInt, check = mojangNameTaken, maxAttempts = 0 } = {}) {
+  if (!Number.isInteger(count) || count < 1 || count > 100) throw new Error('Count must be between 1 and 100')
+  const used = new Set(existing.map(keyOf)), names = []
+  const limit = maxAttempts || count * 80
+  let rejected = 0
+  for (let attempt = 0; names.length < count && attempt < limit; attempt++) {
+    const name = generateName(randomInt)
+    if (!name || used.has(keyOf(name))) continue
+    used.add(keyOf(name))
+    if (await check(name)) { rejected++; continue }
+    names.push(name)
+  }
+  if (names.length !== count) throw new Error(`Could not generate ${count} unregistered name(s) — ${rejected} candidate(s) were already taken`)
+  return { names, rejected }
+}
+
 function updateEnvText(text, updates) {
   const newline = text.includes('\r\n') ? '\r\n' : '\n'
   const remaining = new Map(Object.entries(updates))
@@ -155,7 +197,7 @@ function normaliseRouteMode (group) {
   throw new Error(`Unknown /new-gen route "${raw}" — use randomly, direct, direct+random, or a proxy group number`)
 }
 
-function persistGeneratedBots({ file = path.join(__dirname, '.env'), env = process.env, existing = [], blocked = [], count = 1, group = 'auto', io = fs, randomInt = crypto.randomInt }) {
+function persistGeneratedBots({ file = path.join(__dirname, '.env'), env = process.env, existing = [], blocked = [], count = 1, group = 'auto', io = fs, randomInt = crypto.randomInt, names: providedNames = null }) {
   let text = ''
   try { text = io.readFileSync(file, 'utf8') } catch (err) { if (err.code !== 'ENOENT') throw err }
   const disk = dotenv.parse(text), config = { ...env, ...disk }
@@ -164,7 +206,7 @@ function persistGeneratedBots({ file = path.join(__dirname, '.env'), env = proce
   if (typeof group === 'number' && !routes.some(route => route.index === group)) throw new Error('Proxy group must have a valid HOST/PORT/TYPE')
   if (group === 'randomly' && !routes.length) throw new Error('No proxy group is configured — /new-gen randomly needs PROXY_GROUP_<N>_HOST/PORT')
   const used = usedNames(config, { file, io, existing, blocked })
-  const names = generateNames(count, used, randomInt)
+  const names = providedNames || generateNames(count, used, randomInt)
   const updates = { BOT_NAMES: [...new Set([...parseNameList(config.BOT_NAMES), ...names])].join(',') }
   const groups = new Map(routes.map(route => [route.index, parseNameList(config[`PROXY_GROUP_${route.index}_BOTS`])]))
   // Roster names outside every group already ride the direct/default route,
@@ -212,7 +254,7 @@ function persistGeneratedBots({ file = path.join(__dirname, '.env'), env = proce
 // in place: BOT_NAMES keeps the roster size, the proxy group keeps its route,
 // and BOT_DIRECT_<taken> moves to BOT_DIRECT_<new>. Returns the replacement and
 // where it was routed so the caller can connect it immediately.
-function persistRegeneratedName({ file = path.join(__dirname, '.env'), env = process.env, taken, existing = [], blocked = [], io = fs, randomInt = crypto.randomInt }) {
+function persistRegeneratedName({ file = path.join(__dirname, '.env'), env = process.env, taken, existing = [], blocked = [], io = fs, randomInt = crypto.randomInt, replacement: providedReplacement = null }) {
   const victim = String(taken || '').trim()
   if (!/^[A-Za-z0-9_]{1,16}$/.test(victim)) throw new Error('Invalid taken username')
   let text = ''
@@ -220,7 +262,7 @@ function persistRegeneratedName({ file = path.join(__dirname, '.env'), env = pro
   const disk = dotenv.parse(text), config = { ...env, ...disk }
   const used = usedNames(config, { file, io, existing, blocked })
   used.push(victim)
-  const [replacement] = generateNames(1, used, randomInt)
+  const [replacement] = providedReplacement ? [providedReplacement] : generateNames(1, used, randomInt)
   const sameKey = name => keyOf(name) === keyOf(victim)
   const swap = names => names.map(name => (sameKey(name) ? replacement : name))
   const updates = {}
@@ -251,4 +293,46 @@ function persistRegeneratedName({ file = path.join(__dirname, '.env'), env = pro
   return { name: replacement, taken: victim, group, direct }
 }
 
-module.exports = { generateNames, updateEnvText, saveEnvFile, persistGeneratedBots, persistRegeneratedName, normaliseRouteMode }
+// /new-gen's entry point: pick names, ask Mojang first, then save + route them.
+// Everything after name selection is the same code path as the synchronous
+// version, so the roster/route bookkeeping cannot drift between the two.
+async function persistGeneratedBotsAvailable (options = {}) {
+  const {
+    file = path.join(__dirname, '.env'), env = process.env, existing = [], blocked = [],
+    count = 1, io = fs, randomInt = crypto.randomInt, check = mojangNameTaken
+  } = options
+  let text = ''
+  try { text = io.readFileSync(file, 'utf8') } catch (err) { if (err.code !== 'ENOENT') throw err }
+  const disk = dotenv.parse(text), config = { ...env, ...disk }
+  const used = usedNames(config, { file, io, existing, blocked })
+  const { names, rejected } = await generateAvailableNames(count, used, { randomInt, check })
+  const result = persistGeneratedBots({ ...options, names })
+  return { ...result, rejected, checked: names.length + rejected }
+}
+
+// Mojang-checked variant of persistRegeneratedName: used when an account is
+// retired because the server will not admit it (a taken name or a rejected
+// session). The replacement must be a name nobody owns, or the fresh slot
+// inherits the same problem.
+async function persistRegeneratedNameAvailable (options = {}) {
+  const {
+    file = path.join(__dirname, '.env'), env = process.env, taken, existing = [], blocked = [],
+    io = fs, randomInt = crypto.randomInt, check = null
+  } = options
+  const victim = String(taken || '').trim()
+  if (!/^[A-Za-z0-9_]{1,16}$/.test(victim)) throw new Error('Invalid taken username')
+  let text = ''
+  try { text = io.readFileSync(file, 'utf8') } catch (err) { if (err.code !== 'ENOENT') throw err }
+  const disk = dotenv.parse(text), config = { ...env, ...disk }
+  const used = usedNames(config, { file, io, existing, blocked })
+  used.push(victim)
+  const availability = check || (mojangCheckEnabled(config) ? mojangNameTaken : async () => false)
+  const { names, rejected } = await generateAvailableNames(1, used, { randomInt, check: availability })
+  return { ...persistRegeneratedName({ ...options, replacement: names[0] }), rejected }
+}
+
+module.exports = {
+  generateNames, generateAvailableNames, mojangNameTaken, updateEnvText, saveEnvFile,
+  persistGeneratedBots, persistGeneratedBotsAvailable, persistRegeneratedName,
+  persistRegeneratedNameAvailable, normaliseRouteMode
+}

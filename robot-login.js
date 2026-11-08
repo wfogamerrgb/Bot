@@ -6,6 +6,11 @@ const { shuffledCopy, classifyAuthReply, readDelayMs } = require('./bot-controls
 const keyOf = name => String(name).toLowerCase()
 const validName = name => /^[a-zA-Z0-9_]{1,16}$/.test(name)
 const namesFromText = text => String(text).split(/\r?\n/).map(line => line.split('#')[0].trim().split(/\s+/)[0]).filter(Boolean)
+// "You are not logged into your Minecraft account…" is the server refusing one
+// login handshake, not a credential failure. Blocklisting it in removed.txt is
+// what permanently erased healthy names, so fail() lets it through and the
+// caller's reconnect backoff retries instead (classifyKick calls it `auth`).
+const TRANSIENT_AUTH_RE = /not\s+logged\s+into\s+your\s+(?:minecraft|premium|mojang|msa)?\s*account/i
 
 // Unlike roster groups, admission routes need only a valid HOST/PORT/TYPE:
 // an empty _BOTS list (or a gap in group numbers) must not hide a usable route.
@@ -55,6 +60,10 @@ function createRobotLogin({ env = () => process.env, directory = __dirname, io =
   function fail(name, reason) {
     const s = state(name)
     if (!s || s.phase !== 'admitting') return false
+    if (TRANSIENT_AUTH_RE.test(String(reason || ''))) {
+      log(`${s.name}: session rejected by the server — retrying later (not blocklisted).`)
+      return false
+    }
     s.phase = 'blocked'
     cancelAuth(s)
     if (s.timeout) clearTimer(s.timeout)

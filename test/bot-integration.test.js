@@ -50,7 +50,11 @@ function runtime(env = {}) {
 // a /play request for an unbuilt client would clone and build the real
 // multi-GB upstream client from the test suite. Tests that need a build point
 // MC_WEB_CLIENT_DIR at a temp dir instead.
-  env: { BOT_NAMES: 'A,B,C', WEB_GUI: 'true', TUI_GUI: 'false', WEB_PASSWORD: 'test-only', WEB_TERMINAL_LOG: 'false', MC_WEB_AUTO_BUILD: 'false', CRON_STATE_FILE: cronStateFile, ...stateEnv, ...env },
+  // NEW_GEN_MOJANG_CHECK=false keeps the synchronous generator here: these
+  // tests assert roster/route bookkeeping, and a real Mojang lookup would make
+  // them network-bound. The availability filter itself is covered by
+  // test/name-generation.test.js with an injected checker.
+  env: { BOT_NAMES: 'A,B,C', WEB_GUI: 'true', TUI_GUI: 'false', WEB_PASSWORD: 'test-only', WEB_TERMINAL_LOG: 'false', MC_WEB_AUTO_BUILD: 'false', NEW_GEN_MOJANG_CHECK: 'false', CRON_STATE_FILE: cronStateFile, ...stateEnv, ...env },
     stdout: { isTTY: false, write() {} }, stderr: { write() {} },
     on() {}, exit() {}, memoryUsage: () => ({ rss: 0, heapUsed: 0 }), uptime: () => 1
   }
@@ -116,7 +120,11 @@ function runtime(env = {}) {
       if (name === './removed-bots') return require('../removed-bots')
       if (name === './tor-fleet') {
         const tor = require('../tor-fleet')
-        return env.TEST_TOR_ROTATION ? { ...tor, createAllBannedTorRotation: opts => tor.createAllBannedTorRotation({ ...opts, rotate: async endpoint => { torRotations.push(endpoint); return { ok: true, before: '198.51.100.1', after: '198.51.100.2' } } }) } : tor
+        return {
+          ...tor,
+          ...(env.TEST_TOR_VERIFY ? { verifyTorRotation: env.TEST_TOR_VERIFY } : {}),
+          ...(env.TEST_TOR_ROTATION ? { createAllBannedTorRotation: opts => tor.createAllBannedTorRotation({ ...opts, rotate: async endpoint => { torRotations.push(endpoint); return { ok: true, before: '198.51.100.1', after: '198.51.100.2' } } }) } : {})
+        }
       }
       if (name === path.join(__dirname, '..', 'robot-login')) return { createRobotLogin: opts => require('../robot-login').createRobotLogin({ ...opts, random: () => 0.999, now: () => Number(processMock.env.TEST_AUTH_NOW ?? Date.now()) }), namesFromText: require('../robot-login').namesFromText }
       if (name === './pearl-stasis') return require('../pearl-stasis')
@@ -578,6 +586,41 @@ test('range broadcasts preview without sending, preserve arguments and reject in
   for (const text of ['/all 0-3 /status', '/all 3-2 /status', '/all 1-99 /status']) { r.context.text = text; r.run('handleCommand(text)') }
   assert.deepEqual(plain(r.context.chats), [])
   assert.equal(r.run(`destructiveCommandEffect('/all 2-3 /dc')`), 'disconnects every bot at once')
+})
+
+test('/run-on sends only to the named bots and refuses an unknown name instead of widening', () => {
+  const r = runtime()
+  r.run(`handleCommand('/run-on A /server shardshop')`)
+  assert.deepEqual(plain(r.context.chats), [['A', '/server shardshop']])
+  r.context.chats.length = 0
+  r.run(`handleCommand('/run-on A,C /server afk')`)
+  assert.deepEqual(plain(r.context.chats), [['A', '/server afk'], ['C', '/server afk']])
+  r.context.chats.length = 0
+  r.run(`handleCommand('/run-on 1-2 /server lifesteal')`)
+  assert.deepEqual(plain(r.context.chats), [['A', '/server lifesteal'], ['B', '/server lifesteal']])
+  r.context.chats.length = 0
+  // A typo must run NOTHING — never the whole roster.
+  r.context.text = '/run-on Nobody /server afk'
+  r.run('handleCommand(text)')
+  assert.deepEqual(plain(r.context.chats), [])
+  assert.match(channelLogs(r, 'A'), /Unknown bot: Nobody/)
+  assert.match(channelLogs(r, 'A'), /nothing was run/)
+  r.context.chats.length = 0
+  // A local command keeps its per-bot router; chat still needs the deliberate "!".
+  const before = channelLogs(r, 'B')
+  r.run(`handleCommand('/run-on B /scripts')`)
+  assert.notEqual(channelLogs(r, 'B'), before)
+  r.run(`handleCommand('/run-on A !hello there')`)
+  assert.deepEqual(plain(r.context.chats), [['A', 'hello there']])
+  r.context.chats.length = 0
+  // /run-on * /dc is fleet-wide and inherits the /all /dc confirmation.
+  r.run(`handleCommand('/run-on * /dc')`)
+  assert.deepEqual(plain(r.context.chats), [])
+  assert.match(channelLogs(r, 'A'), /DO NOT RUN/)
+  r.context.chats.length = 0
+  r.run(`handleCommand('/run-on')`)
+  assert.deepEqual(plain(r.context.chats), [])
+  assert.match(channelLogs(r, 'A'), /Usage: \/run-on/)
 })
 
 test('served dashboard retains both COINFLIP and PLAY buttons', async () => {
@@ -1113,7 +1156,6 @@ test('/api/tor/newnym and /tor-newnym report every control port', async () => {
 // rotate-everything.
 test('/tor-newnym rotates one proxy group and reconnects only its bots after a successful signal', async () => {
   const r = runtime({
-    TOR_CONTROL_PORTS: '59997',
     TOR_ROTATE_DELAY_MS: '1000',
     PROXY_GROUP_1_BOTS: 'A,B',
     PROXY_GROUP_1_HOST: 'localhost',
@@ -1125,7 +1167,7 @@ test('/tor-newnym rotates one proxy group and reconnects only its bots after a s
   r.timers.clear()
 
   // Deterministic successful control response: a dead port must NOT churn bots.
-  r.run(`requestTorCircuits = async () => ({ ok: true, results: [{ port: 59997, ok: true }] })`)
+  r.run(`requestTorCircuits = async scope => ({ ok: true, results: [{ port: scope === 2 ? 9051 : 9151, ok: true, verified: true }] })`)
   const two = await r.run(`handleCommand('/tor-newnym 2')`)
   assert.equal(two.scope, 2)
   assert.equal(two.label, 'proxy group 2')
@@ -1146,6 +1188,69 @@ test('/tor-newnym rotates one proxy group and reconnects only its bots after a s
   assert.equal(bad.ok, false)
   assert.match(bad.error, /no proxy group 9/)
   assert.equal(r.timers.size, 0, 'a bad scope schedules nothing')
+})
+
+test('dashboard Tor group API verifies the selected endpoint and schedules only its routed bots', async () => {
+  const seen = []
+  const r = runtime({
+    PROXY_GROUP_1_BOTS: 'a,b', PROXY_GROUP_1_HOST: 'localhost', PROXY_GROUP_1_PORT: '9050',
+    PROXY_GROUP_2_BOTS: 'c', PROXY_GROUP_2_HOST: 'localhost', PROXY_GROUP_2_PORT: '9150',
+    TEST_TOR_VERIFY: async endpoint => { seen.push(endpoint.port); return { ok: true, before: '198.51.100.1', after: '198.51.100.2' } }
+  })
+  const cookie = await r.login()
+  r.timers.clear()
+  const response = await r.request('/api/tor/newnym', JSON.stringify({ group: '1' }), cookie, 'POST')
+  const result = JSON.parse(response.body)
+  assert.equal(response.status, 200)
+  assert.deepEqual(seen, [9050])
+  assert.equal(result.ok, true)
+  assert.equal(result.results[0].verified, true)
+  assert.equal(result.reconnected, 2, 'case-insensitive group members are scheduled')
+  assert.equal(r.timers.size, 2)
+})
+
+test('dashboard Tor failures and stale or direct routes do not churn bots', async () => {
+  const r = runtime({
+    PROXY_GROUP_1_BOTS: 'A,B', PROXY_GROUP_1_HOST: 'localhost', PROXY_GROUP_1_PORT: '9050',
+    PROXY_GROUP_2_BOTS: 'C', PROXY_GROUP_2_HOST: 'localhost', PROXY_GROUP_2_PORT: '9150',
+    TEST_TOR_VERIFY: async endpoint => endpoint.port === 9050
+      ? { ok: true, before: '198.51.100.1', after: '198.51.100.2' }
+      : { ok: false, error: 'SOCKS probe exit IP unchanged' }
+  })
+  const cookie = await r.login()
+  r.run(`bots.B.torProxy = null`)
+  r.timers.clear()
+  const res = await r.request('/api/tor/newnym', JSON.stringify({ group: 'all' }), cookie, 'POST')
+  const result = JSON.parse(res.body)
+  assert.equal(result.ok, false)
+  assert.equal(result.reconnected, 1, 'direct bot B and failed group C are untouched')
+  assert.equal(r.timers.size, 1)
+  r.run(`bots.A = { bot: {}, disconnectManually() { throw Error('stale bot was disconnected') } }`)
+  const scheduled = [...r.timers.keys()][0]
+  r.timers.delete(scheduled); scheduled.fn()
+  assert.equal(r.timers.size, 0, 'a replaced bot instance is not reconnected')
+})
+
+test('Tor rotations reject overlapping requests and deduplicate pending reconnects', async () => {
+  let release
+  const r = runtime({
+    PROXY_GROUP_1_BOTS: 'A', PROXY_GROUP_1_HOST: 'localhost', PROXY_GROUP_1_PORT: '9050',
+    TEST_TOR_VERIFY: () => new Promise(resolve => { release = resolve })
+  })
+  const cookie = await r.login()
+  r.timers.clear()
+  const first = r.request('/api/tor/newnym', JSON.stringify({ group: '1' }), cookie, 'POST')
+  const second = await r.request('/api/tor/newnym', JSON.stringify({ group: '1' }), cookie, 'POST')
+  assert.match(JSON.parse(second.body).error, /already in progress/)
+  release({ ok: true, before: '198.51.100.1', after: '198.51.100.2' })
+  assert.equal(JSON.parse((await first).body).reconnected, 1)
+  release = null
+  const pending = r.request('/api/tor/newnym', JSON.stringify({ group: '1' }), cookie, 'POST')
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(typeof release, 'function', 'second verification started')
+  release({ ok: true, before: '198.51.100.2', after: '198.51.100.3' })
+  assert.equal(JSON.parse((await pending).body).reconnected, 0)
+  assert.equal(r.timers.size, 1)
 })
 
 // The sweep only tidies reporting flags — it must never yank a connection
@@ -3447,6 +3552,41 @@ test('/restart reruns the connect loop for offline bots only and never disturbs 
   assert.match(channelLogs(r, 'A'), /Nothing to restart/)
 })
 
+// The opposite contract: when the whole fleet sits on dead circuits, "connect
+// what is down" is not enough — /restart-everything gives up the live sessions
+// too and replays startup over every name. It must still leave names that are
+// blocked (removed list/deathban) and mid-handshake alone.
+test('/restart-everything replays the whole roster and drops live sessions first', () => {
+  const r = runtime({ TEST_CREATE_BOTS: true, CONNECT_DELAY_MS: '5000' })
+  r.run(`
+    __disc = 0
+    for (const id of ['A', 'B', 'C']) bots[id].disconnectManually = () => { __disc++; bots[id].bot = null; bots[id].connectionState = 'offline' }
+    process.env.BOT_NAMES = 'A,B,C,D,E'
+    bots.E = { bot: null, logs: [], connectionState: 'connecting', host: 'h', port: 1, version: 'v' }
+  `)
+  r.timers.clear()
+  r.run(`handleCommand('/switch A'); handleCommand('/restart-everything --now')`)
+  const out = channelLogs(r, 'A')
+
+  // Every live session was closed and queued for a new connection…
+  assert.equal(r.run('__disc'), 3, 'online bots are disconnected by /restart-everything')
+  assert.match(out, /Full connect loop restarted for 4 bot/)
+  assert.match(out, /3 online session\(s\) closed and replayed/)
+  // …the missing name still connects…
+  assert.equal(r.run(`Object.hasOwn(bots, 'D')`), true, 'D connects')
+  // …and the in-flight handshake is never thrown away.
+  assert.equal(r.run(`bots.E.connectionState`), 'connecting')
+  assert.match(out, /1 still connecting/)
+
+  // /restart must not be caught by the new command's dispatch (it shares the
+  // same prefix): the plain command still takes its own path.
+  const before = channelLogs(r, 'A').length
+  r.run(`handleCommand('/restart')`)
+  const added = channelLogs(r, 'A').slice(before)
+  assert.match(added, /Connect loop restarted for 3 bot/)
+  assert.doesNotMatch(added, /Full connect loop restarted/)
+})
+
 // The scope of /proxy-set is the bot you are on, because that is the thing the
 // caller actually knows. A group endpoint belongs to every bot on it; the
 // default belongs to the ungrouped ones. Editing the wrong one silently
@@ -3526,6 +3666,38 @@ test('/new-bot takes a comma list, spreads by default and connects instantly on 
   assert.match(channelLogs(r, 'A'), /letters, digits or underscores/)
   assert.equal(r.fakeFiles.get('.env'), before, 'a rejected name writes nothing')
   assert.equal(r.run(`Object.hasOwn(bots, 'bad-name')`), false)
+})
+
+// A full fleet must not make /new-bot useless: asking for a name explicitly is
+// a decision, so --force connects it even at BOT_MAX. Without it the old
+// behaviour stands (queue and wait), which is what keeps a stray /new-bot from
+// silently ballooning the fleet past its ceiling.
+test('/new-bot --force connects past BOT_MAX', () => {
+  // The harness already holds A, B and C, so BOT_MAX=3 is reached.
+  const r = runtime({ TEST_CREATE_BOTS: true, LOGIN_PASSWORD: 'pw', BOT_MAX: '3' })
+  r.timers.clear()
+
+  // Baseline: the cap still holds without the flag.
+  r.run(`handleCommand('/new-bot F1')`)
+  assert.equal(r.run(`Object.hasOwn(bots, 'F1')`), false, 'F1 waits: BOT_MAX=3 is reached')
+  assert.match(logsText(r), /BOT_MAX=3 reached/)
+
+  // --force connects it and reports the override.
+  r.run(`handleCommand('/new-bot F2 --force')`)
+  assert.equal(r.run(`Object.hasOwn(bots, 'F2')`), true, 'F2 connects past BOT_MAX')
+  assert.match(channelLogs(r, 'A'), /past BOT_MAX/)
+  assert.equal(r.run(`Object.keys(bots).length > 3`), true, 'the fleet really is over the cap now')
+
+  // The flag is positional-agnostic and works with the instant mode.
+  r.run(`handleCommand('/new-bot F3,F4 instant --force')`)
+  assert.equal(r.run(`Object.hasOwn(bots, 'F3') && Object.hasOwn(bots, 'F4')`), true)
+
+  // Names are still saved, so a restart brings them back.
+  assert.match(require('dotenv').parse(r.fakeFiles.get('.env')).BOT_NAMES, /F2/)
+
+  // A force flag with no names is not a request: offer the usage line instead.
+  r.run(`handleCommand('/new-bot --force')`)
+  assert.match(logsText(r), /Usage: \/new-bot/)
 })
 
 // A reboot announcement used to be handled by nothing: the generic 3-5s startup

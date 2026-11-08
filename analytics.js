@@ -475,6 +475,7 @@ function renderHtml (report) {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AFK Analytics</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <style>${STYLE}</style></head><body>
 <h1>⛏ AFK <b>ANALYTICS</b></h1>
 <p class="sub">generated ${esc(fmtTime(report.generatedAt))} · read-only · data files: <code>${esc((report.config && report.config.coinflipFile) || 'data/coinflip-history.jsonl')}</code> and <code>${esc((report.config && report.config.timeseriesFile) || 'data/timeseries.jsonl')}</code></p>

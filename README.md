@@ -742,6 +742,9 @@ WEB_GUI=true
 
 ## Fleet controls and evidence
 
+- `/run-on Alpha /shardshop` runs a command on exactly the named bots — a
+  comma list, `*fragment`, `*`/`all`, or the same `1-3` / `name:A..B` ranges as
+  `/all`. Unlike `/all`, a misspelled name is reported and nothing runs.
 - `/all 40-65` previews inclusive displayed 1–N bot numbers; `/all 40-65 /status`
   runs only on them. `/all-slow 40-65 1500ms /status` uses the same range before
   the delay. Names work too: `/all name:Alpha..Bravo /status` (roster order).
@@ -1014,14 +1017,14 @@ item matches, the bot falls back to `GUI_SLOT`.
 | `PROXY_GROUP_<N>_USER` | empty | Username for group `N`'s proxy |
 | `PROXY_GROUP_<N>_PASS` | empty | Password for group `N`'s proxy. `_PASSWORD` also works |
 | `PROXY_GROUP_<N>_LOGIN_PASSWORD` | empty | *Minecraft* password for group `N`'s bots — not a proxy credential |
-| `DIRECT_MAX` | `20` | Max concurrent bots on the direct route (see [Direct-route pool](#direct-route-pool-direct_max-ban-replacement-all-banned-warning)) |
+| `DIRECT_MAX` | `150` | Max concurrent bots on the direct route (see [Direct-route pool](#direct-route-pool-direct_max-ban-replacement-all-banned-warning)) |
 
 Bots not listed in any `PROXY_GROUP_<N>_BOTS` fall back to the global `PROXY_HOST` above (or connect directly if it's unset). `/proxy` reports both the configured groups and the fallback.
 
 ### Direct-route pool (`DIRECT_MAX`, ban replacement, all-banned warning)
 
 Every bot outside all proxy groups rides the **direct route**, which means one
-shared IP for the whole cohort. `DIRECT_MAX` (default **20**) is the maximum
+shared IP for the whole cohort. `DIRECT_MAX` (default **150**) is the maximum
 number of direct bots that may hold a connection at once — new names past the
 ceiling are refused with one log line each (`Direct bots share one IP…`), never
 queued forever, and `BOT_MAX` still caps the fleet as a whole.
@@ -1039,7 +1042,7 @@ that warning a dead route could look like a healthy fleet.
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `DIRECT_MAX` | `20` | Maximum concurrent direct-route connections; `0` disables direct bots entirely |
+| `DIRECT_MAX` | `150` | Maximum concurrent direct-route connections; `0` disables direct bots entirely |
 
 The routing decisions live in `direct-pool.js` (pure functions: `directPool`,
 `directStatus`, `mayConnectDirect`, `nextDirectCandidate`) so the ceiling, the
@@ -1470,9 +1473,10 @@ Any unrecognized input is sent as a Minecraft chat message or command.
 | `/proxy` | Show proxy and stall-watchdog configuration |
 | `/proxy-set [host[:port]] [type] [user:pass]` \| `direct` \| `off` | Set the proxy for the proxy **group the active bot belongs to** — or the default route when it has no group — and save it to `.env`. Bare shows the current route, `direct` pins this bot to a direct connection, `off` clears the group/default endpoint, `--reconnect` reconnects the affected bots now |
 | `/switch <id>` | Select a bot by name or list number |
-| `/new-bot bot1,bot2,bot3 [instant\|spread]` | Create and connect several named bots in one go. `spread` (default) paces them at `CONNECT_DELAY_MS` like startup; `instant` connects them all at once. Names are saved to `BOT_NAMES` in `.env`, so a restart brings them back; `BOT_MAX` still caps the fleet and the overflow waits in the queue |
+| `/new-bot bot1,bot2,bot3 [instant\|spread] [--force]` | Create and connect several named bots in one go. `spread` (default) paces them at `CONNECT_DELAY_MS` like startup; `instant` connects them all at once. Names are saved to `BOT_NAMES` in `.env`, so a restart brings them back. `BOT_MAX` caps the fleet and the overflow waits in the queue — add `--force` to connect these names anyway, even at the ceiling (`DIRECT_MAX` still applies, since it is the shared IP that suffers) |
 | `/chat <message>` | Send a chat message without local command parsing |
 | `/all <command>` | Run a local command on every bot or broadcast a server command to all. `ALL_CHAT_GUARD` (on by default) refuses plain chat so a typo cannot make every bot say it — prefix with `!` for deliberate chat (`/all !hello`) |
+| `/run-on <bots> <command>` | Run a command on **only** the bots you name: one name, a comma list (`Alpha,Bravo`), `*<fragment>` for every name containing it, `*`/`all` for the roster, or an inclusive range (`1-3`, `name:A..B`). Local commands run on those bots; a server command is sent to them (`ALL_CHAT_GUARD` applies). An unknown name is an error and runs nothing — it never falls back to the whole roster. `/run-on core_farm /shardshop` |
 | `/repeat [n\|duration] [delay] <cmd>` | Re-run a command with time between the runs (`REPEAT_DELAY_MS`, or an explicit delay like `/repeat 5 30s /spawners`); `/repeat stop` cancels pending runs |
 | `/use-book [name]` | Scan the open GUI (or the inventory) for a book, swap it into hotbar slot 1, select it and run `/use && /use`, every step 200 ms apart. `/use-book auto on\|off` runs it whenever a GUI opens with a book in it — no book, nothing happens |
 | `/copy [name]` | Everything about the held item — the exact name with unicode intact, registry name, type, count, slot, enchants, lore, NBT — printed and copied to the clipboard; `/copy name` copies just the name |
@@ -1481,6 +1485,7 @@ Any unrecognized input is sent as a Minecraft chat message or command.
 | `/reconnect` | Reconnect the active bot |
 | `/reconnect-all` | Reconnect currently offline bots |
 | `/reconnect-all-slow` | Reconnect all bots with a configurable stagger |
+| `/restart-everything [--now]` | Replay the **startup connect loop over the whole roster**: online bots are disconnected first, then every name reconnects with startup pacing. Use it when the fleet sits on dead circuits and per-bot reconnects are not the fix. Nothing else restarts — Tor and the process keep running, and blocked names (removed list/deathban) stay blocked. `--now` skips the pacing |
 | `/restart [--now]` | Rerun the connect loop for every roster name that is **not already online**. This is the fix for a fleet sitting below `BOT_MAX` after the cap was raised: names blocked by the cap or by a failed attempt never retry by themselves. Online bots are skipped and never disconnected, so no session or login is wasted. Pacing matches startup (`CONNECT_DELAY_MS` + jitter); `--now` connects immediately |
 | `/removed` | List the removed / permanently-banned bots |
 | `/auth-retry <bot>` | Clear a recorded login/register failure and reconnect so it can authenticate again |
